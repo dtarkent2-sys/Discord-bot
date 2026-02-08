@@ -7,10 +7,23 @@ class P123Client {
     this._token = null;
     this._tokenExpiry = 0;
 
-    if (!config.p123ApiId || !config.p123ApiKey) {
-      console.warn('[P123] P123_API_ID or P123_API_KEY not set — Portfolio123 integration disabled.');
+    // Debug: log what env vars we found
+    console.log(`[P123] API ID: ${config.p123ApiId ? 'set (' + config.p123ApiId.slice(0, 4) + '...)' : 'NOT SET'}`);
+    console.log(`[P123] API Key: ${config.p123ApiKey ? 'set (' + config.p123ApiKey.slice(0, 4) + '...)' : 'NOT SET'}`);
+
+    // Log which env var names have values (helps debug naming mismatches)
+    const p123Vars = ['P123_API_ID', 'P123_API_KEY', 'PORTFOLIO123_API_ID', 'PORTFOLIO123_API_KEY', 'P123_ID', 'P123_KEY'];
+    const found = p123Vars.filter(v => !!process.env[v]);
+    if (found.length > 0) {
+      console.log(`[P123] Found env vars: ${found.join(', ')}`);
     } else {
-      console.log('[P123] Portfolio123 API configured.');
+      console.log(`[P123] No P123 env vars found. Checked: ${p123Vars.join(', ')}`);
+    }
+
+    if (!config.p123ApiId || !config.p123ApiKey) {
+      console.warn('[P123] Portfolio123 integration disabled — need both API ID and API Key.');
+    } else {
+      console.log('[P123] Portfolio123 API configured and ready.');
     }
   }
 
