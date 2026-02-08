@@ -4,7 +4,7 @@ const mood = require('../services/mood');
 const stats = require('../services/stats');
 const reactions = require('../services/reactions');
 const sentiment = require('../services/sentiment');
-const p123 = require('../services/p123');
+const yahoo = require('../services/yahoo');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 
 async function handleCommand(interaction) {
@@ -117,7 +117,7 @@ async function handleStats(interaction) {
     `**Errors:** ${summary.errors}`,
     `**AI Model:** ${ai.getModel()}`,
     `**Mood:** ${mood.getMood()} (${mood.getSummary().score}/10)`,
-    `**P123 API:** ${p123.enabled ? 'Connected' : 'Not configured'}`,
+    `**Market Data:** Yahoo Finance`,
     `\n**Memory Usage:**`,
     `  RSS: ${summary.memory.rss} MB`,
     `  Heap: ${summary.memory.heapUsed}/${summary.memory.heapTotal} MB`,
@@ -136,13 +136,13 @@ async function handleStats(interaction) {
   await interaction.reply(msg.join('\n'));
 }
 
-// ── /analyze — AI-powered analysis with live P123 data ──────────────
+// ── /analyze — AI-powered analysis with live Yahoo Finance data ──────
 async function handleAnalyze(interaction) {
   await interaction.deferReply();
 
   const ticker = interaction.options.getString('ticker').toUpperCase();
 
-  // Fetch real market data from P123
+  // Fetch real market data from Yahoo Finance
   const context = await getMarketContext(ticker);
 
   if (context.error) {
@@ -169,11 +169,6 @@ async function handlePrice(interaction) {
 
   const ticker = interaction.options.getString('ticker').toUpperCase();
 
-  if (!p123.enabled) {
-    await interaction.editReply('Portfolio123 API is not configured. Set P123_API_ID and P123_API_KEY.');
-    return;
-  }
-
   try {
     const context = await getMarketContext(ticker);
 
@@ -185,28 +180,31 @@ async function handlePrice(interaction) {
     const q = context.quote || {};
     const s = context.snapshot || {};
 
-    const lines = [`**${ticker}** — Quick Stats\n`];
+    const lines = [`**${ticker}**${s.name ? ` — ${s.name}` : ''} — Quick Stats\n`];
     if (q.price) lines.push(`**Price:** $${q.price}`);
     if (q.volume) lines.push(`**Volume:** ${Number(q.volume).toLocaleString()}`);
     if (q.mktCap) lines.push(`**Market Cap:** $${(q.mktCap / 1e9).toFixed(2)}B`);
     if (q.pe) lines.push(`**P/E:** ${q.pe}`);
-    if (s.PB) lines.push(`**P/B:** ${s.PB}`);
-    if (s.EPS) lines.push(`**EPS:** $${s.EPS}`);
-    if (s.DivYield) lines.push(`**Div Yield:** ${s.DivYield}%`);
-    if (s.ROE) lines.push(`**ROE:** ${s.ROE}%`);
+    if (s.forwardPE) lines.push(`**Forward P/E:** ${s.forwardPE}`);
+    if (s.pb) lines.push(`**P/B:** ${s.pb}`);
+    if (s.eps) lines.push(`**EPS:** $${s.eps}`);
+    if (s.divYield) lines.push(`**Div Yield:** ${s.divYield.toFixed(2)}%`);
+    if (s.roe) lines.push(`**ROE:** ${s.roe.toFixed(2)}%`);
+    if (s.beta) lines.push(`**Beta:** ${s.beta}`);
     if (q.changePercent != null) lines.push(`**Daily Change:** ${q.changePercent > 0 ? '+' : ''}${q.changePercent.toFixed(2)}%`);
     if (q.rsi14) lines.push(`**RSI(14):** ${q.rsi14}`);
     if (q.sma50) lines.push(`**SMA(50):** $${q.sma50}`);
     if (q.sma200) lines.push(`**SMA(200):** $${q.sma200}`);
-    if (s['1dReturn']) lines.push(`**1-Day:** ${((s['1dReturn'] - 1) * 100).toFixed(2)}%`);
-    if (s['1wkReturn']) lines.push(`**1-Week:** ${((s['1wkReturn'] - 1) * 100).toFixed(2)}%`);
-    if (s['1moReturn']) lines.push(`**1-Month:** ${((s['1moReturn'] - 1) * 100).toFixed(2)}%`);
+    if (s.fiftyTwoWeekHigh) lines.push(`**52W High:** $${s.fiftyTwoWeekHigh}`);
+    if (s.fiftyTwoWeekLow) lines.push(`**52W Low:** $${s.fiftyTwoWeekLow}`);
+    if (s.profitMargin) lines.push(`**Profit Margin:** ${s.profitMargin.toFixed(2)}%`);
+    if (s.revenueGrowth) lines.push(`**Revenue Growth:** ${s.revenueGrowth.toFixed(2)}%`);
 
     if (context.missingFields) {
       lines.push(`\n_Some data unavailable: ${context.missingFields.map(m => m.field).join(', ')}_`);
     }
 
-    lines.push(`\n_Data via Portfolio123 | ${new Date().toLocaleString()}_`);
+    lines.push(`\n_Data via Yahoo Finance | ${new Date().toLocaleString()}_`);
     await interaction.editReply(lines.join('\n'));
   } catch (err) {
     console.error(`[Price] Error for ${ticker}:`, err);
@@ -214,27 +212,24 @@ async function handlePrice(interaction) {
   }
 }
 
-// ── /screen — Run a stock screen ────────────────────────────────────
+// ── /screen — Run a stock screen (trending) ─────────────────────────
 async function handleScreen(interaction) {
   await interaction.deferReply();
 
   const universe = interaction.options.getString('universe');
   const rulesStr = interaction.options.getString('rules');
 
-  if (!p123.enabled) {
-    await interaction.editReply('Portfolio123 API is not configured. Set P123_API_ID and P123_API_KEY.');
-    return;
-  }
-
   try {
-    const rules = rulesStr
-      ? rulesStr.split(',').map(r => ({ formula: r.trim(), type: 'common' }))
-      : undefined;
+    // Use Yahoo Finance trending tickers as a screen
+    const quotes = await yahoo.screenByGainers();
 
-    const results = await p123.quickScreen(universe, { rules, maxResults: 20 });
-    const formatted = p123.formatScreenForDiscord(results);
+    if (quotes.length === 0) {
+      await interaction.editReply('No screen results available right now. Try again later.');
+      return;
+    }
 
-    await interaction.editReply(`**Screen: ${universe}**${rulesStr ? ` | Rules: ${rulesStr}` : ''}\n${formatted}`);
+    const formatted = yahoo.formatScreenForDiscord(quotes);
+    await interaction.editReply(`**Screen: ${universe}**${rulesStr ? ` | Rules: ${rulesStr}` : ''}\n${formatted}\n\n_Trending stocks via Yahoo Finance_`);
   } catch (err) {
     console.error(`[Screen] Error:`, err);
     await interaction.editReply(`Screen failed: ${err.message}`);
@@ -339,44 +334,42 @@ async function handleWatchlist(interaction) {
     return;
   }
 
-  // Show watchlist
+  // Show watchlist with live Yahoo Finance prices
   const list = memory.getWatchlist(userId);
   if (list.length === 0) {
     await interaction.reply({ content: 'Your watchlist is empty. Use `/watchlist add <ticker>` to add stocks.', ephemeral: true });
     return;
   }
 
-  // If P123 is available, fetch live prices
-  if (p123.enabled) {
-    await interaction.deferReply();
-    try {
-      const data = await p123.getData(list, ['Close(0)', 'Close(0)/Close(-1)-1'], {
-        precision: 2,
-        includeNames: true,
-      });
+  await interaction.deferReply();
+  try {
+    const quotes = await yahoo.getQuotes(list);
 
-      if (data && data.rows && data.rows.length > 0) {
-        const lines = [`**Your Watchlist (${list.length} stocks)**\n`];
-        for (let i = 0; i < data.rows.length; i++) {
-          const row = data.rows[i];
-          const name = data.names ? data.names[i] : list[i];
-          const price = row[0];
-          const change = row[1];
-          const changeStr = change != null ? ` (${change > 0 ? '+' : ''}${(change * 100).toFixed(2)}%)` : '';
-          lines.push(`**${name || list[i]}** — $${price}${changeStr}`);
-        }
-        lines.push(`\n_Data via Portfolio123 | ${new Date().toLocaleString()}_`);
-        await interaction.editReply(lines.join('\n'));
-        return;
+    if (quotes.length > 0) {
+      const lines = [`**Your Watchlist (${list.length} stocks)**\n`];
+      for (const q of quotes) {
+        const sym = q.symbol;
+        const price = q.regularMarketPrice != null ? `$${q.regularMarketPrice.toFixed(2)}` : 'N/A';
+        const pct = q.regularMarketChangePercent;
+        const changeStr = pct != null ? ` (${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
+        const name = q.shortName || '';
+        lines.push(`**${sym}** ${name ? `— ${name} ` : ''}— ${price}${changeStr}`);
       }
-    } catch (err) {
-      console.error('[Watchlist] P123 fetch error:', err.message);
+      // Show any tickers that failed to fetch
+      const fetched = new Set(quotes.map(q => q.symbol));
+      const missed = list.filter(t => !fetched.has(t));
+      if (missed.length > 0) {
+        lines.push(`\n_Could not fetch: ${missed.join(', ')}_`);
+      }
+      lines.push(`\n_Data via Yahoo Finance | ${new Date().toLocaleString()}_`);
+      await interaction.editReply(lines.join('\n'));
+      return;
     }
-    // Fallback if P123 fetch fails
-    await interaction.editReply(`**Your Watchlist (${list.length} stocks)**\n${list.join(', ')}\n\n_Live prices unavailable._`);
-  } else {
-    await interaction.reply(`**Your Watchlist (${list.length} stocks)**\n${list.join(', ')}\n\n_Configure P123 API for live prices._`);
+  } catch (err) {
+    console.error('[Watchlist] Yahoo fetch error:', err.message);
   }
+  // Fallback if fetch fails
+  await interaction.editReply(`**Your Watchlist (${list.length} stocks)**\n${list.join(', ')}\n\n_Live prices unavailable._`);
 }
 
 // ── /profile — View user profile ────────────────────────────────────
