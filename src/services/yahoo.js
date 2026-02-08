@@ -1,7 +1,23 @@
 /**
  * Yahoo Finance client using yahoo-finance2 v3 (Node.js).
  * No API key required — uses Yahoo's public APIs.
+ * Supports stocks AND crypto (BTC, ETH, SOL, etc.)
  */
+
+// Common crypto symbols → Yahoo Finance format
+const CRYPTO_MAP = {
+  BTC: 'BTC-USD', ETH: 'ETH-USD', SOL: 'SOL-USD', XRP: 'XRP-USD',
+  DOGE: 'DOGE-USD', ADA: 'ADA-USD', AVAX: 'AVAX-USD', DOT: 'DOT-USD',
+  LINK: 'LINK-USD', MATIC: 'MATIC-USD', SHIB: 'SHIB-USD', LTC: 'LTC-USD',
+  BNB: 'BNB-USD', ATOM: 'ATOM-USD', UNI: 'UNI-USD', FIL: 'FIL-USD',
+  APT: 'APT-USD', ARB: 'ARB-USD', OP: 'OP-USD', NEAR: 'NEAR-USD',
+  SUI: 'SUI-USD', SEI: 'SEI-USD', TIA: 'TIA-USD', INJ: 'INJ-USD',
+  PEPE: 'PEPE-USD', WIF: 'WIF-USD', BONK: 'BONK-USD', FLOKI: 'FLOKI-USD',
+  RENDER: 'RENDER-USD', FET: 'FET-USD', TAO: 'TAO-USD', HBAR: 'HBAR-USD',
+  ALGO: 'ALGO-USD', XLM: 'XLM-USD', VET: 'VET-USD', ICP: 'ICP-USD',
+  AAVE: 'AAVE-USD', MKR: 'MKR-USD', CRV: 'CRV-USD', SAND: 'SAND-USD',
+  MANA: 'MANA-USD', AXS: 'AXS-USD', GALA: 'GALA-USD', IMX: 'IMX-USD',
+};
 
 class YahooFinanceClient {
   constructor() {
@@ -28,6 +44,29 @@ class YahooFinanceClient {
 
   get enabled() {
     return !this._initFailed;
+  }
+
+  /**
+   * Resolve a user-provided ticker to a Yahoo Finance symbol.
+   * Handles crypto shorthand: BTC → BTC-USD, ETH → ETH-USD, etc.
+   * Already-suffixed tickers (BTC-USD) pass through unchanged.
+   * Regular stock tickers (AAPL, TSLA) pass through unchanged.
+   */
+  resolveTicker(ticker) {
+    const upper = ticker.toUpperCase().trim();
+    // Already has -USD suffix (user typed BTC-USD)
+    if (upper.endsWith('-USD')) return upper;
+    // Known crypto symbol
+    if (CRYPTO_MAP[upper]) return CRYPTO_MAP[upper];
+    // Regular stock ticker
+    return upper;
+  }
+
+  /**
+   * Check if a resolved ticker is a cryptocurrency.
+   */
+  isCrypto(ticker) {
+    return ticker.toUpperCase().endsWith('-USD') && CRYPTO_MAP[ticker.replace('-USD', '')];
   }
 
   // ── Retry helper — retries on transient network failures ────────────
@@ -180,7 +219,7 @@ class YahooFinanceClient {
     if (!yf) throw new Error('Yahoo Finance not available');
 
     const result = await this._retry(() => yf.search(query), `search(${query})`);
-    return (result.quotes || []).filter(q => q.quoteType === 'EQUITY').slice(0, 10);
+    return (result.quotes || []).filter(q => q.quoteType === 'EQUITY' || q.quoteType === 'CRYPTOCURRENCY').slice(0, 10);
   }
 
   // ── Screening — v3 uses screener() API ────────────────────────────
