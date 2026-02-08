@@ -26,12 +26,21 @@ const PREFIX = process.env.BOT_PREFIX || '!';
 client.once(Events.ClientReady, async () => {
   console.log(`[Bot] Logged in as ${client.user.tag}`);
 
+  // Initialize database
+  try {
+    await memory.initialize();
+  } catch (err) {
+    console.error('[Bot] Database failed to initialize:', err.message);
+    process.exit(1);
+  }
+
+  // Initialize AI engine (non-fatal — falls back to rule-based)
   try {
     await ai.initialize();
     console.log('[Bot] AI Engine initialized.');
   } catch (err) {
     console.error('[Bot] AI Engine failed to initialize:', err.message);
-    console.log('[Bot] Bot will run without AI capabilities.');
+    console.log('[Bot] Bot will run with rule-based responses only.');
   }
 
   // Set the first text channel as the autonomous actions target
@@ -50,25 +59,31 @@ client.once(Events.ClientReady, async () => {
 // --- Message handler ---
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
+  if (!memory.ready) return;
 
   const userId = message.author.id;
   const channelId = message.channel.id;
   const username = message.author.username;
   const content = message.content.trim();
 
-  // Store every message in memory
+  // Analyze sentiment (local NLP — always available once ai is ready)
   let sentimentScore = null;
   if (ai.ready) {
     try {
-      const sentiment = await ai.analyzeSentiment(content);
-      sentimentScore = sentiment.label === 'POSITIVE' ? sentiment.score : -sentiment.score;
+      const sentiment = ai.analyzeSentiment(content);
+      sentimentScore = sentiment.raw;
     } catch {
       // Sentiment analysis failed silently
     }
   }
 
-  memory.addMessage(userId, channelId, 'user', content, sentimentScore?.toString());
-  memory.updateUserProfile(userId, username, sentimentScore);
+  // Store every message in memory
+  try {
+    await memory.addMessage(userId, channelId, 'user', content, sentimentScore?.toString());
+    await memory.updateUserProfile(userId, username, sentimentScore);
+  } catch (err) {
+    console.error('[Bot] Memory write error:', err.message);
+  }
 
   // Handle prefix commands
   if (content.startsWith(PREFIX)) {
@@ -90,7 +105,7 @@ async function handleCommand(message, command, args) {
   switch (command) {
     case 'ask': {
       if (!ai.ready) {
-        await message.reply('AI models are still loading, please try again shortly.');
+        await message.reply('AI is still initializing, please try again shortly.');
         return;
       }
       const question = args.join(' ');
@@ -99,16 +114,16 @@ async function handleCommand(message, command, args) {
         return;
       }
       await message.channel.sendTyping();
-      const context = memory.buildContextString(message.channel.id);
+      const context = await memory.buildContextString(message.channel.id);
       const response = await ai.generateResponse(question, context);
-      memory.addMessage(client.user.id, message.channel.id, 'assistant', response);
+      await memory.addMessage(client.user.id, message.channel.id, 'assistant', response);
       await message.reply(response);
       break;
     }
 
     case 'sentiment': {
       if (!ai.ready) {
-        await message.reply('AI models are still loading.');
+        await message.reply('AI is still initializing.');
         return;
       }
       const text = args.join(' ');
@@ -116,14 +131,35 @@ async function handleCommand(message, command, args) {
         await message.reply(`Usage: \`${PREFIX}sentiment <text>\``);
         return;
       }
-      const result = await ai.analyzeSentiment(text);
+      const result = ai.analyzeSentiment(text);
       await message.reply(`**${result.label}** (confidence: ${(result.score * 100).toFixed(1)}%)`);
+      break;
+    }
+
+    case 'analyze': {
+      if (!ai.ready) {
+        await message.reply('AI is still initializing.');
+        return;
+      }
+      const text = args.join(' ');
+      if (!text) {
+        await message.reply(`Usage: \`${PREFIX}analyze <text>\``);
+        return;
+      }
+      const analysis = ai.analyzeText(text);
+      const lines = [`**Text Analysis:**`];
+      if (analysis.topics.length) lines.push(`Topics: ${analysis.topics.join(', ')}`);
+      if (analysis.people.length) lines.push(`People: ${analysis.people.join(', ')}`);
+      if (analysis.places.length) lines.push(`Places: ${analysis.places.join(', ')}`);
+      lines.push(`Sentiment: ${analysis.sentiment.label} (${(analysis.sentiment.score * 100).toFixed(1)}%)`);
+      lines.push(`Question: ${analysis.isQuestion ? 'Yes' : 'No'}`);
+      await message.reply(lines.join('\n'));
       break;
     }
 
     case 'profile': {
       const targetUser = message.mentions.users.first() || message.author;
-      const profile = memory.getUserProfile(targetUser.id);
+      const profile = await memory.getUserProfile(targetUser.id);
       if (!profile) {
         await message.reply('No data on that user yet.');
         return;
@@ -147,7 +183,7 @@ async function handleCommand(message, command, args) {
 
     case 'topic': {
       if (!ai.ready) {
-        await message.reply('AI models are still loading.');
+        await message.reply('AI is still initializing.');
         return;
       }
       await message.channel.sendTyping();
@@ -161,6 +197,7 @@ async function handleCommand(message, command, args) {
         '**Available Commands:**',
         `\`${PREFIX}ask <question>\` - Ask the AI a question`,
         `\`${PREFIX}sentiment <text>\` - Analyze text sentiment`,
+        `\`${PREFIX}analyze <text>\` - Full NLP text analysis`,
         `\`${PREFIX}profile [@user]\` - View user profile`,
         `\`${PREFIX}topic\` - Generate a discussion topic`,
         `\`${PREFIX}setchannel\` - Set autonomous activity channel (admin)`,
@@ -177,22 +214,21 @@ async function handleCommand(message, command, args) {
 // --- Mention handler ---
 async function handleMention(message, content) {
   if (!ai.ready) {
-    await message.reply("I'm still warming up my AI models. Give me a moment!");
+    await message.reply("I'm still warming up. Give me a moment!");
     return;
   }
 
   await message.channel.sendTyping();
 
-  // Strip the mention from the message
   const cleanContent = content.replace(/<@!?\d+>/g, '').trim();
   if (!cleanContent) {
     await message.reply("You mentioned me but didn't say anything! Try asking me something.");
     return;
   }
 
-  const context = memory.buildContextString(message.channel.id);
+  const context = await memory.buildContextString(message.channel.id);
   const response = await ai.generateResponse(cleanContent, context);
-  memory.addMessage(client.user.id, message.channel.id, 'assistant', response);
+  await memory.addMessage(client.user.id, message.channel.id, 'assistant', response);
   await message.reply(response);
 }
 
@@ -211,21 +247,16 @@ client.on(Events.GuildMemberAdd, async (member) => {
 });
 
 // --- Graceful shutdown ---
-process.on('SIGINT', () => {
-  console.log('[Bot] Shutting down...');
+async function shutdown(signal) {
+  console.log(`[Bot] ${signal} received, shutting down...`);
   autonomous.stopAll();
-  memory.close();
+  await memory.close();
   client.destroy();
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-  console.log('[Bot] Received SIGTERM, shutting down...');
-  autonomous.stopAll();
-  memory.close();
-  client.destroy();
-  process.exit(0);
-});
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 // --- Start ---
 const token = process.env.DISCORD_TOKEN;

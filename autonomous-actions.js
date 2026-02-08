@@ -1,4 +1,4 @@
-const cron = require('node-cron');
+const schedule = require('node-schedule');
 
 class AutonomousActions {
   constructor(client, aiEngine, memory) {
@@ -22,15 +22,15 @@ class AutonomousActions {
   }
 
   stopAll() {
-    this.scheduledJobs.forEach(job => job.stop());
+    this.scheduledJobs.forEach(job => job.cancel());
     this.scheduledJobs = [];
     console.log('[Autonomous] All scheduled actions stopped.');
   }
 
   // Post a conversation starter at configured intervals
   _scheduleTopicStarter() {
-    const minutes = process.env.AUTONOMOUS_INTERVAL_MINUTES || 30;
-    const job = cron.schedule(`*/${minutes} * * * *`, async () => {
+    const minutes = parseInt(process.env.AUTONOMOUS_INTERVAL_MINUTES, 10) || 30;
+    const job = schedule.scheduleJob(`*/${minutes} * * * *`, async () => {
       try {
         if (!this.targetChannelId) return;
         const channel = await this.client.channels.fetch(this.targetChannelId);
@@ -49,13 +49,13 @@ class AutonomousActions {
 
   // Check channel mood every 2 hours
   _scheduleMoodCheck() {
-    const job = cron.schedule('0 */2 * * *', async () => {
+    const job = schedule.scheduleJob('0 */2 * * *', async () => {
       try {
         if (!this.targetChannelId) return;
         const channel = await this.client.channels.fetch(this.targetChannelId);
         if (!channel) return;
 
-        const recent = this.memory.getRecentConversation(this.targetChannelId, 20);
+        const recent = await this.memory.getRecentConversation(this.targetChannelId, 20);
         if (recent.length === 0) return;
 
         let positiveCount = 0;
@@ -63,18 +63,18 @@ class AutonomousActions {
 
         for (const msg of recent) {
           if (msg.role === 'user') {
-            const sentiment = await this.ai.analyzeSentiment(msg.content);
+            const sentiment = this.ai.analyzeSentiment(msg.content);
             if (sentiment.label === 'POSITIVE') positiveCount++;
-            else negativeCount++;
+            else if (sentiment.label === 'NEGATIVE') negativeCount++;
           }
         }
 
         const total = positiveCount + negativeCount;
-        if (total === 0) return;
+        if (total < 5) return;
 
         const positiveRatio = positiveCount / total;
 
-        if (positiveRatio < 0.3 && total >= 5) {
+        if (positiveRatio < 0.3) {
           const encouragement = await this.ai.generateResponse(
             'The chat seems a bit down. Generate a short encouraging or uplifting message.'
           );
@@ -91,13 +91,13 @@ class AutonomousActions {
 
   // Post daily activity summary at midnight
   _scheduleActivitySummary() {
-    const job = cron.schedule('0 0 * * *', async () => {
+    const job = schedule.scheduleJob('0 0 * * *', async () => {
       try {
         if (!this.targetChannelId) return;
         const channel = await this.client.channels.fetch(this.targetChannelId);
         if (!channel) return;
 
-        const activeUsers = this.memory.getActiveUsers(24);
+        const activeUsers = await this.memory.getActiveUsers(24);
         if (activeUsers.length === 0) return;
 
         const lines = [
