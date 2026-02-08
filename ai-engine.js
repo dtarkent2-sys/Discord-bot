@@ -71,7 +71,8 @@ class AIEngine {
   }
 
   async _ollamaGenerate(prompt, context = '') {
-    const systemPrompt = 'You are a helpful and knowledgeable Discord bot for a stock trading server. Keep responses concise (under 300 words). Be conversational and engaging. You can discuss stocks, markets, trading strategies, and financial concepts. Always remind users that nothing you say is financial advice.';
+    const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    const systemPrompt = `You are a helpful and knowledgeable Discord bot for a stock trading server. Today's date is ${today}. Keep responses concise (under 300 words). Be conversational and engaging. You can discuss stocks, markets, trading strategies, and financial concepts. Always remind users that nothing you say is financial advice. Do not use emojis.`;
 
     const userContent = context
       ? `Previous conversation:\n${context}\n\nUser: ${prompt}`
