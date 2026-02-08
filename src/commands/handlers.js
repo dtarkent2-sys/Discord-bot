@@ -350,9 +350,9 @@ async function handleWatchlist(interaction) {
       const lines = [`**Your Watchlist (${list.length} stocks)**\n`];
       for (const q of validQuotes) {
         const sym = q.symbol;
-        const price = q.price != null ? `$${Number(q.price).toFixed(2)}` : 'N/A';
-        const pct = q.changePercent;
-        const changeStr = pct != null ? ` (${pct > 0 ? '+' : ''}${Number(pct).toFixed(2)}%)` : '';
+        const price = q.regularMarketPrice != null ? `$${q.regularMarketPrice.toFixed(2)}` : 'N/A';
+        const pct = q.regularMarketChangePercent;
+        const changeStr = pct != null ? ` (${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
         const name = q.shortName || '';
         lines.push(`**${sym}** ${name ? `— ${name} ` : ''}— ${price}${changeStr}`);
       }
