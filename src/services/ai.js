@@ -3,6 +3,7 @@ const config = require('../config');
 const memory = require('./memory');
 const mood = require('./mood');
 const { persona, pick, buildPersonalityPrompt } = require('../personality');
+const { webSearch, formatResultsForAI } = require('../tools/web-search');
 
 class AIService {
   constructor() {
@@ -51,7 +52,7 @@ class AIService {
   }
 
   buildSystemPrompt(options = {}) {
-    const { liveData } = options;
+    const { liveData, searchResults } = options;
     const today = new Date().toISOString().slice(0, 10);
 
     return `
@@ -65,8 +66,72 @@ Keep responses concise (under 300 words) and natural. No corporate speak.
 
 You are knowledgeable about financial markets, trading, investing, and the economy. Answer questions using your knowledge. Discuss prices, trends, analysis, opinions — whatever the user asks about. Just be helpful.
 ${liveData ? `\nLIVE DATA (use these real numbers when available):\n${liveData}\n` : ''}
+${searchResults ? `\nWEB SEARCH RESULTS (use this real-time information to answer the user's question — cite sources when possible):\n${searchResults}\n` : ''}
 ${mood.buildMoodContext()}
 `.trim();
+  }
+
+  /**
+   * Detect whether a message likely needs a live web search to answer well.
+   * Uses simple keyword heuristics — not perfect, but catches most real-time questions.
+   */
+  _needsWebSearch(message) {
+    if (!config.searxngUrl) return false;
+
+    const lower = message.toLowerCase();
+
+    // Current events / real-time triggers
+    const realtimePatterns = [
+      /\bwho(?:'s| is| are)\b.*\b(?:playing|winning|leading|fighting|competing|running)\b/,
+      /\b(?:super\s?bowl|world\s?series|world\s?cup|olympics|nba finals|stanley cup|march madness)\b/,
+      /\b(?:today|tonight|yesterday|this week|this weekend|right now|currently|latest|recent|breaking)\b/,
+      /\b(?:score|results?|standings?|rankings?|winner|champion)\b/,
+      /\b(?:news|headline|update|happening|announced|released|launched)\b/,
+      /\b(?:what happened|what's going on|what is going on|what's new)\b/,
+      /\b(?:weather|forecast|temperature)\b/,
+      /\b(?:election|vote|poll|debate)\b/,
+      /\b(?:who won|who lost|who died|who got)\b/,
+      /\b(?:when (?:is|does|did|will))\b/,
+      /\b(?:is .{3,} (?:open|closed|canceled|cancelled|delayed|postponed))\b/,
+    ];
+
+    // Question patterns that suggest "look this up"
+    const questionPatterns = [
+      /\bwhat(?:'s| is| are| was| were)\b.*\b(?:price|cost|worth|salary|net worth|market cap)\b/,
+      /\bhow (?:much|many|old|tall|far|long)\b/,
+      /\bwhere (?:is|are|can|do)\b/,
+      /\blook up\b/,
+      /\bsearch for\b/,
+      /\bgoogle\b/,
+      /\bfind out\b/,
+    ];
+
+    for (const pat of realtimePatterns) {
+      if (pat.test(lower)) return true;
+    }
+    for (const pat of questionPatterns) {
+      if (pat.test(lower)) return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Build a concise search query from a user message.
+   */
+  _buildSearchQuery(message) {
+    // Strip common filler and just keep the substance
+    let q = message
+      .replace(/^(hey|hi|yo|ok|okay|so|well|um|hmm|please|can you|could you|do you know|tell me|what's|who's)\s+/i, '')
+      .replace(/[?!.]+$/, '')
+      .trim();
+
+    // If still too long, truncate to first ~80 chars
+    if (q.length > 80) {
+      q = q.slice(0, 80).replace(/\s\S*$/, '');
+    }
+
+    return q || message.slice(0, 80);
   }
 
   async chat(userId, username, userMessage, options = {}) {
@@ -74,7 +139,23 @@ ${mood.buildMoodContext()}
 
     memory.recordInteraction(userId, username, userMessage);
 
-    const systemPrompt = this.buildSystemPrompt({ liveData });
+    // Auto-search for real-time questions
+    let searchResults = null;
+    if (!liveData && this._needsWebSearch(userMessage)) {
+      try {
+        const query = this._buildSearchQuery(userMessage);
+        console.log(`[AI] Auto-searching: "${query}"`);
+        const result = await webSearch(query, 3);
+        if (!result.error && result.results && result.results.length > 0) {
+          searchResults = formatResultsForAI(result);
+          console.log(`[AI] Search returned ${result.results.length} results`);
+        }
+      } catch (err) {
+        console.error('[AI] Web search failed, continuing without:', err.message);
+      }
+    }
+
+    const systemPrompt = this.buildSystemPrompt({ liveData, searchResults });
 
     const memoryContext = memory.buildContext(userId);
     let fullSystemPrompt = systemPrompt;
