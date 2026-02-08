@@ -33,21 +33,31 @@ class P123Client {
 
   // ── Authentication ──────────────────────────────────────────────────
   async _authenticate() {
+    console.log(`[P123] Authenticating with API ID: ${config.p123ApiId.slice(0, 4)}...`);
     const res = await fetch(`${BASE_URL}/auth`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ apiId: config.p123ApiId, apiKey: config.p123ApiKey }),
     });
 
+    const text = await res.text();
     if (!res.ok) {
-      const text = await res.text();
+      console.error(`[P123] Auth failed (${res.status}): ${text}`);
       throw new Error(`P123 auth failed (${res.status}): ${text}`);
     }
 
-    const data = await res.json();
-    this._token = data.token || data;
-    // Refresh token every 50 minutes (tokens typically last 60 min)
+    // Token may be returned as plain string or as { token: "..." }
+    let token;
+    try {
+      const parsed = JSON.parse(text);
+      token = typeof parsed === 'string' ? parsed : parsed.token || parsed;
+    } catch {
+      token = text.replace(/^"|"$/g, ''); // strip quotes if raw string
+    }
+
+    this._token = token;
     this._tokenExpiry = Date.now() + 50 * 60 * 1000;
+    console.log(`[P123] Auth successful, token: ${String(token).slice(0, 8)}...`);
     return this._token;
   }
 
@@ -70,10 +80,12 @@ class P123Client {
     };
     if (body) opts.body = JSON.stringify(body);
 
+    console.log(`[P123] ${method} ${path}`);
     let res = await fetch(`${BASE_URL}${path}`, opts);
 
     // Auto re-auth on 401/403
     if (res.status === 401 || res.status === 403) {
+      console.log(`[P123] Got ${res.status}, re-authenticating...`);
       await this._authenticate();
       opts.headers['Authorization'] = `Bearer ${this._token}`;
       res = await fetch(`${BASE_URL}${path}`, opts);
@@ -81,7 +93,15 @@ class P123Client {
 
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`P123 ${method} ${path} failed (${res.status}): ${text}`);
+      console.error(`[P123] ${method} ${path} failed (${res.status}): ${text}`);
+      // Provide user-friendly messages for common errors
+      if (res.status === 402) {
+        throw new Error(`Portfolio123 subscription required for this feature. Check your P123 account plan.`);
+      }
+      if (res.status === 403) {
+        throw new Error(`Portfolio123 access denied. Your API plan may not include this endpoint. Response: ${text}`);
+      }
+      throw new Error(`P123 error (${res.status}): ${text}`);
     }
 
     return res.json();
