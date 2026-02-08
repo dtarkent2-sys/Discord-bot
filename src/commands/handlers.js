@@ -5,6 +5,7 @@ const stats = require('../services/stats');
 const reactions = require('../services/reactions');
 const sentiment = require('../services/sentiment');
 const yahoo = require('../services/yahoo');
+const tradingAgents = require('../services/trading-agents');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 
 async function handleCommand(interaction) {
@@ -36,6 +37,8 @@ async function handleCommand(interaction) {
       return handleWatchlist(interaction);
     case 'profile':
       return handleProfile(interaction);
+    case 'deepanalysis':
+      return handleDeepAnalysis(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   }
@@ -242,6 +245,7 @@ async function handleHelp(interaction) {
     '**Slash Commands:**',
     '`/ask <question>` — Ask the AI a question',
     '`/analyze <ticker>` — AI-powered stock analysis with live data',
+    '`/deepanalysis <ticker>` — Multi-agent deep analysis (BUY/SELL/HOLD signal)',
     '`/price <ticker>` — Quick price + key stats lookup',
     '`/screen <universe> [rules]` — Run a stock screen',
     '`/watchlist [action] [ticker]` — Manage your stock watchlist',
@@ -420,6 +424,53 @@ async function handleProfile(interaction) {
   }
 
   await interaction.reply(lines.join('\n'));
+}
+
+// ── /deepanalysis — Multi-agent trading analysis (TradingAgents) ─────
+async function handleDeepAnalysis(interaction) {
+  await interaction.deferReply();
+
+  const ticker = interaction.options.getString('ticker').toUpperCase();
+
+  // Update progress via editing the deferred reply
+  const updateProgress = async (stage, message) => {
+    try {
+      await interaction.editReply(`**TradingAgents — ${ticker}**\n⏳ ${message}`);
+    } catch (e) {
+      // Ignore edit errors during rapid updates
+    }
+  };
+
+  try {
+    const result = await tradingAgents.analyze(ticker, updateProgress);
+
+    // Format the main summary for Discord
+    const formatted = tradingAgents.formatForDiscord(result);
+    await interaction.editReply(formatted);
+
+    // Send detailed report as a follow-up if it fits
+    const detailed = tradingAgents.formatDetailedReport(result);
+    if (detailed.length <= 1950) {
+      await interaction.followUp({ content: `\`\`\`md\n${detailed}\n\`\`\``, ephemeral: true });
+    } else {
+      // Chunk it for the user as an ephemeral message
+      const chunks = [];
+      let remaining = detailed;
+      while (remaining.length > 0) {
+        chunks.push(remaining.slice(0, 1900));
+        remaining = remaining.slice(1900);
+      }
+      for (let i = 0; i < Math.min(chunks.length, 3); i++) {
+        await interaction.followUp({
+          content: `\`\`\`md\n${chunks[i]}\n\`\`\``,
+          ephemeral: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.error(`[DeepAnalysis] Error for ${ticker}:`, err);
+    await interaction.editReply(`**TradingAgents — ${ticker}**\n❌ Analysis failed: ${err.message}`);
+  }
 }
 
 module.exports = { handleCommand };

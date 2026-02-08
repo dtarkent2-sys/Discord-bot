@@ -104,6 +104,15 @@ const commands = [
         .setDescription('User to view (defaults to you)')
         .setRequired(false)
     ),
+
+  new SlashCommandBuilder()
+    .setName('deepanalysis')
+    .setDescription('Multi-agent deep analysis (TradingAgents) — BUY/SELL/HOLD signal')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock ticker symbol (e.g. AAPL, TSLA)')
+        .setRequired(true)
+    ),
 ];
 
 async function registerCommands() {
