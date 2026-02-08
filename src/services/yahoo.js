@@ -30,11 +30,36 @@ class YahooFinanceClient {
     return !this._initFailed;
   }
 
+  // ── Retry helper — retries on transient network failures ────────────
+  async _retry(fn, label, maxRetries = 2) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        const msg = err.message || '';
+        const isTransient = msg.includes('fetch failed') ||
+          msg.includes('ECONNREFUSED') ||
+          msg.includes('ECONNRESET') ||
+          msg.includes('ETIMEDOUT') ||
+          msg.includes('socket hang up') ||
+          msg.includes('network');
+
+        if (isTransient && attempt < maxRetries) {
+          const delay = (attempt + 1) * 1500; // 1.5s, 3s
+          console.warn(`[Yahoo] ${label} attempt ${attempt + 1} failed (${msg}), retrying in ${delay}ms...`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
   // ── Quote — current price + key stats ───────────────────────────────
   async getQuote(ticker) {
     const yf = await this._getYF();
     if (!yf) throw new Error('Yahoo Finance not available');
-    return yf.quote(ticker.toUpperCase());
+    return this._retry(() => yf.quote(ticker.toUpperCase()), `quote(${ticker})`);
   }
 
   // ── Quotes — batch price lookup ─────────────────────────────────────
@@ -45,7 +70,7 @@ class YahooFinanceClient {
     const results = [];
     for (const ticker of tickers) {
       try {
-        const quote = await yf.quote(ticker.toUpperCase());
+        const quote = await this._retry(() => yf.quote(ticker.toUpperCase()), `quote(${ticker})`);
         results.push(quote);
       } catch (err) {
         console.error(`[Yahoo] Quote error for ${ticker}:`, err.message);
@@ -60,13 +85,19 @@ class YahooFinanceClient {
     const yf = await this._getYF();
     if (!yf) throw new Error('Yahoo Finance not available');
 
+    const now = new Date();
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
 
-    const result = await yf.chart(ticker.toUpperCase(), {
-      period1: startDate,
-      interval: '1d',
-    });
+    // Pass period1 and period2 as Unix timestamps (seconds) to avoid
+    // Date object serialization issues across Node versions
+    const period1 = Math.floor(startDate.getTime() / 1000);
+    const period2 = Math.floor(now.getTime() / 1000);
+
+    const result = await this._retry(
+      () => yf.chart(ticker.toUpperCase(), { period1, period2, interval: '1d' }),
+      `chart(${ticker})`
+    );
 
     // chart() returns { quotes: [{ date, open, high, low, close, volume }] }
     return result.quotes || [];
@@ -80,11 +111,18 @@ class YahooFinanceClient {
     const upper = ticker.toUpperCase();
 
     // Fetch quote summary and price history in parallel
+    // Both have independent error handling so one failure doesn't kill the other
     const [summary, history] = await Promise.all([
-      yf.quoteSummary(upper, {
-        modules: ['price', 'summaryDetail', 'defaultKeyStatistics', 'financialData'],
+      this._retry(
+        () => yf.quoteSummary(upper, {
+          modules: ['price', 'summaryDetail', 'defaultKeyStatistics', 'financialData'],
+        }),
+        `quoteSummary(${upper})`
+      ),
+      this.getHistory(upper, 200).catch(err => {
+        console.warn(`[Yahoo] History fetch failed for ${upper}, continuing without:`, err.message);
+        return [];
       }),
-      this.getHistory(upper, 200).catch(() => []),
     ]);
 
     const price = summary.price || {};
@@ -141,7 +179,7 @@ class YahooFinanceClient {
     const yf = await this._getYF();
     if (!yf) throw new Error('Yahoo Finance not available');
 
-    const result = await yf.search(query);
+    const result = await this._retry(() => yf.search(query), `search(${query})`);
     return (result.quotes || []).filter(q => q.quoteType === 'EQUITY').slice(0, 10);
   }
 
@@ -151,7 +189,10 @@ class YahooFinanceClient {
     if (!yf) throw new Error('Yahoo Finance not available');
 
     try {
-      const result = await yf.screener({ scrIds: 'day_gainers', count: 20 });
+      const result = await this._retry(
+        () => yf.screener({ scrIds: 'day_gainers', count: 20 }),
+        'screener(day_gainers)'
+      );
       if (result && result.quotes) {
         return result.quotes;
       }
