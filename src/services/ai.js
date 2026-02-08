@@ -9,7 +9,11 @@ const PRICE_PATTERN = /\$\d[\d,.]*|\d+\.\d{2}%|trades?\s+at|currently\s+(trading
 
 class AIService {
   constructor() {
-    this.ollama = new Ollama({ host: config.ollamaHost });
+    const ollamaOptions = { host: config.ollamaHost };
+    if (config.ollamaApiKey) {
+      ollamaOptions.headers = { Authorization: `Bearer ${config.ollamaApiKey}` };
+    }
+    this.ollama = new Ollama(ollamaOptions);
     this.model = config.ollamaModel;
     this.conversationHistory = new Map(); // userId -> messages[]
     this.maxHistory = 20;
