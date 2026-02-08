@@ -1,85 +1,161 @@
-const { execFile } = require('child_process');
-const path = require('path');
-
-const SCRIPT = path.join(__dirname, '..', '..', 'scripts', 'yfinance_fetch.py');
-const TIMEOUT = 30000; // 30 seconds
+/**
+ * Yahoo Finance client using yahoo-finance2 v3 (Node.js).
+ * No API key required — uses Yahoo's public APIs.
+ */
 
 class YahooFinanceClient {
   constructor() {
-    this._pythonCmd = null;
+    this._yf = null;
+    this._initFailed = false;
   }
 
-  // Detect python3 or python
-  async _getPython() {
-    if (this._pythonCmd) return this._pythonCmd;
+  // yahoo-finance2 v3: import class and instantiate
+  async _getYF() {
+    if (this._yf) return this._yf;
+    if (this._initFailed) return null;
 
-    for (const cmd of ['python3', 'python']) {
-      try {
-        await this._exec(cmd, ['--version']);
-        this._pythonCmd = cmd;
-        return cmd;
-      } catch { /* try next */ }
+    try {
+      const YahooFinance = (await import('yahoo-finance2')).default;
+      this._yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
+      console.log('[Yahoo] yahoo-finance2 v3 loaded successfully.');
+      return this._yf;
+    } catch (err) {
+      console.error('[Yahoo] Failed to load yahoo-finance2:', err.message);
+      this._initFailed = true;
+      return null;
     }
-    throw new Error('Python not found. Install Python 3 and yfinance: pip install yfinance');
-  }
-
-  // Run a shell command and return stdout
-  _exec(cmd, args) {
-    return new Promise((resolve, reject) => {
-      execFile(cmd, args, { timeout: TIMEOUT }, (err, stdout, stderr) => {
-        if (err) return reject(err);
-        resolve(stdout);
-      });
-    });
-  }
-
-  // Call the Python yfinance script
-  async _call(command, ...args) {
-    const python = await this._getPython();
-    const stdout = await this._exec(python, [SCRIPT, command, ...args]);
-    const result = JSON.parse(stdout.trim());
-    if (result && result.error) {
-      throw new Error(result.error);
-    }
-    return result;
   }
 
   get enabled() {
-    return true; // yfinance needs no API key
+    return !this._initFailed;
   }
 
   // ── Quote — current price + key stats ───────────────────────────────
   async getQuote(ticker) {
-    return this._call('quote', ticker.toUpperCase());
+    const yf = await this._getYF();
+    if (!yf) throw new Error('Yahoo Finance not available');
+    return yf.quote(ticker.toUpperCase());
   }
 
   // ── Quotes — batch price lookup ─────────────────────────────────────
   async getQuotes(tickers) {
-    const tickerStr = tickers.map(t => t.toUpperCase()).join(',');
-    return this._call('quotes', tickerStr);
+    const yf = await this._getYF();
+    if (!yf) throw new Error('Yahoo Finance not available');
+
+    const results = [];
+    for (const ticker of tickers) {
+      try {
+        const quote = await yf.quote(ticker.toUpperCase());
+        results.push(quote);
+      } catch (err) {
+        console.error(`[Yahoo] Quote error for ${ticker}:`, err.message);
+        results.push({ symbol: ticker.toUpperCase(), error: err.message });
+      }
+    }
+    return results;
   }
 
   // ── Historical — price history ──────────────────────────────────────
   async getHistory(ticker, days = 30) {
-    return this._call('history', ticker.toUpperCase(), String(days));
+    const yf = await this._getYF();
+    if (!yf) throw new Error('Yahoo Finance not available');
+
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    return yf.historical(ticker.toUpperCase(), {
+      period1: startDate,
+      interval: '1d',
+    });
   }
 
   // ── Ticker Snapshot — full fundamentals + technicals ────────────────
   async getTickerSnapshot(ticker) {
-    const data = await this._call('snapshot', ticker.toUpperCase());
-    data.timestamp = new Date().toISOString();
-    return data;
+    const yf = await this._getYF();
+    if (!yf) throw new Error('Yahoo Finance not available');
+
+    const upper = ticker.toUpperCase();
+
+    // Fetch quote summary and price history in parallel
+    const [summary, history] = await Promise.all([
+      yf.quoteSummary(upper, {
+        modules: ['price', 'summaryDetail', 'defaultKeyStatistics', 'financialData'],
+      }),
+      this.getHistory(upper, 200).catch(() => []),
+    ]);
+
+    const price = summary.price || {};
+    const detail = summary.summaryDetail || {};
+    const keyStats = summary.defaultKeyStatistics || {};
+    const financials = summary.financialData || {};
+
+    // Compute technicals from history
+    const closes = history.map(d => d.close).filter(c => c != null);
+    const sma50 = closes.length >= 50 ? this._sma(closes, 50) : null;
+    const sma200 = closes.length >= 200 ? this._sma(closes, 200) : null;
+    const rsi14 = closes.length >= 15 ? this._rsi(closes, 14) : null;
+
+    return {
+      ticker: upper,
+      name: price.shortName || price.longName,
+      price: price.regularMarketPrice,
+      previousClose: price.regularMarketPreviousClose,
+      open: price.regularMarketOpen,
+      dayHigh: price.regularMarketDayHigh,
+      dayLow: price.regularMarketDayLow,
+      volume: price.regularMarketVolume,
+      marketCap: price.marketCap,
+      change: price.regularMarketChange,
+      changePercent: price.regularMarketChangePercent,
+
+      // Fundamentals
+      pe: detail.trailingPE,
+      forwardPE: detail.forwardPE,
+      pb: keyStats.priceToBook,
+      eps: financials.earningsPerShare || keyStats.trailingEps,
+      divYield: detail.dividendYield != null ? detail.dividendYield * 100 : null,
+      roe: financials.returnOnEquity != null ? financials.returnOnEquity * 100 : null,
+      profitMargin: financials.profitMargins != null ? financials.profitMargins * 100 : null,
+      revenueGrowth: financials.revenueGrowth != null ? financials.revenueGrowth * 100 : null,
+      beta: detail.beta,
+      fiftyTwoWeekHigh: detail.fiftyTwoWeekHigh,
+      fiftyTwoWeekLow: detail.fiftyTwoWeekLow,
+
+      // Technicals (computed from history)
+      sma50,
+      sma200,
+      rsi14,
+
+      // Recent price history for AI context
+      priceHistory: history.slice(-30),
+
+      timestamp: new Date().toISOString(),
+    };
   }
 
   // ── Search — find tickers by name ───────────────────────────────────
   async search(query) {
-    return this._call('search', query);
+    const yf = await this._getYF();
+    if (!yf) throw new Error('Yahoo Finance not available');
+
+    const result = await yf.search(query);
+    return (result.quotes || []).filter(q => q.quoteType === 'EQUITY').slice(0, 10);
   }
 
-  // ── Screening — trending tickers ──────────────────────────────────
+  // ── Screening — v3 uses screener() API ────────────────────────────
   async screenByGainers() {
-    const data = await this._call('trending');
-    return Array.isArray(data) ? data : [];
+    const yf = await this._getYF();
+    if (!yf) throw new Error('Yahoo Finance not available');
+
+    try {
+      const result = await yf.screener({ scrIds: 'day_gainers', count: 20 });
+      if (result && result.quotes) {
+        return result.quotes;
+      }
+    } catch (err) {
+      console.error('[Yahoo] Screener error:', err.message);
+    }
+    return [];
   }
 
   // ── Format helpers ──────────────────────────────────────────────────
@@ -87,13 +163,13 @@ class YahooFinanceClient {
   formatQuoteForDiscord(quote) {
     if (!quote) return 'No data available.';
 
-    const lines = [`**${quote.symbol || quote.ticker}** — ${quote.shortName || quote.name || 'Unknown'}\n`];
-    if (quote.price != null) lines.push(`**Price:** $${Number(quote.price).toFixed(2)}`);
-    if (quote.changePercent != null) {
-      const pct = quote.changePercent;
-      lines.push(`**Change:** ${pct > 0 ? '+' : ''}${Number(pct).toFixed(2)}%`);
+    const lines = [`**${quote.symbol}** — ${quote.shortName || 'Unknown'}\n`];
+    if (quote.regularMarketPrice != null) lines.push(`**Price:** $${quote.regularMarketPrice.toFixed(2)}`);
+    if (quote.regularMarketChangePercent != null) {
+      const pct = quote.regularMarketChangePercent;
+      lines.push(`**Change:** ${pct > 0 ? '+' : ''}${pct.toFixed(2)}%`);
     }
-    if (quote.volume) lines.push(`**Volume:** ${Number(quote.volume).toLocaleString()}`);
+    if (quote.regularMarketVolume) lines.push(`**Volume:** ${Number(quote.regularMarketVolume).toLocaleString()}`);
     if (quote.marketCap) lines.push(`**Market Cap:** $${(quote.marketCap / 1e9).toFixed(2)}B`);
     return lines.join('\n');
   }
@@ -107,11 +183,11 @@ class YahooFinanceClient {
     output += '---------|-----------|----------|----------\n';
     for (const q of rows) {
       const sym = (q.symbol || '').padEnd(8);
-      const price = q.price != null ? `$${Number(q.price).toFixed(2)}`.padEnd(9) : 'N/A'.padEnd(9);
-      const change = q.changePercent != null
-        ? `${q.changePercent > 0 ? '+' : ''}${Number(q.changePercent).toFixed(2)}%`.padEnd(8)
+      const price = q.regularMarketPrice != null ? `$${q.regularMarketPrice.toFixed(2)}`.padEnd(9) : 'N/A'.padEnd(9);
+      const change = q.regularMarketChangePercent != null
+        ? `${q.regularMarketChangePercent > 0 ? '+' : ''}${q.regularMarketChangePercent.toFixed(2)}%`.padEnd(8)
         : 'N/A'.padEnd(8);
-      const vol = q.volume ? `${(q.volume / 1e6).toFixed(1)}M` : 'N/A';
+      const vol = q.regularMarketVolume ? `${(q.regularMarketVolume / 1e6).toFixed(1)}M` : 'N/A';
       output += `${sym} | ${price} | ${change} | ${vol}\n`;
     }
     output += '```';
@@ -120,6 +196,29 @@ class YahooFinanceClient {
       output = output.slice(0, 1900) + '\n...```';
     }
     return output;
+  }
+
+  // ── Technical indicator calculations ────────────────────────────────
+
+  _sma(prices, period) {
+    const recent = prices.slice(-period);
+    return Math.round((recent.reduce((a, b) => a + b, 0) / recent.length) * 100) / 100;
+  }
+
+  _rsi(prices, period = 14) {
+    if (prices.length < period + 1) return null;
+    let gains = 0;
+    let losses = 0;
+    for (let i = prices.length - period; i < prices.length; i++) {
+      const diff = prices[i] - prices[i - 1];
+      if (diff > 0) gains += diff;
+      else losses -= diff;
+    }
+    const avgGain = gains / period;
+    const avgLoss = losses / period;
+    if (avgLoss === 0) return 100;
+    const rs = avgGain / avgLoss;
+    return Math.round((100 - (100 / (1 + rs))) * 100) / 100;
   }
 }
 
