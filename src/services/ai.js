@@ -62,15 +62,20 @@ class AIService {
     }
 
     try {
-      const response = await this.ollama.chat({
+      // Use streaming to collect the response
+      const stream = await this.ollama.chat({
         model: this.model,
         messages: [
           { role: 'system', content: systemPrompt },
           ...history,
         ],
+        stream: true,
       });
 
-      const assistantMessage = response.message.content;
+      let assistantMessage = '';
+      for await (const part of stream) {
+        assistantMessage += part.message.content;
+      }
 
       // Add assistant response to history
       history.push({ role: 'assistant', content: assistantMessage });
@@ -90,14 +95,20 @@ class AIService {
     }
   }
 
-  // Simple completion without conversation context
+  // Stream-based completion without conversation context
   async complete(prompt) {
     try {
-      const response = await this.ollama.chat({
+      const stream = await this.ollama.chat({
         model: this.model,
         messages: [{ role: 'user', content: prompt }],
+        stream: true,
       });
-      return response.message.content;
+
+      let result = '';
+      for await (const part of stream) {
+        result += part.message.content;
+      }
+      return result;
     } catch (err) {
       console.error('Ollama completion error:', err.message);
       return null;
