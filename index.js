@@ -30,6 +30,9 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   stats.setGuildCount(c.guilds.cache.size);
 
+  // Test Ollama connection
+  await ai.initialize();
+
   // Register slash commands
   await registerCommands();
 

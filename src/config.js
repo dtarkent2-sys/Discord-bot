@@ -21,7 +21,7 @@ if (fs.existsSync(envPath)) {
 module.exports = {
   token: process.env.DISCORD_TOKEN,
   clientId: process.env.DISCORD_CLIENT_ID,
-  ollamaHost: process.env.OLLAMA_HOST || 'https://ollama.com',
+  ollamaHost: process.env.OLLAMA_HOST || process.env.OLLAMA_URL || 'https://ollama.com',
   ollamaModel: process.env.OLLAMA_MODEL || 'gemma4b',
   ollamaApiKey: process.env.OLLAMA_API_KEY || '',
   port: parseInt(process.env.PORT, 10) || 3000,
