@@ -13,6 +13,7 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.DirectMessages,
   ],
   partials: [Partials.Channel],
 });
@@ -99,6 +100,12 @@ client.on(Events.MessageCreate, async (message) => {
     await handleMention(message, content);
     return;
   }
+
+  // Handle DMs — respond to all messages (no prefix or mention needed)
+  if (!message.guild) {
+    await handleMention(message, content);
+    return;
+  }
 });
 
 // --- Command handler ---
@@ -173,6 +180,10 @@ async function handleCommand(message, command, args) {
     }
 
     case 'setchannel': {
+      if (!message.guild) {
+        await message.reply('This command can only be used in a server.');
+        return;
+      }
       if (!message.member.permissions.has('ManageGuild')) {
         await message.reply('You need the Manage Server permission to use this command.');
         return;
