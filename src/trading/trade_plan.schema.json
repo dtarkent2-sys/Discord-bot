@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TradePlan",
+  "description": "Validated trade plan output from the AI",
+  "type": "object",
+  "required": ["ticker", "direction", "confidence", "reasoning", "entry", "exit", "stopLoss", "dataUsed"],
+  "properties": {
+    "ticker": {
+      "type": "string",
+      "pattern": "^[A-Z]{1,5}$",
+      "description": "Stock ticker symbol"
+    },
+    "direction": {
+      "type": "string",
+      "enum": ["LONG", "SHORT", "NO_TRADE"],
+      "description": "Trade direction or NO_TRADE if data is insufficient"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["LOW", "MEDIUM", "HIGH"],
+      "description": "Confidence level in the trade"
+    },
+    "reasoning": {
+      "type": "string",
+      "minLength": 10,
+      "description": "Explanation grounded in provided data only"
+    },
+    "entry": {
+      "type": ["number", "null"],
+      "description": "Suggested entry price or null for NO_TRADE"
+    },
+    "exit": {
+      "type": ["number", "null"],
+      "description": "Suggested exit/target price or null for NO_TRADE"
+    },
+    "stopLoss": {
+      "type": ["number", "null"],
+      "description": "Stop loss price or null for NO_TRADE"
+    },
+    "timeframe": {
+      "type": "string",
+      "enum": ["intraday", "swing", "position"],
+      "description": "Expected holding period"
+    },
+    "dataUsed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "description": "List of data sources referenced in reasoning"
+    },
+    "missingFields": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Fields that were unavailable (present when direction is NO_TRADE)"
+    }
+  },
+  "if": {
+    "properties": { "direction": { "const": "NO_TRADE" } }
+  },
+  "then": {
+    "required": ["missingFields"]
+  },
+  "additionalProperties": false
+}
