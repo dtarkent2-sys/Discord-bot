@@ -22,7 +22,7 @@ module.exports = {
   token: process.env.DISCORD_TOKEN,
   clientId: process.env.DISCORD_CLIENT_ID,
   ollamaHost: process.env.OLLAMA_HOST || 'http://localhost:11434',
-  ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2',
+  ollamaModel: process.env.OLLAMA_MODEL || 'kimi-k2.5:cloud',
   port: parseInt(process.env.PORT, 10) || 3000,
   dataDir: path.join(__dirname, '..', 'data'),
 };
