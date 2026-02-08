@@ -344,24 +344,24 @@ async function handleWatchlist(interaction) {
   await interaction.deferReply();
   try {
     const quotes = await yahoo.getQuotes(list);
+    const validQuotes = quotes.filter(q => !q.error);
 
-    if (quotes.length > 0) {
+    if (validQuotes.length > 0) {
       const lines = [`**Your Watchlist (${list.length} stocks)**\n`];
-      for (const q of quotes) {
+      for (const q of validQuotes) {
         const sym = q.symbol;
-        const price = q.regularMarketPrice != null ? `$${q.regularMarketPrice.toFixed(2)}` : 'N/A';
-        const pct = q.regularMarketChangePercent;
-        const changeStr = pct != null ? ` (${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
+        const price = q.price != null ? `$${Number(q.price).toFixed(2)}` : 'N/A';
+        const pct = q.changePercent;
+        const changeStr = pct != null ? ` (${pct > 0 ? '+' : ''}${Number(pct).toFixed(2)}%)` : '';
         const name = q.shortName || '';
         lines.push(`**${sym}** ${name ? `— ${name} ` : ''}— ${price}${changeStr}`);
       }
-      // Show any tickers that failed to fetch
-      const fetched = new Set(quotes.map(q => q.symbol));
+      const fetched = new Set(validQuotes.map(q => q.symbol));
       const missed = list.filter(t => !fetched.has(t));
       if (missed.length > 0) {
         lines.push(`\n_Could not fetch: ${missed.join(', ')}_`);
       }
-      lines.push(`\n_Data via Yahoo Finance | ${new Date().toLocaleString()}_`);
+      lines.push(`\n_Data via Yahoo Finance (yfinance) | ${new Date().toLocaleString()}_`);
       await interaction.editReply(lines.join('\n'));
       return;
     }
