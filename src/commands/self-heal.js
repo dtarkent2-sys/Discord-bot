@@ -1,3 +1,4 @@
+const config = require('../config');
 const aicoder = require('../ai-coder.js');
 const github = require('../github-client.js');
 
@@ -6,8 +7,8 @@ module.exports = {
     description: 'Bot automatically finds and fixes bugs in a file. Usage: !selfheal <file_path>',
     async execute(message, args) {
         // 1. Owner check
-        if (message.author.id !== 'YOUR_DISCORD_USER_ID') {
-            return message.reply('⛔ Restricted to owner.');
+        if (!config.botOwnerId || message.author.id !== config.botOwnerId) {
+            return message.reply('Restricted to owner.');
         }
 
         if (!args[0]) {
@@ -18,10 +19,11 @@ module.exports = {
         const thinkingMsg = await message.channel.send(`🔍 **${this.name}** analyzing \`${filePath}\` for critical bugs...`);
 
         // 2. Get current code
-        const currentCode = await github.getFileContent(filePath);
-        if (!currentCode) {
-            return thinkingMsg.edit(`❌ Could not fetch \`${filePath}\`. Check the path.`);
+        const fileData = await github.getFileContent(filePath);
+        if (!fileData) {
+            return thinkingMsg.edit(`Could not fetch \`${filePath}\`. Check the path.`);
         }
+        const currentCode = fileData.content;
 
         // 3. AI Prompt for SELF-FIXING (not just suggesting)
         const selfFixPrompt = `

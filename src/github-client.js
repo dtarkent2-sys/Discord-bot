@@ -109,6 +109,11 @@ class GitHubClient {
     return { safe: true };
   }
 
+  // Public alias for self-heal module
+  diffLines(oldText, newText) {
+    return this._diffLineCount(oldText, newText);
+  }
+
   // Simple line difference counter
   _diffLineCount(oldText, newText) {
     const oldLines = oldText.split('\n');

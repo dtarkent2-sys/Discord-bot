@@ -1,6 +1,7 @@
 const config = require('../config');
 const github = require('../github-client');
 const aicoder = require('../ai-coder');
+const selfHealModule = require('./self-heal');
 
 // Owner-only guard
 function isOwner(message) {
@@ -137,7 +138,82 @@ async function handleRollback(message, args) {
     return message.reply('Usage: `!rollback <file_path>` — reverts to the previous commit version.');
   }
 
-  await message.channel.send('Rollback is not yet implemented. Use `git revert` manually for now.');
+  const filePath = args[0];
+  const waitMsg = await message.channel.send(`Rolling back \`${filePath}\`...`);
+
+  try {
+    const { Octokit } = await import('@octokit/rest');
+    const octokit = new Octokit({ auth: config.githubToken });
+
+    // Get commit history for this file
+    const commits = await octokit.repos.listCommits({
+      owner: config.githubOwner,
+      repo: config.githubRepo,
+      path: filePath,
+      sha: config.githubBranch,
+      per_page: 2,
+    });
+
+    if (!commits.data || commits.data.length < 2) {
+      return waitMsg.edit(`Cannot rollback \`${filePath}\`: no previous version found (only ${commits.data?.length || 0} commit(s)).`);
+    }
+
+    // Get the file content at the previous commit
+    const previousSha = commits.data[1].sha;
+    const previousFile = await octokit.repos.getContent({
+      owner: config.githubOwner,
+      repo: config.githubRepo,
+      path: filePath,
+      ref: previousSha,
+    });
+
+    const previousContent = Buffer.from(previousFile.data.content, 'base64').toString();
+    const commitMsg = `Rollback via Discord: ${filePath} to ${previousSha.slice(0, 7)} by ${message.author.username}`;
+
+    const result = await github.updateFile(filePath, previousContent, commitMsg);
+
+    if (result.success) {
+      await waitMsg.edit(`Rolled back \`${filePath}\` to previous version (commit ${previousSha.slice(0, 7)}).\nCommit: ${result.url}`);
+    } else {
+      await waitMsg.edit(`Rollback failed: ${result.error}`);
+    }
+  } catch (err) {
+    console.error(`[Rollback] Error:`, err);
+    await waitMsg.edit(`Rollback failed: ${err.message}`);
+  }
+}
+
+// ── !selfheal <file_path> ──────────────────────────────────────────
+async function handleSelfheal(message, args) {
+  await selfHealModule.execute(message, args);
+}
+
+// ── !help ──────────────────────────────────────────────────────────
+async function handleHelp(message) {
+  const prefix = config.botPrefix;
+  await message.reply([
+    '**Slash Commands:**',
+    '`/ask <question>` — Ask the AI a question',
+    '`/analyze <ticker>` — AI-powered stock analysis',
+    '`/price <ticker>` — Quick price + key stats',
+    '`/screen <universe> [rules]` — Run a stock screen',
+    '`/watchlist [action] [ticker]` — Manage your watchlist',
+    '`/sentiment <text>` — Analyze text sentiment',
+    '`/topic` — Generate a discussion topic',
+    '`/profile [@user]` — View user profile',
+    '`/memory` — See what the bot remembers about you',
+    '`/model <name>` — Switch the AI model',
+    '`/stats` — View bot statistics',
+    '`/help` — Show all commands',
+    '',
+    '**Prefix Commands (owner only):**',
+    `\`${prefix}update <file>\` — Push code to GitHub`,
+    `\`${prefix}suggest <file> <instruction>\` — AI code suggestion`,
+    `\`${prefix}autoedit <file> <instruction>\` — Auto-apply safe changes`,
+    `\`${prefix}rollback <file>\` — Revert a file to its previous version`,
+    `\`${prefix}selfheal <file>\` — AI auto-fix critical bugs`,
+    `\`${prefix}help\` — Show this message`,
+  ].join('\n'));
 }
 
 // Helper: split a string into chunks
@@ -163,6 +239,8 @@ const commands = {
   suggest: handleSuggest,
   autoedit: handleAutoedit,
   rollback: handleRollback,
+  selfheal: handleSelfheal,
+  help: handleHelp,
 };
 
 async function handlePrefixCommand(message) {
