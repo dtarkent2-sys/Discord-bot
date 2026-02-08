@@ -16,6 +16,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.74.0",
+    "@octokit/rest": "^22.0.1",
     "discord.js": "^14.16.3",
     "express": "^4.21.1",
     "node-schedule": "^2.1.1",

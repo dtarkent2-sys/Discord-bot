@@ -10,6 +10,7 @@ const { handleCommand } = require('./src/commands/handlers');
 const { registerCommands } = require('./src/commands/register');
 const { startDashboard } = require('./src/dashboard/server');
 const AutonomousBehaviorEngine = require('./src/services/autonomous');
+const { handlePrefixCommand } = require('./src/commands/prefix');
 
 // ── Discord Client Setup ─────────────────────────────────────────────
 const client = new Client({
@@ -67,6 +68,12 @@ client.on(Events.MessageCreate, async (message) => {
   // Ignore bots and system messages
   if (message.author.bot) return;
   if (!message.content && message.attachments.size === 0) return;
+
+  // Check for prefix commands (!update, !suggest, !autoedit) first
+  if (message.content.startsWith(config.botPrefix)) {
+    const handled = await handlePrefixCommand(message);
+    if (handled) return;
+  }
 
   // Only respond when mentioned or in DMs
   const isMentioned = message.mentions.has(client.user);
