@@ -1,6 +1,6 @@
-# Sprocket - Discord Trading Bot
+# Sprocket - Autonomous Discord Trading Bot
 
-An autonomous Discord trading bot powered by [Ollama](https://ollama.com). Features a personality-driven AI ("Sprocket, The Eager Analyst"), live market analysis with anti-hallucination safeguards, emotional intelligence, scheduled autonomous behaviors, and a web dashboard.
+An autonomous, goal-driven Discord trading bot powered by [Ollama](https://ollama.com). Features a personality-driven AI ("Sprocket, The Eager Analyst"), live market analysis with anti-hallucination safeguards, emotional intelligence, a proactive goal system, web search, self-healing code, a safety layer, and a web dashboard.
 
 [![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/dtarkent2-sys/Discord-bot)
 
@@ -8,18 +8,28 @@ An autonomous Discord trading bot powered by [Ollama](https://ollama.com). Featu
 
 ## Features
 
+### Core
 - **AI Chat** — Conversational responses via Ollama with streaming, conversation history, and Sprocket's personality
 - **Trade Analysis** — `/analyze <ticker>` fetches live market data, builds a structured trade plan with entry/stop/targets
 - **Anti-Hallucination Guard** — Two-layer defense: prompt-level HARD RULES + code-level regex detection blocks fabricated prices
 - **Mood Engine** — Sprocket's mood shifts based on market conditions (7 states from Euphoric to Distressed)
 - **Conversation Memory** — Per-user fact extraction, ticker tracking, topic classification, and sentiment history
-- **Autonomous Behaviors** — Scheduled pre-market briefings, sector heatmaps, unusual activity alerts, and weekend reviews
 - **Reaction Learning** — Learns from thumbs up/down reactions on its own messages
 - **Image Analysis** — Analyzes images via Ollama vision models when attached to messages
-- **Web Dashboard** — Real-time stats page at `/` with JSON API at `/api/stats` and health check at `/health`
+- **Watchlist** — Per-user stock watchlist with live price lookups via Portfolio123
+
+### Autonomous Agent
+- **Agent Core** — Goal-driven decision-making brain that evaluates context, classifies user intent, and chooses actions
+- **Proactive Goal System** — Weighted goals (`provide_value`, `foster_engagement`, `self_improve`, `learn_preferences`) with activation conditions and success metrics
+- **Web Search** — Live internet search via Serper API with caching and AI-powered summarization
+- **Safety & Rate Limits** — Guardrails preventing harmful autonomous actions, API rate limit tracking, and emergency stop
+- **Self-Healing** — AI-powered auto-fix for critical bugs via GitHub + Anthropic
+
+### Infrastructure
 - **Slash Commands** — 12 Discord slash commands: `/ask`, `/analyze`, `/price`, `/screen`, `/watchlist`, `/sentiment`, `/topic`, `/profile`, `/memory`, `/model`, `/stats`, `/help`
 - **Self-Editing** — Owner-only prefix commands to update, suggest, auto-edit, rollback, and self-heal code via GitHub + Anthropic AI
-- **Watchlist** — Per-user stock watchlist with live price lookups via Portfolio123
+- **Web Dashboard** — Real-time stats page at `/` with JSON API at `/api/stats` and health check at `/health`
+- **Monitoring** — Real-time log viewer, API usage graphs, goal achievement tracking, safety override alerts
 
 ---
 
@@ -72,6 +82,7 @@ All settings are configured through environment variables. See `.env.example`.
 | `GITHUB_REPO` | GitHub repo name | `Discord-bot` |
 | `GITHUB_BRANCH` | GitHub branch for code edits | `main` |
 | `ANTHROPIC_API_KEY` | Anthropic API key (for `!suggest`, `!autoedit`, `!selfheal`) | — |
+| `SERPER_API_KEY` | Serper Dev API key (for web search) | — |
 | `BOT_OWNER_ID` | Discord user ID of the bot owner (for prefix commands) | — |
 | `BOT_PREFIX` | Prefix for owner commands | `!` |
 | `PORT` | Dashboard/health check port | `3000` |
@@ -112,10 +123,87 @@ These require `BOT_OWNER_ID` to be set and are restricted to the bot owner.
 | `!selfheal <file>` | AI finds and auto-fixes one critical bug in a file |
 | `!help` | Show all commands |
 
+### Autonomy Commands (Owner Only)
+
+| Command | Description |
+|---|---|
+| `!autonomy status` | Show current goals, weights, and recent autonomous actions |
+| `!autonomy pause <minutes>` | Temporarily disable all autonomous behaviors |
+| `!autonomy setgoal <goal> <weight>` | Adjust a goal's priority weight |
+| `!autonomy override <action>` | Manually trigger an autonomous action |
+| `!safetystatus` | Show current rate limits, safety blocks, and API usage |
+
 ### Other
 
 - **@mention** the bot in any channel or send a **DM** to chat directly
 - React with :thumbsup: or :thumbsdown: on bot replies to provide feedback
+
+---
+
+## Autonomous Agent Architecture
+
+Sprocket is more than a chatbot — it's a goal-driven autonomous agent that decides when and how to act.
+
+### Agent Core (`agent-core.js`)
+
+The decision-making brain. Evaluates context, classifies user intent, and selects the best action.
+
+- **`evaluateContext(message)`** — Main decision loop. Considers user history, channel activity, time of day, and current goals
+- **`analyzeIntent(text)`** — Classifies what the user wants using AI
+- **`isChannelQuiet(channel, minutes)`** — Detects idle channels for proactive engagement
+- **`chooseActionBasedOnGoal(goal, context)`** — Picks an action aligned with the active goal
+
+Returns action objects like:
+```js
+{ action: 'execute', tool: 'getStockPrice', args: ['AAPL'] }
+{ action: 'respond', content: 'Markets are rallying today...' }
+{ action: 'wait', reason: 'Channel is active, no intervention needed' }
+```
+
+Available tools: `getStockPrice`, `webSearch`, `selfHeal`, `analyzeStock`, `runScreen`, `generateTopic`
+
+### Proactive Goal System
+
+Goals drive what Sprocket does when no one is asking it a question. Each goal has a weight, activation condition, and success metric.
+
+| Goal | Description | Trigger |
+|---|---|---|
+| `provide_value` | Post market summaries, react to major news, share insights | 9 AM daily, breaking market moves |
+| `foster_engagement` | Detect quiet channels, ask discussion questions, welcome users | Channel idle > 30 min |
+| `self_improve` | Monitor error logs, run `!selfheal`, optimize responses | Error rate > threshold |
+| `learn_preferences` | Track user interests, personalize responses, adapt tone | Every interaction |
+
+Goals are evaluated on a loop:
+- **Every 5 minutes** — Agent core checks if proactive action is needed
+- **Every hour** — Goal manager reviews progress and adjusts weights
+- **Every 24 hours** — Memory system prunes stale data
+
+### Web Search (`tools/web-search.js`)
+
+Live internet search capability via the [Serper Dev API](https://serper.dev).
+
+- **`webSearch(query, numResults)`** — Returns structured results with titles, links, and snippets
+- **`searchAndSummarize(query)`** — Searches the web and uses AI to produce a concise 2-3 sentence summary with source attribution
+- **5-minute cache** — Prevents duplicate API calls for the same query
+
+### Safety & Rate Limits (`safety-system.js`)
+
+A guardrail layer that every autonomous action must pass through before execution.
+
+**Safety rules:**
+- Never edit files containing API keys, passwords, or authentication logic
+- Maximum 3 GitHub commits per hour
+- Never mention specific stock tickers as financial advice
+- Never @mention more than 5 users at once
+- Maximum 10 web searches per hour
+- Never run `!selfheal` more than once per day
+
+**Graceful degradation:**
+- If an API fails, switch to fallback mode
+- If rate limited, queue actions with exponential backoff
+- All safety overrides are logged for review
+
+**Emergency stop:** `emergencyStop()` immediately halts all autonomous actions.
 
 ---
 
@@ -129,6 +217,31 @@ Sprocket runs 4 scheduled behaviors (all times Eastern):
 | 10 AM, 12 PM, 2 PM, 4 PM Mon-Fri | **Sector Pulse** — Heatmap of 11 sector ETFs |
 | 11 AM Mon-Fri (30% chance) | **Unusual Activity** — Scans watchlist for >3% movers |
 | Saturday 10 AM | **Weekend Review** — Bot stats and weekly summary |
+
+---
+
+## Memory & Personalization
+
+Sprocket maintains a multi-layer memory system for contextual, personalized interactions.
+
+### Per-User Memory
+- **Facts** — Extracted from conversation (name, job, interests, preferences)
+- **Tickers** — Tracks which stocks a user discusses most frequently
+- **Topics** — Classifies conversations (options, technical, fundamental, crypto, macro, risk)
+- **Watchlist** — Personal stock watchlist with add/remove/show
+- **Sentiment** — Per-user sentiment history with rolling average and trend detection
+
+### Long-Term Memory
+- **User Preferences** — Interests, interaction style, trust level
+- **Conversation Contexts** — Summaries of past conversations with key points
+- **Decision Outcomes** — What actions the bot took, whether they succeeded, and what it learned
+
+### Learning Loop
+1. User interacts with the bot
+2. Bot records the interaction, sentiment, and any extracted facts
+3. Bot's response is tracked — did the user give a :thumbsup: or :thumbsdown:?
+4. Outcome is saved to memory: `saveDecisionOutcome(decisionId, wasSuccessful, whatWorked)`
+5. Next time a similar context appears, `findSimilarContexts()` retrieves past outcomes to inform the response
 
 ---
 
@@ -163,12 +276,18 @@ Mood is updated by market P&L data and market signals, and decays toward neutral
 
 ```
 Discord-bot/
-├── index.js                        # Entry point — Discord client, message/reaction handlers
+├── index.js                        # Entry point — Discord client, event routing, autonomy loop
+├── agent-core.js                   # Agent brain — goal evaluation, intent classification, action selection
+├── safety-system.js                # Safety guardrails — rate limits, action validation, emergency stop
 ├── package.json                    # Dependencies and scripts
 ├── railway.toml                    # Railway deployment config
+├── Dockerfile                      # Container deployment (Railway/DigitalOcean)
+├── docker-compose.yml              # Local dev with optional PostgreSQL + Redis
 ├── .env.example                    # Environment variable template
 ├── .gitignore
 ├── data/                           # Persistent JSON storage (git-ignored)
+├── scripts/
+│   └── backup-memory.js            # Daily memory database backup to JSON
 └── src/
     ├── config.js                   # Environment config loader
     ├── personality.js              # Bot identity, speech patterns, quirks
@@ -179,14 +298,17 @@ Discord-bot/
     │   ├── handlers.js             # Slash command handlers (12 commands)
     │   ├── prefix.js               # Prefix command handlers (!update, !suggest, !autoedit, !rollback, !selfheal, !help)
     │   └── self-heal.js            # Self-healing command — AI auto-fix for critical bugs
+    ├── tools/
+    │   └── web-search.js           # Serper API web search with caching + AI summarization
     ├── dashboard/
-    │   └── server.js               # Express web dashboard with /health, /api/stats, /
+    │   ├── server.js               # Express web dashboard with /health, /api/stats, /
+    │   └── monitor.html            # Real-time monitoring UI (logs, API usage, goals, safety)
     ├── data/
     │   ├── freshness.js            # Data freshness gate (assertFresh)
     │   └── market.js               # Market context provider (getMarketContext)
     ├── services/
     │   ├── ai.js                   # Core AI service — system prompt, chat/complete
-    │   ├── autonomous.js           # Scheduled behaviors engine (4 cron jobs)
+    │   ├── autonomous.js           # Goal-driven scheduled behaviors engine
     │   ├── commentary.js           # AI-powered personality inflection with fallbacks
     │   ├── images.js               # Image analysis via Ollama vision models
     │   ├── memory.js               # Per-user memory — facts, tickers, topics, watchlist, context building
@@ -234,6 +356,22 @@ Since Ollama runs as a separate service, your options are:
 - **External Ollama** — Run Ollama on your own server, set `OLLAMA_HOST` to its public endpoint
 - **Ollama Cloud** — Use an Ollama cloud model variant (e.g. `gemma4b:cloud`)
 
+### Docker Deployment
+
+```bash
+# Build and run with Docker
+docker build -t sprocket-bot .
+docker run -d --env-file .env sprocket-bot
+
+# Or use docker-compose for local dev with full stack
+docker-compose up -d
+```
+
+The `docker-compose.yml` includes:
+- **Bot service** — The Discord bot
+- **PostgreSQL** (optional) — Production-grade memory storage
+- **Redis** (optional) — Response caching and rate limit tracking
+
 ---
 
 ## Local Development
@@ -251,6 +389,14 @@ ollama serve
 ```bash
 curl http://localhost:3000/health
 ```
+
+### Monitoring Dashboard
+
+Access the monitoring UI at `http://localhost:3000/monitor` for:
+- Real-time bot logs
+- API usage graphs (Ollama, P123, Serper, GitHub)
+- Goal achievement tracking
+- Safety override alerts
 
 ---
 
