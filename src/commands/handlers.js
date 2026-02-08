@@ -26,6 +26,16 @@ async function handleCommand(interaction) {
       return handlePrice(interaction);
     case 'screen':
       return handleScreen(interaction);
+    case 'help':
+      return handleHelp(interaction);
+    case 'sentiment':
+      return handleSentiment(interaction);
+    case 'topic':
+      return handleTopic(interaction);
+    case 'watchlist':
+      return handleWatchlist(interaction);
+    case 'profile':
+      return handleProfile(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   }
@@ -229,6 +239,194 @@ async function handleScreen(interaction) {
     console.error(`[Screen] Error:`, err);
     await interaction.editReply(`Screen failed: ${err.message}`);
   }
+}
+
+// ── /help — List all available commands ──────────────────────────────
+async function handleHelp(interaction) {
+  const lines = [
+    '**Slash Commands:**',
+    '`/ask <question>` — Ask the AI a question',
+    '`/analyze <ticker>` — AI-powered stock analysis with live data',
+    '`/price <ticker>` — Quick price + key stats lookup',
+    '`/screen <universe> [rules]` — Run a stock screen',
+    '`/watchlist [action] [ticker]` — Manage your stock watchlist',
+    '`/sentiment <text>` — Analyze text sentiment',
+    '`/topic` — Generate an AI discussion topic',
+    '`/profile [@user]` — View user profile and activity',
+    '`/memory` — See what the bot remembers about you',
+    '`/model <name>` — Switch the AI model',
+    '`/stats` — View bot statistics',
+    '`/help` — Show this message',
+    '',
+    '**Prefix Commands (owner only):**',
+    '`!update <file>` — Push code to GitHub',
+    '`!suggest <file> <instruction>` — AI code suggestion',
+    '`!autoedit <file> <instruction>` — Auto-apply safe code changes',
+    '`!rollback <file>` — Revert a file to its previous version',
+    '`!selfheal <file>` — AI auto-fix critical bugs in a file',
+    '',
+    '**Other:**',
+    'Mention me or DM me to chat anytime!',
+    'React with :thumbsup: or :thumbsdown: on my replies so I can learn.',
+  ];
+
+  await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+}
+
+// ── /sentiment — Analyze text sentiment ─────────────────────────────
+async function handleSentiment(interaction) {
+  const text = interaction.options.getString('text');
+  const result = sentiment.analyze(text);
+
+  const lines = [
+    `**Sentiment Analysis**`,
+    `**Text:** ${text.length > 200 ? text.slice(0, 200) + '...' : text}`,
+    `**Result:** ${result.label}`,
+    `**Score:** ${result.score} (comparative: ${result.comparative.toFixed(3)})`,
+  ];
+  if (result.positive.length > 0) {
+    lines.push(`**Positive words:** ${result.positive.join(', ')}`);
+  }
+  if (result.negative.length > 0) {
+    lines.push(`**Negative words:** ${result.negative.join(', ')}`);
+  }
+
+  await interaction.reply(lines.join('\n'));
+}
+
+// ── /topic — Generate an AI discussion topic ────────────────────────
+async function handleTopic(interaction) {
+  await interaction.deferReply();
+
+  const response = await ai.complete(
+    'Generate a single interesting discussion topic for a stock trading Discord server. ' +
+    'It can be about markets, trading strategies, economic trends, a specific sector, ' +
+    'or a thought-provoking investing question. Keep it to 1-2 sentences. ' +
+    'Just output the topic, no labels or prefixes.'
+  );
+
+  if (!response) {
+    await interaction.editReply('Could not generate a topic right now. Try again later!');
+    return;
+  }
+
+  await interaction.editReply(`**Discussion Topic:**\n${response}`);
+}
+
+// ── /watchlist — Manage personal watchlist ───────────────────────────
+async function handleWatchlist(interaction) {
+  const action = interaction.options.getString('action') || 'show';
+  const ticker = interaction.options.getString('ticker');
+  const userId = interaction.user.id;
+
+  if (action === 'add') {
+    if (!ticker) {
+      await interaction.reply({ content: 'Please provide a ticker to add. Example: `/watchlist add AAPL`', ephemeral: true });
+      return;
+    }
+    const list = memory.addToWatchlist(userId, ticker);
+    await interaction.reply(`Added **${ticker.toUpperCase()}** to your watchlist. (${list.length} stocks total)`);
+    return;
+  }
+
+  if (action === 'remove') {
+    if (!ticker) {
+      await interaction.reply({ content: 'Please provide a ticker to remove. Example: `/watchlist remove AAPL`', ephemeral: true });
+      return;
+    }
+    const list = memory.removeFromWatchlist(userId, ticker);
+    await interaction.reply(`Removed **${ticker.toUpperCase()}** from your watchlist. (${list.length} stocks remaining)`);
+    return;
+  }
+
+  // Show watchlist
+  const list = memory.getWatchlist(userId);
+  if (list.length === 0) {
+    await interaction.reply({ content: 'Your watchlist is empty. Use `/watchlist add <ticker>` to add stocks.', ephemeral: true });
+    return;
+  }
+
+  // If P123 is available, fetch live prices
+  if (p123.enabled) {
+    await interaction.deferReply();
+    try {
+      const data = await p123.getData(list, ['Close(0)', 'Close(0)/Close(-1)-1'], {
+        precision: 2,
+        includeNames: true,
+      });
+
+      if (data && data.rows && data.rows.length > 0) {
+        const lines = [`**Your Watchlist (${list.length} stocks)**\n`];
+        for (let i = 0; i < data.rows.length; i++) {
+          const row = data.rows[i];
+          const name = data.names ? data.names[i] : list[i];
+          const price = row[0];
+          const change = row[1];
+          const changeStr = change != null ? ` (${change > 0 ? '+' : ''}${(change * 100).toFixed(2)}%)` : '';
+          lines.push(`**${name || list[i]}** — $${price}${changeStr}`);
+        }
+        lines.push(`\n_Data via Portfolio123 | ${new Date().toLocaleString()}_`);
+        await interaction.editReply(lines.join('\n'));
+        return;
+      }
+    } catch (err) {
+      console.error('[Watchlist] P123 fetch error:', err.message);
+    }
+    // Fallback if P123 fetch fails
+    await interaction.editReply(`**Your Watchlist (${list.length} stocks)**\n${list.join(', ')}\n\n_Live prices unavailable._`);
+  } else {
+    await interaction.reply(`**Your Watchlist (${list.length} stocks)**\n${list.join(', ')}\n\n_Configure P123 API for live prices._`);
+  }
+}
+
+// ── /profile — View user profile ────────────────────────────────────
+async function handleProfile(interaction) {
+  const targetUser = interaction.options.getUser('user') || interaction.user;
+  const userId = targetUser.id;
+  const userData = memory.getUser(userId);
+  const sentimentStats = sentiment.getStats(userId);
+  const reactionStats = reactions.getUserStats(userId);
+
+  if (userData.interactionCount === 0) {
+    await interaction.reply({ content: `No data on **${targetUser.username}** yet.`, ephemeral: true });
+    return;
+  }
+
+  const lines = [`**Profile: ${targetUser.username}**\n`];
+  lines.push(`**Interactions:** ${userData.interactionCount}`);
+
+  if (userData.firstSeen) {
+    lines.push(`**First seen:** ${new Date(userData.firstSeen).toLocaleDateString()}`);
+  }
+  if (userData.lastSeen) {
+    lines.push(`**Last active:** ${new Date(userData.lastSeen).toLocaleDateString()}`);
+  }
+
+  lines.push(`**Sentiment:** ${sentimentStats.label} (trend: ${sentimentStats.trend})`);
+  lines.push(`**Feedback:** ${reactionStats.thumbsUp} :thumbsup: / ${reactionStats.thumbsDown} :thumbsdown:`);
+
+  if (userData.facts.length > 0) {
+    lines.push(`\n**Known facts:** ${userData.facts.slice(-10).join(', ')}`);
+  }
+
+  const frequentTickers = memory.getFrequentTickers(userId);
+  if (frequentTickers.length > 0) {
+    lines.push(`**Favorite tickers:** ${frequentTickers.map(f => `${f.ticker} (${f.count}x)`).join(', ')}`);
+  }
+
+  const watchlist = memory.getWatchlist(userId);
+  if (watchlist.length > 0) {
+    lines.push(`**Watchlist:** ${watchlist.join(', ')}`);
+  }
+
+  if (Object.keys(userData.preferences).length > 0) {
+    const prefs = Object.entries(userData.preferences)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(', ');
+    lines.push(`**Preferences:** ${prefs}`);
+  }
+
+  await interaction.reply(lines.join('\n'));
 }
 
 module.exports = { handleCommand };

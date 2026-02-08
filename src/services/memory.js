@@ -247,6 +247,29 @@ class MemoryService {
     return topics;
   }
 
+  // ── Watchlist ────────────────────────────────────────────────────
+  getWatchlist(userId) {
+    const key = `watchlist:${userId}`;
+    return this.store.get(key, []);
+  }
+
+  addToWatchlist(userId, ticker) {
+    ticker = ticker.toUpperCase();
+    const list = this.getWatchlist(userId);
+    if (!list.includes(ticker)) {
+      list.push(ticker);
+      this.store.set(`watchlist:${userId}`, list);
+    }
+    return list;
+  }
+
+  removeFromWatchlist(userId, ticker) {
+    ticker = ticker.toUpperCase();
+    const list = this.getWatchlist(userId).filter(t => t !== ticker);
+    this.store.set(`watchlist:${userId}`, list);
+    return list;
+  }
+
   _timeAgo(timestamp) {
     if (!timestamp) return 'unknown';
     const ms = Date.now() - new Date(timestamp).getTime();

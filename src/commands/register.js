@@ -59,6 +59,51 @@ const commands = [
         .setDescription('Filter rules, comma-separated (e.g. "PE < 15, MktCap > 1e9")')
         .setRequired(false)
     ),
+
+  new SlashCommandBuilder()
+    .setName('help')
+    .setDescription('Show all available commands'),
+
+  new SlashCommandBuilder()
+    .setName('sentiment')
+    .setDescription('Analyze the sentiment of a piece of text')
+    .addStringOption(opt =>
+      opt.setName('text')
+        .setDescription('The text to analyze')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('topic')
+    .setDescription('Generate an AI-powered discussion topic'),
+
+  new SlashCommandBuilder()
+    .setName('watchlist')
+    .setDescription('Manage your personal stock watchlist')
+    .addStringOption(opt =>
+      opt.setName('action')
+        .setDescription('Action to perform')
+        .setRequired(false)
+        .addChoices(
+          { name: 'show', value: 'show' },
+          { name: 'add', value: 'add' },
+          { name: 'remove', value: 'remove' },
+        )
+    )
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock ticker symbol (for add/remove)')
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('profile')
+    .setDescription('View user profile and activity')
+    .addUserOption(opt =>
+      opt.setName('user')
+        .setDescription('User to view (defaults to you)')
+        .setRequired(false)
+    ),
 ];
 
 async function registerCommands() {
