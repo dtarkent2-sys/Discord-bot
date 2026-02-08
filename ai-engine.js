@@ -67,15 +67,17 @@ class AIEngine {
   async _ollamaGenerate(prompt, context = '') {
     const systemPrompt = 'You are a helpful and friendly Discord bot. Keep responses concise (under 300 words). Be conversational and engaging.';
 
-    const fullPrompt = context
+    const userContent = context
       ? `Previous conversation:\n${context}\n\nUser: ${prompt}`
       : prompt;
 
     try {
-      const res = await axios.post(`${OLLAMA_BASE}/api/generate`, {
+      const res = await axios.post(`${OLLAMA_BASE}/api/chat`, {
         model: OLLAMA_MODEL,
-        prompt: fullPrompt,
-        system: systemPrompt,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userContent },
+        ],
         stream: false,
         options: {
           temperature: 0.7,
@@ -84,7 +86,7 @@ class AIEngine {
         },
       }, { timeout: 60000, ...this.axiosConfig });
 
-      return res.data.response.trim();
+      return res.data.message.content.trim();
     } catch (err) {
       console.error('[AI Engine] Ollama generation failed:', err.message);
       return this._ruleBasedResponse(prompt);
@@ -137,14 +139,16 @@ class AIEngine {
 
     if (this.ollamaAvailable) {
       try {
-        const res = await axios.post(`${OLLAMA_BASE}/api/generate`, {
+        const res = await axios.post(`${OLLAMA_BASE}/api/chat`, {
           model: OLLAMA_MODEL,
-          prompt: 'Generate one interesting discussion topic or thought-provoking question for a Discord server. Just the topic, nothing else.',
+          messages: [
+            { role: 'user', content: 'Generate one interesting discussion topic or thought-provoking question for a Discord server. Just the topic, nothing else.' },
+          ],
           stream: false,
           options: { temperature: 0.9, num_predict: 80 },
         }, { timeout: 30000, ...this.axiosConfig });
 
-        return res.data.response.trim();
+        return res.data.message.content.trim();
       } catch {
         // fall through to rule-based
       }
