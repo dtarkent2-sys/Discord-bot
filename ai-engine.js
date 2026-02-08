@@ -71,7 +71,7 @@ class AIEngine {
   }
 
   async _ollamaGenerate(prompt, context = '') {
-    const systemPrompt = 'You are a helpful and friendly Discord bot. Keep responses concise (under 300 words). Be conversational and engaging.';
+    const systemPrompt = 'You are a helpful and knowledgeable Discord bot for a stock trading server. Keep responses concise (under 300 words). Be conversational and engaging. You can discuss stocks, markets, trading strategies, and financial concepts. Always remind users that nothing you say is financial advice.';
 
     const userContent = context
       ? `Previous conversation:\n${context}\n\nUser: ${prompt}`

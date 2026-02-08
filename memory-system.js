@@ -44,6 +44,12 @@ class MemorySystem {
         ON conversations(user_id, created_at DESC)`,
       `CREATE INDEX IF NOT EXISTS idx_conversations_channel
         ON conversations(channel_id, created_at DESC)`,
+      `CREATE TABLE IF NOT EXISTS watchlists (
+        user_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, symbol)
+      )`,
     ];
 
     return statements.reduce((chain, sql) => {
@@ -162,6 +168,35 @@ class MemorySystem {
     return messages
       .map(m => `${m.role}: ${m.content}`)
       .join('\n');
+  }
+
+  // --- Watchlist ---
+
+  async addToWatchlist(userId, symbol) {
+    return this._run(
+      `INSERT OR IGNORE INTO watchlists (user_id, symbol) VALUES (?, ?)`,
+      [userId, symbol.toUpperCase()]
+    );
+  }
+
+  async removeFromWatchlist(userId, symbol) {
+    return this._run(
+      `DELETE FROM watchlists WHERE user_id = ? AND symbol = ?`,
+      [userId, symbol.toUpperCase()]
+    );
+  }
+
+  async getWatchlist(userId) {
+    return this._all(
+      `SELECT symbol FROM watchlists WHERE user_id = ? ORDER BY added_at`,
+      [userId]
+    );
+  }
+
+  async getAllWatchedSymbols() {
+    return this._all(
+      `SELECT DISTINCT symbol FROM watchlists ORDER BY symbol`
+    );
   }
 
   close() {

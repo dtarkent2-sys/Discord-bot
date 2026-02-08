@@ -5,6 +5,7 @@ const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
 const AIEngine = require('./ai-engine');
 const MemorySystem = require('./memory-system');
 const AutonomousActions = require('./autonomous-actions');
+const StockData = require('./stock-data');
 
 // --- Initialize core systems ---
 const client = new Client({
@@ -20,7 +21,8 @@ const client = new Client({
 
 const ai = new AIEngine();
 const memory = new MemorySystem();
-const autonomous = new AutonomousActions(client, ai, memory);
+const stocks = new StockData();
+const autonomous = new AutonomousActions(client, ai, memory, stocks);
 
 const PREFIX = process.env.BOT_PREFIX || '!';
 
@@ -204,9 +206,94 @@ async function handleCommand(message, command, args) {
       break;
     }
 
+    case 'price':
+    case 'p': {
+      const ticker = args[0];
+      if (!ticker) {
+        await message.reply(`Usage: \`${PREFIX}price AAPL\``);
+        return;
+      }
+      try {
+        await message.channel.sendTyping();
+        const quote = await stocks.getQuote(ticker);
+        await message.reply(stocks.formatQuoteDetailed(quote));
+      } catch (err) {
+        await message.reply(`Could not find data for **${ticker.toUpperCase()}**.`);
+      }
+      break;
+    }
+
+    case 'market':
+    case 'm': {
+      try {
+        await message.channel.sendTyping();
+        const status = stocks.isMarketOpen();
+        const indices = await stocks.getIndices();
+        const lines = [
+          `**${status.label}** — ${status.next}`,
+          '',
+          ...indices.map(q => stocks.formatQuote(q)),
+        ];
+        await message.reply(lines.join('\n'));
+      } catch (err) {
+        await message.reply('Could not fetch market data right now.');
+      }
+      break;
+    }
+
+    case 'watchlist':
+    case 'wl': {
+      const sub = (args[0] || 'show').toLowerCase();
+      const ticker = args[1];
+
+      if (sub === 'add') {
+        if (!ticker) {
+          await message.reply(`Usage: \`${PREFIX}watchlist add AAPL\``);
+          return;
+        }
+        // Validate ticker exists
+        try {
+          await stocks.getQuote(ticker);
+        } catch {
+          await message.reply(`**${ticker.toUpperCase()}** doesn't look like a valid ticker.`);
+          return;
+        }
+        await memory.addToWatchlist(message.author.id, ticker);
+        await message.reply(`Added **${ticker.toUpperCase()}** to your watchlist.`);
+      } else if (sub === 'remove' || sub === 'rm') {
+        if (!ticker) {
+          await message.reply(`Usage: \`${PREFIX}watchlist remove AAPL\``);
+          return;
+        }
+        await memory.removeFromWatchlist(message.author.id, ticker);
+        await message.reply(`Removed **${ticker.toUpperCase()}** from your watchlist.`);
+      } else {
+        // Show watchlist with live prices
+        const list = await memory.getWatchlist(message.author.id);
+        if (list.length === 0) {
+          await message.reply(`Your watchlist is empty. Use \`${PREFIX}watchlist add AAPL\` to add tickers.`);
+          return;
+        }
+        await message.channel.sendTyping();
+        const quotes = await stocks.getQuotes(list.map(r => r.symbol));
+        const lines = [
+          `**Your Watchlist (${quotes.length} stocks):**`,
+          '',
+          ...quotes.map(q => stocks.formatQuote(q)),
+        ];
+        await message.reply(lines.join('\n'));
+      }
+      break;
+    }
+
     case 'help': {
       await message.reply([
-        '**Available Commands:**',
+        '**Stock Commands:**',
+        `\`${PREFIX}price <ticker>\` - Live stock quote (alias: \`${PREFIX}p\`)`,
+        `\`${PREFIX}market\` - Market status + indices (alias: \`${PREFIX}m\`)`,
+        `\`${PREFIX}watchlist [add|remove] <ticker>\` - Manage your watchlist (alias: \`${PREFIX}wl\`)`,
+        '',
+        '**General Commands:**',
         `\`${PREFIX}ask <question>\` - Ask the AI a question`,
         `\`${PREFIX}sentiment <text>\` - Analyze text sentiment`,
         `\`${PREFIX}analyze <text>\` - Full NLP text analysis`,

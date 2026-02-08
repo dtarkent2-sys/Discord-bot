@@ -14,10 +14,11 @@ const DEFAULTS = {
 const TZ = process.env.SCHEDULE_TIMEZONE || 'America/New_York';
 
 class AutonomousActions {
-  constructor(client, ai, memory) {
+  constructor(client, ai, memory, stocks) {
     this.client = client;
     this.ai = ai;
     this.memory = memory;
+    this.stocks = stocks;
     this.jobs = {};
     this.targetChannelId = null;
 
@@ -42,6 +43,8 @@ class AutonomousActions {
 
   start() {
     this._schedule('stockAnalysis',   this._env('SCHEDULE_STOCK_ANALYSIS'),  () => this._guard('Stock Analysis',   () => this.postStockAnalysis()));
+    this._schedule('marketOpen',      '30 9 * * 1-5',                        () => this._guard('Market Open',      () => this.postMarketAlert('open')));
+    this._schedule('marketClose',     '0 16 * * 1-5',                        () => this._guard('Market Close',     () => this.postMarketAlert('close')));
     this._schedule('dailyQuestion',   this._env('SCHEDULE_DAILY_QUESTION'),  () => this._guard('Daily Question',   () => this.postDailyQuestion()));
     this._schedule('dailySummary',    this._env('SCHEDULE_DAILY_SUMMARY'),   () => this._guard('Daily Summary',    () => this.postDailySummary()));
     this._schedule('weeklyInsights',  this._env('SCHEDULE_WEEKLY_INSIGHTS'), () => this._guard('Weekly Insights',  () => this.postWeeklyInsights()));
@@ -66,12 +69,29 @@ class AutonomousActions {
     const channel = await this._getTargetChannel();
     if (!channel) return;
 
+    // Fetch real index data to include in the prompt
+    let indexData = '';
+    try {
+      const indices = await this.stocks.getIndices();
+      indexData = indices
+        .map(q => {
+          const arrow = q.change >= 0 ? '+' : '';
+          return `${q.name}: $${q.price.toFixed(2)} (${arrow}${q.changePct.toFixed(2)}%)`;
+        })
+        .join('\n');
+    } catch {
+      indexData = 'Index data unavailable';
+    }
+
     const prompt = [
-      'Give a brief pre-market stock analysis for today. Cover:',
-      '1. Key index futures (S&P 500, NASDAQ, Dow)',
-      '2. Major overnight news affecting markets',
-      '3. Key earnings or economic data releases today',
-      '4. Overall market sentiment (bullish/bearish/neutral)',
+      'Give a brief pre-market stock analysis for today. Here are the current index levels:',
+      indexData,
+      '',
+      'Cover:',
+      '1. What the index moves suggest about market sentiment',
+      '2. Key earnings or economic data releases to watch today',
+      '3. Sectors likely to be in focus',
+      '4. Overall outlook (bullish/bearish/neutral) and what to watch for',
       'Keep it under 250 words. Use bullet points. Do NOT give financial advice.',
     ].join('\n');
 
@@ -80,6 +100,55 @@ class AutonomousActions {
 
     await channel.send(`${header}\n\n${analysis}\n\n*This is AI-generated commentary, not financial advice.*`);
     console.log('[Autonomous] Posted stock analysis.');
+  }
+
+  // ─── Market open/close alerts (9:30 AM / 4:00 PM EST weekdays) ────────────
+
+  async postMarketAlert(type) {
+    const channel = await this._getTargetChannel();
+    if (!channel) return;
+
+    try {
+      const indices = await this.stocks.getIndices();
+      const indexLines = indices.map(q => this.stocks.formatQuote(q));
+
+      if (type === 'open') {
+        const lines = [
+          `**Market Open — ${this._dateStr()}**`,
+          '',
+          ...indexLines,
+          '',
+          `Use \`!price <ticker>\` to check any stock. Good luck today!`,
+        ];
+        await channel.send(lines.join('\n'));
+      } else {
+        const lines = [
+          `**Market Closed — ${this._dateStr()}**`,
+          '',
+          '**Final numbers:**',
+          ...indexLines,
+        ];
+
+        // AI closing summary
+        const spx = indices.find(q => q.symbol === '^GSPC');
+        if (this.ai.ready && this.ai.ollamaAvailable && spx) {
+          const dir = spx.change >= 0 ? 'up' : 'down';
+          const closingPrompt = `The S&P 500 closed ${dir} ${Math.abs(spx.changePct).toFixed(2)}% today. Write 1-2 sentences summarizing the trading day for a Discord stock server. Be concise. No financial advice.`;
+          try {
+            const closing = await this.ai.generateResponse(closingPrompt);
+            lines.push('', `*${closing}*`);
+          } catch {
+            // skip
+          }
+        }
+
+        await channel.send(lines.join('\n'));
+      }
+    } catch (err) {
+      console.error(`[Autonomous] Market ${type} alert failed:`, err.message);
+    }
+
+    console.log(`[Autonomous] Posted market ${type} alert.`);
   }
 
   // ─── 2. Daily discussion question (10 AM EST) ─────────────────────────────
@@ -95,9 +164,9 @@ class AutonomousActions {
       : '';
 
     const prompt = [
-      'Generate one engaging discussion question for a Discord server.',
-      'Make it thought-provoking and open-ended so many people can participate.',
-      'Vary the category — could be tech, philosophy, gaming, pop culture, science, hypotheticals, etc.',
+      'Generate one engaging discussion question for a stock trading Discord server.',
+      'Make it thought-provoking and open-ended so many traders can participate.',
+      'Vary the category — could be trading strategies, market psychology, portfolio management, sector analysis, macroeconomics, trading mistakes/lessons, options vs stocks, technical vs fundamental analysis, or investing philosophy.',
       topicHints,
       recentContext ? `\nAvoid repeating anything from these recent messages:\n${recentContext}` : '',
       'Return ONLY the question, nothing else.',
@@ -298,12 +367,12 @@ class AutonomousActions {
     const recent = await this.memory.buildContextString(target.channel.id, 5);
 
     const engagementStyles = [
-      'Ask a fun "would you rather" question related to recent conversation.',
-      'Share an interesting fact and ask if anyone knew about it.',
-      'Start a lighthearted debate with a hot take.',
-      'Ask what everyone is working on or playing today.',
-      'Pose a creative hypothetical scenario.',
-      'Share a quick brain teaser or riddle.',
+      'Ask a fun "would you rather" question about trading (e.g. would you rather have X or Y in your portfolio).',
+      'Share an interesting market history fact and ask if anyone knew about it.',
+      'Start a lighthearted debate with a hot take about a stock, sector, or market trend.',
+      'Ask what trades or positions everyone is watching today.',
+      'Pose a hypothetical market scenario and ask what people would do.',
+      'Share a quick mental math challenge related to gains/losses/percentages.',
     ];
     const style = engagementStyles[Math.floor(Math.random() * engagementStyles.length)];
 
@@ -414,11 +483,11 @@ class AutonomousActions {
       const guildName = member.guild.name;
       const memberCount = member.guild.memberCount;
       const prompt = [
-        `Generate a short, warm welcome message for a new Discord server member.`,
+        `Generate a short, warm welcome message for a new member joining a stock trading Discord server.`,
         `Their name is ${member.displayName}.`,
         `The server is called "${guildName}" and now has ${memberCount} members.`,
-        `Be friendly and make them feel at home. Mention they can use !help to see commands.`,
-        `Keep it to 2-3 sentences.`,
+        `Be friendly. Mention they can use !help to see commands and !price to check stocks.`,
+        `Keep it to 2-3 sentences. Don't give financial advice.`,
       ].join(' ');
 
       return await this.ai.generateResponse(prompt);
