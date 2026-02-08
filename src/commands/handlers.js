@@ -1,5 +1,6 @@
 const ai = require('../services/ai');
 const memory = require('../services/memory');
+const mood = require('../services/mood');
 const stats = require('../services/stats');
 const reactions = require('../services/reactions');
 const sentiment = require('../services/sentiment');
@@ -58,6 +59,16 @@ async function handleMemory(interaction) {
     parts.push(`**First seen:** ${new Date(userData.firstSeen).toLocaleDateString()}`);
   }
 
+  // Topic tracking
+  const frequentTickers = memory.getFrequentTickers(userId);
+  if (frequentTickers.length > 0) {
+    parts.push(`\n**Your favorite tickers:** ${frequentTickers.map(f => `${f.ticker} (${f.count}x)`).join(', ')}`);
+  }
+  const lastInteraction = memory.getLastInteraction(userId);
+  if (lastInteraction && lastInteraction.tickers.length > 0) {
+    parts.push(`**Last discussed:** ${lastInteraction.tickers.join(', ')}${lastInteraction.topic ? ` (${lastInteraction.topic})` : ''}`);
+  }
+
   parts.push(`\n**Sentiment:** ${sentimentStats.label} (trend: ${sentimentStats.trend})`);
   parts.push(`**Feedback:** ${reactionStats.thumbsUp} 👍 / ${reactionStats.thumbsDown} 👎`);
 
@@ -91,6 +102,7 @@ async function handleStats(interaction) {
     `**Commands run:** ${summary.commandsRun}`,
     `**Errors:** ${summary.errors}`,
     `**AI Model:** ${ai.getModel()}`,
+    `**Mood:** ${mood.getMood()} (${mood.getSummary().score}/10)`,
     `\n**Memory Usage:**`,
     `  RSS: ${summary.memory.rss} MB`,
     `  Heap: ${summary.memory.heapUsed}/${summary.memory.heapTotal} MB`,

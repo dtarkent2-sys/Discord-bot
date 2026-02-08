@@ -14,7 +14,9 @@
 const schedule = require('node-schedule');
 const { persona, pick } = require('../personality');
 const { getMarketContext } = require('../data/market');
-const stats = require('../services/stats');
+const mood = require('./mood');
+const commentary = require('./commentary');
+const stats = require('./stats');
 const config = require('../config');
 
 class AutonomousBehaviorEngine {
@@ -32,19 +34,29 @@ class AutonomousBehaviorEngine {
         console.log('[Sprocket] Running pre-market briefing...');
         try {
           const spyData = await this.getPreMarketMove('SPY');
-          const tone = spyData.change >= 0
-            ? pick(persona.speechPatterns.marketUp)
-            : pick(persona.speechPatterns.marketDown);
 
+          // Update mood from market signal
+          if (spyData.available) {
+            mood.updateFromPnL(spyData.change);
+          }
+
+          // Use AI commentary for a unique opener
+          const opener = await commentary.briefingOpener();
           const direction = spyData.change >= 0 ? 'higher' : 'lower';
+
+          let body;
+          if (spyData.available) {
+            body = await commentary.marketMove('SPY', spyData.change);
+          } else {
+            body = `Pre-market data unavailable right now. ${pick(persona.speechPatterns.noData)}`;
+          }
+
           const message = [
             `**${persona.name}'s Pre-Market Briefing**`,
             ``,
-            pick(persona.speechPatterns.greetings),
+            opener,
             ``,
-            spyData.available
-              ? `Futures pointing ${direction}. SPY pre-market: ${spyData.change > 0 ? '+' : ''}${spyData.change}%. ${tone}`
-              : `Pre-market data unavailable right now. ${pick(persona.speechPatterns.noData)}`,
+            body,
             ``,
             `Not financial advice.`,
           ].join('\n');
@@ -61,10 +73,13 @@ class AutonomousBehaviorEngine {
       schedule.scheduleJob({ rule: '0 10,12,14,16 * * 1-5', tz: 'America/New_York' }, async () => {
         console.log('[Sprocket] Running market health pulse...');
         try {
+          // Decay mood toward neutral between updates
+          mood.decay();
+
           const heatmap = await this.generateSectorHeatmap();
 
           const message = [
-            `**Sector Pulse Update**`,
+            `**Sector Pulse Update** *(${persona.name} is feeling ${mood.getMood()})*`,
             ``,
             heatmap || `${pick(persona.speechPatterns.error)} Sector data is currently unavailable.`,
             ``,
@@ -87,7 +102,9 @@ class AutonomousBehaviorEngine {
           const observation = await this.scanForUnusualActivity();
           if (!observation) return;
 
-          const message = `*${persona.name} whispers* Hmm. ${observation} Worth a glance. Not financial advice.`;
+          // Use AI to phrase the observation in Sprocket's voice
+          const aiComment = await commentary.unusualActivity(observation.ticker, observation.detail);
+          const message = `*${persona.name} whispers* ${aiComment || observation.detail + ' Not financial advice.'}`;
           await this.postToChannel(config.tradingChannelName, message);
         } catch (err) {
           console.error('[Sprocket] Observation scan error:', err.message);
@@ -202,7 +219,6 @@ class AutonomousBehaviorEngine {
   async scanForUnusualActivity() {
     // Watchlist to scan — expand as needed
     const watchlist = ['AAPL', 'TSLA', 'NVDA', 'AMD', 'META', 'AMZN', 'GOOGL', 'MSFT'];
-    const unusual = [];
 
     for (const ticker of watchlist) {
       const ctx = await getMarketContext(ticker);
@@ -211,12 +227,15 @@ class AutonomousBehaviorEngine {
       // Flag anything with > 3% move as "unusual" (simple heuristic)
       const pct = Math.abs(ctx.quote.changePercent ?? 0);
       if (pct > 3) {
-        unusual.push(`**${ticker}** is moving ${ctx.quote.changePercent > 0 ? 'up' : 'down'} ${pct.toFixed(1)}% — atypical volume patterns.`);
+        const direction = ctx.quote.changePercent > 0 ? 'up' : 'down';
+        return {
+          ticker,
+          detail: `${ticker} is moving ${direction} ${pct.toFixed(1)}% with atypical volume patterns.`,
+        };
       }
     }
 
-    if (unusual.length === 0) return null;
-    return unusual.slice(0, 3).join(' ');
+    return null;
   }
 
   /**

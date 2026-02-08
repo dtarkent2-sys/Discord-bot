@@ -1,6 +1,7 @@
 const { Ollama } = require('ollama');
 const config = require('../config');
 const memory = require('./memory');
+const mood = require('./mood');
 const { persona, pick, buildPersonalityPrompt } = require('../personality');
 
 // Patterns that indicate the model is talking about specific prices/market data
@@ -101,6 +102,9 @@ ${macroData || 'MISSING — no macro data available'}
 
 NEWS_FEED:
 ${newsData || 'MISSING — no news data available'}
+
+MOOD STATE:
+${mood.buildMoodContext()}
 `.trim();
   }
 
