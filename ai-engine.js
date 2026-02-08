@@ -29,11 +29,11 @@ class AIEngine {
   }
 
   async initialize() {
-    console.log('[AI Engine] Initializing...');
+    console.log(`[AI Engine] Initializing... (Ollama URL: ${OLLAMA_BASE}, model: ${OLLAMA_MODEL}, API key: ${OLLAMA_API_KEY ? 'set' : 'NOT SET'})`);
 
     // Check if Ollama is reachable
     try {
-      const res = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000, ...this.axiosConfig });
+      const res = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 15000, ...this.axiosConfig });
       const models = res.data.models || [];
       const hasModel = models.some(m => m.name.startsWith(OLLAMA_MODEL));
       if (hasModel) {
@@ -43,8 +43,10 @@ class AIEngine {
         console.log(`[AI Engine] Ollama running but model "${OLLAMA_MODEL}" not found. Using rule-based fallback.`);
         console.log(`[AI Engine] Available models: ${models.map(m => m.name).join(', ') || 'none'}`);
       }
-    } catch {
-      console.log('[AI Engine] Ollama not reachable. Using rule-based fallback.');
+    } catch (err) {
+      console.error(`[AI Engine] Ollama not reachable: ${err.message}`);
+      if (err.response) console.error(`[AI Engine] Response status: ${err.response.status}, data:`, err.response.data);
+      console.log('[AI Engine] Using rule-based fallback.');
     }
 
     this.ready = true;
