@@ -9,6 +9,7 @@ const stats = require('./src/services/stats');
 const { handleCommand } = require('./src/commands/handlers');
 const { registerCommands } = require('./src/commands/register');
 const { startDashboard } = require('./src/dashboard/server');
+const AutonomousBehaviorEngine = require('./src/services/autonomous');
 
 // ── Discord Client Setup ─────────────────────────────────────────────
 const client = new Client({
@@ -34,6 +35,10 @@ client.once(Events.ClientReady, async (c) => {
 
   // Start web dashboard
   startDashboard();
+
+  // Start autonomous scheduled behaviors
+  const autonomousEngine = new AutonomousBehaviorEngine(client);
+  autonomousEngine.startAllSchedules();
 });
 
 // ── Slash Command Handler ────────────────────────────────────────────

@@ -25,4 +25,6 @@ module.exports = {
   ollamaModel: process.env.OLLAMA_MODEL || 'gemma4b',
   port: parseInt(process.env.PORT, 10) || 3000,
   dataDir: path.join(__dirname, '..', 'data'),
+  tradingChannelName: process.env.TRADING_CHANNEL || 'trading-floor',
+  generalChannelName: process.env.GENERAL_CHANNEL || 'general',
 };
