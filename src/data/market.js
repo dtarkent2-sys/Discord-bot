@@ -42,6 +42,9 @@ async function getMarketContext(ticker) {
         data[names[i]] = row[i] !== undefined ? row[i] : (Array.isArray(row) ? row[i] : null);
       }
       context.snapshot = data;
+      // Compute daily change percent from 1-day return ratio
+      const changePercent = data['1dReturn'] != null ? ((data['1dReturn'] - 1) * 100) : null;
+
       context.quote = {
         price: data.Price,
         volume: data.Volume,
@@ -50,6 +53,7 @@ async function getMarketContext(ticker) {
         rsi14: data.RSI14,
         sma50: data.SMA50,
         sma200: data.SMA200,
+        changePercent,
         timestamp: new Date().toISOString(),
       };
     } else {
@@ -75,6 +79,17 @@ async function getMarketContext(ticker) {
   } catch (err) {
     console.error(`[Market] P123 price history error for ${upperTicker}:`, err.message);
     missing.push({ field: 'price_history', reason: err.message });
+  }
+
+  // Apply freshness gate to quote data
+  if (context.quote) {
+    try {
+      assertFresh(context.quote.timestamp, FRESHNESS.quote, 'quote');
+    } catch (err) {
+      if (err instanceof FreshnessError) {
+        missing.push({ field: 'quote', reason: `Quote data is stale (${err.ageSeconds}s old, max ${err.maxAgeSeconds}s)` });
+      }
+    }
   }
 
   // If we have no data at all, return error
@@ -113,6 +128,7 @@ function formatContextForAI(context) {
     if (q.pe) lines.push(`  P/E: ${q.pe}`);
     if (q.rsi14) lines.push(`  RSI(14): ${q.rsi14}`);
     if (q.sma50) lines.push(`  SMA(50): $${q.sma50}`);
+    if (q.changePercent != null) lines.push(`  Daily Change: ${q.changePercent > 0 ? '+' : ''}${q.changePercent.toFixed(2)}%`);
     if (q.sma200) lines.push(`  SMA(200): $${q.sma200}`);
   }
 
@@ -122,6 +138,7 @@ function formatContextForAI(context) {
     if (s.DivYield) lines.push(`  Div Yield: ${s.DivYield}%`);
     if (s.ROE) lines.push(`  ROE: ${s.ROE}%`);
     if (s.EPS) lines.push(`  EPS: $${s.EPS}`);
+    if (s['1dReturn']) lines.push(`  1-Day Return: ${((s['1dReturn'] - 1) * 100).toFixed(2)}%`);
     if (s['1wkReturn']) lines.push(`  1-Week Return: ${((s['1wkReturn'] - 1) * 100).toFixed(2)}%`);
     if (s['1moReturn']) lines.push(`  1-Month Return: ${((s['1moReturn'] - 1) * 100).toFixed(2)}%`);
   }

@@ -153,6 +153,7 @@ class P123Client {
       'DivYield%',          // Dividend yield
       'ROE%',               // Return on equity
       'EPS',                // EPS
+      'Close(0)/Close(-1)', // 1-day return (for daily change %)
       'Close(0)/Close(-5)', // 1-week return
       'Close(0)/Close(-21)',// 1-month return
       'RSI(14)',            // RSI 14-day
@@ -162,7 +163,7 @@ class P123Client {
     return this._request('POST', '/data', {
       tickers: [ticker],
       formulas,
-      names: ['Price', 'Volume', 'MktCap', 'PE', 'PB', 'DivYield', 'ROE', 'EPS', '1wkReturn', '1moReturn', 'RSI14', 'SMA50', 'SMA200'],
+      names: ['Price', 'Volume', 'MktCap', 'PE', 'PB', 'DivYield', 'ROE', 'EPS', '1dReturn', '1wkReturn', '1moReturn', 'RSI14', 'SMA50', 'SMA200'],
       pitMethod: 'Prelim',
       precision: 2,
       includeNames: true,
