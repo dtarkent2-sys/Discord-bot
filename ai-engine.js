@@ -3,8 +3,9 @@ const natural = require('natural');
 const nlp = require('compromise');
 const { NeuralNetwork } = require('brain.js');
 
-const OLLAMA_BASE = process.env.OLLAMA_URL || 'http://localhost:11434';
+const OLLAMA_BASE = process.env.OLLAMA_URL || 'https://ollama.com';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gemma3';
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || '';
 
 class AIEngine {
   constructor() {
@@ -20,6 +21,11 @@ class AIEngine {
     this.net = new NeuralNetwork({ hiddenLayers: [10] });
     this.trained = false;
     this.trainingData = [];
+
+    // Axios config for Ollama requests (adds auth header when API key is set)
+    this.axiosConfig = OLLAMA_API_KEY
+      ? { headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` } }
+      : {};
   }
 
   async initialize() {
@@ -27,7 +33,7 @@ class AIEngine {
 
     // Check if Ollama is reachable
     try {
-      const res = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000 });
+      const res = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 5000, ...this.axiosConfig });
       const models = res.data.models || [];
       const hasModel = models.some(m => m.name.startsWith(OLLAMA_MODEL));
       if (hasModel) {
@@ -74,7 +80,7 @@ class AIEngine {
           top_p: 0.9,
           num_predict: 300,
         },
-      }, { timeout: 60000 });
+      }, { timeout: 60000, ...this.axiosConfig });
 
       return res.data.response.trim();
     } catch (err) {
@@ -134,7 +140,7 @@ class AIEngine {
           prompt: 'Generate one interesting discussion topic or thought-provoking question for a Discord server. Just the topic, nothing else.',
           stream: false,
           options: { temperature: 0.9, num_predict: 80 },
-        }, { timeout: 30000 });
+        }, { timeout: 30000, ...this.axiosConfig });
 
         return res.data.response.trim();
       } catch {
