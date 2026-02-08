@@ -1,30 +1,29 @@
 /**
- * Web Search — Live internet search via Serper Dev API.
+ * Web Search — Live internet search via SearXNG.
  *
- * Serper (https://serper.dev) provides a Google Search API.
- * Free tier: 2,500 queries/month.
+ * SearXNG (https://docs.searxng.org) is a free, open-source metasearch engine.
+ * No API key required — just point to any SearXNG instance.
  *
  * Setup:
- *   1. Sign up at https://serper.dev and get your API key
+ *   1. Use a public instance (e.g. https://search.ononoki.org) or self-host one
  *   2. Add to your Railway environment variables:
- *        SERPER_API_KEY=your_serper_api_key_here
+ *        SEARXNG_URL=https://your-searxng-instance.com
  *   3. Or add to your local .env file
  *
  * Usage from ai-engine.js or any other module:
- *   const { webSearch, searchAndSummarize } = require('./src/tools/web-search');
+ *   const { webSearch, formatResultsForDiscord } = require('./src/tools/web-search');
  *   const results = await webSearch('AAPL earnings 2026');
  */
 
 const config = require('../config');
 
-const SERPER_API_URL = 'https://google.serper.dev/search';
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
-// Simple in-memory cache to avoid duplicate API calls
+// Simple in-memory cache to avoid duplicate queries
 const cache = new Map();
 
 /**
- * Search the web using the Serper API.
+ * Search the web using a SearXNG instance.
  *
  * @param {string} query — The search query
  * @param {number} [numResults=3] — Number of results to return (max 10)
@@ -35,10 +34,10 @@ async function webSearch(query, numResults = 3) {
     return { error: 'Search query is required.', query };
   }
 
-  const apiKey = config.serperApiKey;
-  if (!apiKey) {
+  const baseUrl = config.searxngUrl;
+  if (!baseUrl) {
     return {
-      error: 'SERPER_API_KEY is not configured. Add it to your environment variables. Get a free key at https://serper.dev',
+      error: 'SEARXNG_URL is not configured. Set it to a SearXNG instance URL (e.g. https://search.ononoki.org).',
       query,
     };
   }
@@ -52,51 +51,58 @@ async function webSearch(query, numResults = 3) {
 
   const num = Math.min(Math.max(numResults, 1), 10);
 
+  // Build the SearXNG search URL with JSON format
+  const url = new URL('/search', baseUrl);
+  url.searchParams.set('q', query.trim());
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('categories', 'general');
+
   try {
-    const response = await fetch(SERPER_API_URL, {
-      method: 'POST',
-      headers: {
-        'X-API-KEY': apiKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ q: query.trim(), num }),
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
 
     if (!response.ok) {
       const text = await response.text().catch(() => '');
-      if (response.status === 401 || response.status === 403) {
-        return { error: 'Invalid SERPER_API_KEY. Check your key at https://serper.dev', query };
-      }
       if (response.status === 429) {
-        return { error: 'Serper rate limit exceeded. Free tier allows 2,500 queries/month.', query };
+        return { error: 'SearXNG rate limit hit. Try again in a moment.', query };
       }
-      return { error: `Serper API error: ${response.status} ${response.statusText}${text ? ` — ${text}` : ''}`, query };
+      return { error: `SearXNG error: ${response.status} ${response.statusText}${text ? ` — ${text.slice(0, 200)}` : ''}`, query };
     }
 
     const data = await response.json();
 
     // Parse organic results
-    const organic = data.organic || [];
-    const results = organic.slice(0, num).map((item, i) => ({
+    const rawResults = data.results || [];
+    const results = rawResults.slice(0, num).map((item, i) => ({
       title: item.title || '',
-      link: item.link || '',
-      snippet: item.snippet || '',
+      link: item.url || '',
+      snippet: item.content || '',
+      engine: item.engine || '',
       position: i + 1,
     }));
 
-    // Include knowledge graph if available
-    let knowledgeGraph = null;
-    if (data.knowledgeGraph) {
-      knowledgeGraph = {
-        title: data.knowledgeGraph.title || '',
-        type: data.knowledgeGraph.type || '',
-        description: data.knowledgeGraph.description || '',
+    // Include infobox if available (SearXNG equivalent of knowledge graph)
+    let infobox = null;
+    if (data.infoboxes && data.infoboxes.length > 0) {
+      const ib = data.infoboxes[0];
+      infobox = {
+        title: ib.infobox || '',
+        content: ib.content || '',
+        urls: (ib.urls || []).map(u => ({ title: u.title, url: u.url })),
       };
     }
 
     const result = {
       results,
-      knowledgeGraph,
+      infobox,
       query: query.trim(),
       resultCount: results.length,
       timestamp: new Date().toISOString(),
@@ -115,15 +121,14 @@ async function webSearch(query, numResults = 3) {
 
     return result;
   } catch (err) {
-    // Network errors — connection refused, DNS failures, timeouts
     const msg = err.message || String(err);
 
-    if (msg.includes('fetch failed') || msg.includes('ECONNREFUSED') || msg.includes('ENOTFOUND')) {
-      return { error: `Network error: cannot reach Serper API. Check your internet connection.`, query };
+    if (err.name === 'AbortError' || msg.includes('abort')) {
+      return { error: 'SearXNG request timed out (15s). The instance may be slow — try again or use a different instance.', query };
     }
 
-    if (msg.includes('timeout') || msg.includes('AbortError')) {
-      return { error: 'Serper API request timed out. Try again.', query };
+    if (msg.includes('fetch failed') || msg.includes('ECONNREFUSED') || msg.includes('ENOTFOUND')) {
+      return { error: `Cannot reach SearXNG at ${baseUrl}. Check SEARXNG_URL and ensure the instance is running.`, query };
     }
 
     return { error: `Web search failed: ${msg}`, query };
@@ -131,9 +136,9 @@ async function webSearch(query, numResults = 3) {
 }
 
 /**
- * Format search results as a readable string for Discord or AI context.
+ * Format search results as a readable string for Discord.
  *
- * @param {{ results, knowledgeGraph, query }} searchResult
+ * @param {{ results, infobox, query }} searchResult
  * @returns {string}
  */
 function formatResultsForDiscord(searchResult) {
@@ -143,10 +148,10 @@ function formatResultsForDiscord(searchResult) {
 
   const lines = [`**Web Search: "${searchResult.query}"**\n`];
 
-  if (searchResult.knowledgeGraph) {
-    const kg = searchResult.knowledgeGraph;
-    lines.push(`> **${kg.title}** ${kg.type ? `(${kg.type})` : ''}`);
-    if (kg.description) lines.push(`> ${kg.description}`);
+  if (searchResult.infobox) {
+    const ib = searchResult.infobox;
+    lines.push(`> **${ib.title}**`);
+    if (ib.content) lines.push(`> ${ib.content.slice(0, 300)}`);
     lines.push('');
   }
 
@@ -166,7 +171,7 @@ function formatResultsForDiscord(searchResult) {
 /**
  * Format search results as context for an AI prompt.
  *
- * @param {{ results, knowledgeGraph, query }} searchResult
+ * @param {{ results, infobox, query }} searchResult
  * @returns {string}
  */
 function formatResultsForAI(searchResult) {
@@ -176,10 +181,10 @@ function formatResultsForAI(searchResult) {
 
   const lines = [`Web search results for "${searchResult.query}":\n`];
 
-  if (searchResult.knowledgeGraph) {
-    const kg = searchResult.knowledgeGraph;
-    lines.push(`Knowledge Graph: ${kg.title} ${kg.type ? `(${kg.type})` : ''}`);
-    if (kg.description) lines.push(kg.description);
+  if (searchResult.infobox) {
+    const ib = searchResult.infobox;
+    lines.push(`Infobox: ${ib.title}`);
+    if (ib.content) lines.push(ib.content.slice(0, 500));
     lines.push('');
   }
 

@@ -22,7 +22,7 @@ An autonomous, goal-driven Discord trading bot powered by [Ollama](https://ollam
 ### Autonomous Agent
 - **Agent Core** — Goal-driven decision-making brain that evaluates context, classifies user intent, and chooses actions
 - **Proactive Goal System** — Weighted goals (`provide_value`, `foster_engagement`, `self_improve`, `learn_preferences`) with activation conditions and success metrics
-- **Web Search** — Live internet search via Serper API with caching and AI-powered summarization
+- **Web Search** — Live internet search via [SearXNG](https://docs.searxng.org) (free, open-source) with caching
 - **Safety & Rate Limits** — Guardrails preventing harmful autonomous actions, API rate limit tracking, and emergency stop
 - **Self-Healing** — AI-powered auto-fix for critical bugs via GitHub + Anthropic
 
@@ -81,7 +81,7 @@ All settings are configured through environment variables. See `.env.example`.
 | `GITHUB_REPO` | GitHub repo name | `Discord-bot` |
 | `GITHUB_BRANCH` | GitHub branch for code edits | `main` |
 | `ANTHROPIC_API_KEY` | Anthropic API key (for `!suggest`, `!autoedit`, `!selfheal`) | — |
-| `SERPER_API_KEY` | Serper Dev API key (for web search) | — |
+| `SEARXNG_URL` | SearXNG instance URL (for web search — free, no key needed) | — |
 | `BOT_OWNER_ID` | Discord user ID of the bot owner (for prefix commands) | — |
 | `BOT_PREFIX` | Prefix for owner commands | `!` |
 | `PORT` | Dashboard/health check port | `3000` |
@@ -180,11 +180,13 @@ Goals are evaluated on a loop:
 
 ### Web Search (`tools/web-search.js`)
 
-Live internet search capability via the [Serper Dev API](https://serper.dev).
+Live internet search capability via [SearXNG](https://docs.searxng.org) — a free, open-source metasearch engine. No API key required.
 
-- **`webSearch(query, numResults)`** — Returns structured results with titles, links, and snippets
-- **`searchAndSummarize(query)`** — Searches the web and uses AI to produce a concise 2-3 sentence summary with source attribution
-- **5-minute cache** — Prevents duplicate API calls for the same query
+- **`webSearch(query, numResults)`** — Queries a SearXNG instance and returns structured results with titles, links, and snippets
+- **`formatResultsForAI(result)`** — Formats search results as context for LLM prompts
+- **`formatResultsForDiscord(result)`** — Formats search results for Discord display
+- **5-minute cache** — Prevents duplicate queries to the same instance
+- **Infobox support** — Extracts knowledge-graph-style infoboxes when available
 
 ### Safety & Rate Limits (`safety-system.js`)
 
@@ -353,7 +355,7 @@ Discord-bot/
     │   ├── prefix.js               # Prefix command handlers (!update, !suggest, !autoedit, !rollback, !selfheal, !help)
     │   └── self-heal.js            # Self-healing command — AI auto-fix for critical bugs
     ├── tools/
-    │   └── web-search.js           # Serper API web search with caching + AI summarization
+    │   └── web-search.js           # SearXNG web search with caching + Discord/AI formatting
     ├── dashboard/
     │   ├── server.js               # Express web dashboard with /health, /api/stats, /
     │   └── monitor.html            # Real-time monitoring UI (logs, API usage, goals, safety)
@@ -449,7 +451,7 @@ curl http://localhost:3000/health
 
 Access the monitoring UI at `http://localhost:3000/monitor` for:
 - Real-time bot logs
-- API usage graphs (Ollama, Yahoo Finance, Serper, GitHub)
+- API usage graphs (Ollama, Yahoo Finance, SearXNG, GitHub)
 - Goal achievement tracking
 - Safety override alerts
 
