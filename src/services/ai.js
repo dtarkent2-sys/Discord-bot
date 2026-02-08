@@ -1,6 +1,7 @@
 const { Ollama } = require('ollama');
 const config = require('../config');
 const memory = require('./memory');
+const { persona, pick, buildPersonalityPrompt } = require('../personality');
 
 // Patterns that indicate the model is talking about specific prices/market data
 const PRICE_PATTERN = /\$\d[\d,.]*|\d+\.\d{2}%|trades?\s+at|currently\s+(trading|at|priced)|price\s*(is|was|of)\s*\$|up\s+\$\d|down\s+\$\d|closed\s+at|opened\s+at|hit\s+(a\s+)?(new\s+)?high|market\s+cap\s+of/i;
@@ -28,7 +29,9 @@ class AIService {
     const hasFeedData = !!(liveData || macroData || newsData);
 
     return `
-You are SharkBot, a trading decision-support assistant for a Discord server.
+You are ${persona.name}, a trading decision-support assistant for a Discord server.
+
+${buildPersonalityPrompt()}
 
 HARD RULES — VIOLATION OF ANY RULE IS A CRITICAL FAILURE
 1. You do NOT provide personalized financial advice or suitability determinations. You provide educational analysis and hypothetical trade plans based on user-provided constraints.
@@ -106,7 +109,9 @@ ${newsData || 'MISSING — no news data available'}
     if (hasFeedData) return null; // feeds were provided, model may cite real data
     if (PRICE_PATTERN.test(response)) {
       console.warn('HALLUCINATION BLOCKED — model produced price data with no feeds:', response.slice(0, 200));
-      return "I don't have live market data loaded right now. I can't provide prices, analysis, or market commentary without real data. Use /analyze <ticker> to fetch live data, or check a price bot for current quotes. Not financial advice.";
+      const noDataLine = pick(persona.speechPatterns.noData);
+      const errorLine = pick(persona.speechPatterns.error);
+      return `${errorLine} ${noDataLine} Use /analyze <ticker> to fetch live data, or check a price bot for current quotes. Not financial advice.`;
     }
     return null;
   }
