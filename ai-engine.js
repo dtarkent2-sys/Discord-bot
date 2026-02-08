@@ -4,7 +4,7 @@ const nlp = require('compromise');
 const { NeuralNetwork } = require('brain.js');
 
 const OLLAMA_BASE = process.env.OLLAMA_URL || 'https://ollama.com';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gemma3';
+const OLLAMA_MODEL_PREF = process.env.OLLAMA_MODEL || 'gemma3';
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || '';
 
 class AIEngine {
@@ -29,18 +29,24 @@ class AIEngine {
   }
 
   async initialize() {
-    console.log(`[AI Engine] Initializing... (Ollama URL: ${OLLAMA_BASE}, model: ${OLLAMA_MODEL}, API key: ${OLLAMA_API_KEY ? 'set' : 'NOT SET'})`);
+    console.log(`[AI Engine] Initializing... (Ollama URL: ${OLLAMA_BASE}, model: ${OLLAMA_MODEL_PREF}, API key: ${OLLAMA_API_KEY ? 'set' : 'NOT SET'})`);
 
-    // Check if Ollama is reachable
+    // Check if Ollama is reachable and resolve full model name
     try {
       const res = await axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 15000, ...this.axiosConfig });
       const models = res.data.models || [];
-      const hasModel = models.some(m => m.name.startsWith(OLLAMA_MODEL));
-      if (hasModel) {
+
+      // Find exact match first, then prefix match (e.g. "gemma3" -> "gemma3:4b")
+      const exact = models.find(m => m.name === OLLAMA_MODEL_PREF);
+      const prefix = models.find(m => m.name.startsWith(OLLAMA_MODEL_PREF));
+      const match = exact || prefix;
+
+      if (match) {
+        this.ollamaModel = match.name;
         this.ollamaAvailable = true;
-        console.log(`[AI Engine] Ollama connected — model "${OLLAMA_MODEL}" ready.`);
+        console.log(`[AI Engine] Ollama connected — using model "${this.ollamaModel}".`);
       } else {
-        console.log(`[AI Engine] Ollama running but model "${OLLAMA_MODEL}" not found. Using rule-based fallback.`);
+        console.log(`[AI Engine] Ollama running but model "${OLLAMA_MODEL_PREF}" not found. Using rule-based fallback.`);
         console.log(`[AI Engine] Available models: ${models.map(m => m.name).join(', ') || 'none'}`);
       }
     } catch (err) {
@@ -73,7 +79,7 @@ class AIEngine {
 
     try {
       const res = await axios.post(`${OLLAMA_BASE}/api/chat`, {
-        model: OLLAMA_MODEL,
+        model: this.ollamaModel,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userContent },
@@ -140,7 +146,7 @@ class AIEngine {
     if (this.ollamaAvailable) {
       try {
         const res = await axios.post(`${OLLAMA_BASE}/api/chat`, {
-          model: OLLAMA_MODEL,
+          model: this.ollamaModel,
           messages: [
             { role: 'user', content: 'Generate one interesting discussion topic or thought-provoking question for a Discord server. Just the topic, nothing else.' },
           ],
