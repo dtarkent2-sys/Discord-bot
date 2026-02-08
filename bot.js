@@ -51,7 +51,7 @@ client.once(Events.ClientReady, async () => {
     );
     if (channel) {
       autonomous.setTargetChannel(channel.id);
-      autonomous.startAll();
+      autonomous.start();
     }
   }
 });
@@ -249,7 +249,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
 // --- Graceful shutdown ---
 async function shutdown(signal) {
   console.log(`[Bot] ${signal} received, shutting down...`);
-  autonomous.stopAll();
+  autonomous.stop();
   await memory.close();
   client.destroy();
   process.exit(0);
