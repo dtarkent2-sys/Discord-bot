@@ -30,6 +30,8 @@ module.exports = {
   githubBranch: process.env.GITHUB_BRANCH || 'main',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
   botOwnerId: process.env.BOT_OWNER_ID || '',
+  p123ApiId: process.env.P123_API_ID || '',
+  p123ApiKey: process.env.P123_API_KEY || '',
   botPrefix: process.env.BOT_PREFIX || '!',
   port: parseInt(process.env.PORT, 10) || 3000,
   dataDir: path.join(__dirname, '..', 'data'),
