@@ -16,7 +16,7 @@ class YahooFinanceClient {
 
     try {
       const YahooFinance = (await import('yahoo-finance2')).default;
-      this._yf = new YahooFinance({ suppressNotices: ['yahooSurvey'] });
+      this._yf = new YahooFinance({ suppressNotices: ['yahooSurvey', 'ripHistorical'] });
       console.log('[Yahoo] yahoo-finance2 v3 loaded successfully.');
       return this._yf;
     } catch (err) {
@@ -55,7 +55,7 @@ class YahooFinanceClient {
     return results;
   }
 
-  // ── Historical — price history ──────────────────────────────────────
+  // ── Historical — price history via chart() API ─────────────────────
   async getHistory(ticker, days = 30) {
     const yf = await this._getYF();
     if (!yf) throw new Error('Yahoo Finance not available');
@@ -63,10 +63,13 @@ class YahooFinanceClient {
     const startDate = new Date();
     startDate.setDate(startDate.getDate() - days);
 
-    return yf.historical(ticker.toUpperCase(), {
+    const result = await yf.chart(ticker.toUpperCase(), {
       period1: startDate,
       interval: '1d',
     });
+
+    // chart() returns { quotes: [{ date, open, high, low, close, volume }] }
+    return result.quotes || [];
   }
 
   // ── Ticker Snapshot — full fundamentals + technicals ────────────────
