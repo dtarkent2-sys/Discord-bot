@@ -22,7 +22,7 @@ module.exports = {
   token: process.env.DISCORD_TOKEN,
   clientId: process.env.DISCORD_CLIENT_ID,
   ollamaHost: process.env.OLLAMA_HOST || 'http://localhost:11434',
-  ollamaModel: process.env.OLLAMA_MODEL || 'gpt-oss:120b-cloud',
+  ollamaModel: process.env.OLLAMA_MODEL || 'deepseek-v3.2:cloud',
   port: parseInt(process.env.PORT, 10) || 3000,
   dataDir: path.join(__dirname, '..', 'data'),
 };
