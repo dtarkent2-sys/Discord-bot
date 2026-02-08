@@ -27,6 +27,15 @@ const commands = [
   new SlashCommandBuilder()
     .setName('stats')
     .setDescription('Get bot statistics'),
+
+  new SlashCommandBuilder()
+    .setName('analyze')
+    .setDescription('Analyze a stock ticker (data-only, no hallucination)')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock ticker symbol (e.g. AAPL, TSLA)')
+        .setRequired(true)
+    ),
 ];
 
 async function registerCommands() {

@@ -3,6 +3,7 @@ const memory = require('../services/memory');
 const stats = require('../services/stats');
 const reactions = require('../services/reactions');
 const sentiment = require('../services/sentiment');
+const { analyzeTicker, formatPlanForDiscord } = require('../trading/analyze');
 
 async function handleCommand(interaction) {
   const { commandName, user } = interaction;
@@ -17,6 +18,8 @@ async function handleCommand(interaction) {
       return handleModel(interaction);
     case 'stats':
       return handleStats(interaction);
+    case 'analyze':
+      return handleAnalyze(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   }
@@ -104,6 +107,20 @@ async function handleStats(interaction) {
   }
 
   await interaction.reply(msg.join('\n'));
+}
+
+async function handleAnalyze(interaction) {
+  await interaction.deferReply();
+
+  const ticker = interaction.options.getString('ticker').toUpperCase();
+  const result = await analyzeTicker(ticker);
+
+  if (!result.success) {
+    await interaction.editReply(`**Analysis failed for ${ticker}**\n${result.error}`);
+    return;
+  }
+
+  await interaction.editReply(formatPlanForDiscord(result.plan));
 }
 
 module.exports = { handleCommand };
