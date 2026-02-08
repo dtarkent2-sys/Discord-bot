@@ -17,6 +17,7 @@ An autonomous, goal-driven Discord trading bot powered by [Ollama](https://ollam
 - **Reaction Learning** — Learns from thumbs up/down reactions on its own messages
 - **Image Analysis** — Analyzes images via Ollama vision models when attached to messages
 - **Watchlist** — Per-user stock watchlist with live price lookups via Yahoo Finance
+- **TradingAgents** — Multi-agent deep analysis pipeline inspired by [TradingAgents](https://github.com/TauricResearch/TradingAgents) — 4 analysts, bull/bear debate, trader decision, risk committee → BUY/SELL/HOLD signal
 
 ### Autonomous Agent
 - **Agent Core** — Goal-driven decision-making brain that evaluates context, classifies user intent, and chooses actions
@@ -26,7 +27,7 @@ An autonomous, goal-driven Discord trading bot powered by [Ollama](https://ollam
 - **Self-Healing** — AI-powered auto-fix for critical bugs via GitHub + Anthropic
 
 ### Infrastructure
-- **Slash Commands** — 12 Discord slash commands: `/ask`, `/analyze`, `/price`, `/screen`, `/watchlist`, `/sentiment`, `/topic`, `/profile`, `/memory`, `/model`, `/stats`, `/help`
+- **Slash Commands** — 13 Discord slash commands: `/ask`, `/analyze`, `/deepanalysis`, `/price`, `/screen`, `/watchlist`, `/sentiment`, `/topic`, `/profile`, `/memory`, `/model`, `/stats`, `/help`
 - **Self-Editing** — Owner-only prefix commands to update, suggest, auto-edit, rollback, and self-heal code via GitHub + Anthropic AI
 - **Web Dashboard** — Real-time stats page at `/` with JSON API at `/api/stats` and health check at `/health`
 - **Monitoring** — Real-time log viewer, API usage graphs, goal achievement tracking, safety override alerts
@@ -97,6 +98,7 @@ All settings are configured through environment variables. See `.env.example`.
 |---|---|
 | `/ask <question>` | Ask the AI anything — uses conversation context and memory |
 | `/analyze <ticker>` | AI-powered stock analysis with live Yahoo Finance market data |
+| `/deepanalysis <ticker>` | Multi-agent deep analysis — 4 analysts, debate, trader, risk → BUY/SELL/HOLD |
 | `/price <ticker>` | Quick price + key stats lookup (P/E, RSI, moving averages, etc.) |
 | `/screen <universe> [rules]` | Run a stock screen (e.g. `/screen SP500 PE < 15, MktCap > 1e9`) |
 | `/watchlist [action] [ticker]` | Manage your personal stock watchlist (show/add/remove) |
@@ -243,6 +245,60 @@ Sprocket maintains a multi-layer memory system for contextual, personalized inte
 
 ---
 
+## TradingAgents — Multi-Agent Analysis Pipeline
+
+Inspired by [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents), Sprocket implements a full multi-agent LLM trading analysis pipeline natively in Node.js. No Python required — uses the existing Ollama integration and Yahoo Finance data.
+
+### Pipeline
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ /deepanalysis AAPL                                       │
+├─────────────────────────────────────────────────────────┤
+│ Stage 1: Four Analyst Agents (parallel)                  │
+│   ├── Market/Technical Analyst (price action, RSI, SMA) │
+│   ├── Fundamentals Analyst (P/E, EPS, margins, growth)  │
+│   ├── Sentiment Analyst (crowd psychology, fear/greed)   │
+│   └── News/Macro Analyst (sector trends, catalysts)      │
+├─────────────────────────────────────────────────────────┤
+│ Stage 2: Bull vs Bear Debate                             │
+│   ├── Bull Advocate (strongest case FOR buying)          │
+│   └── Bear Advocate (strongest case AGAINST buying)      │
+├─────────────────────────────────────────────────────────┤
+│ Stage 3: Trader Decision                                 │
+│   └── Senior Trader makes BUY/SELL/HOLD decision         │
+├─────────────────────────────────────────────────────────┤
+│ Stage 4: Risk Management Committee (parallel)            │
+│   ├── Aggressive Risk Manager                            │
+│   ├── Moderate Risk Manager                              │
+│   └── Conservative Risk Manager                          │
+├─────────────────────────────────────────────────────────┤
+│ Stage 5: Final Signal                                    │
+│   └── Head of Trading → BUY/SELL/HOLD + confidence 1-10 │
+└─────────────────────────────────────────────────────────┘
+```
+
+### How It Works
+
+1. **Data Fetch** — Yahoo Finance provides real-time price, volume, technicals (RSI, SMA50/200), fundamentals (P/E, EPS, margins), and 52-week range
+2. **Analyst Agents** — Four specialized LLM agents analyze the data from different angles simultaneously, each producing a BULLISH/BEARISH/NEUTRAL rating with confidence
+3. **Debate** — A bull advocate and bear advocate argue for/against the stock, citing specific data points and countering each other's arguments
+4. **Trader** — Reviews all analyst reports and the debate, then makes a decisive BUY/SELL/HOLD call with timeframe
+5. **Risk Committee** — Three risk managers (aggressive, moderate, conservative) independently review the trade proposal and vote APPROVE/REJECT
+6. **Final Signal** — Head of trading synthesizes everything into a final signal with confidence level
+
+### Output
+
+The command produces a formatted Discord message showing:
+- Signal (BUY/SELL/HOLD) with confidence bar
+- Summary rationale
+- Individual analyst ratings
+- Bull/Bear debate highlights
+- Risk committee verdicts (APPROVE/REJECT from each manager)
+- Full detailed report as an ephemeral follow-up message
+
+---
+
 ## Anti-Hallucination Architecture
 
 Sprocket uses a two-layer defense to prevent fabricated market data:
@@ -293,7 +349,7 @@ Discord-bot/
     ├── ai-coder.js                 # Anthropic API wrapper for code generation
     ├── commands/
     │   ├── register.js             # Slash command registration with Discord API
-    │   ├── handlers.js             # Slash command handlers (12 commands)
+    │   ├── handlers.js             # Slash command handlers (13 commands)
     │   ├── prefix.js               # Prefix command handlers (!update, !suggest, !autoedit, !rollback, !selfheal, !help)
     │   └── self-heal.js            # Self-healing command — AI auto-fix for critical bugs
     ├── tools/
@@ -311,6 +367,7 @@ Discord-bot/
     │   ├── images.js               # Image analysis via Ollama vision models
     │   ├── memory.js               # Per-user memory — facts, tickers, topics, watchlist, context building
     │   ├── mood.js                 # Mood engine — 7 states, P&L-driven, decay, market signals
+    │   ├── trading-agents.js       # TradingAgents multi-agent analysis pipeline (4 analysts, debate, trader, risk)
     │   ├── yahoo.js                # Yahoo Finance client (quotes, history, technicals, screening)
     │   ├── reactions.js            # Reaction-based learning and pattern tracking
     │   ├── sentiment.js            # Sentiment analysis with per-user trend tracking
