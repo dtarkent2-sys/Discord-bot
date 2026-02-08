@@ -4,7 +4,7 @@ const nlp = require('compromise');
 const { NeuralNetwork } = require('brain.js');
 
 const OLLAMA_BASE = process.env.OLLAMA_URL || 'https://ollama.com';
-const OLLAMA_MODEL_PREF = process.env.OLLAMA_MODEL || 'gemma3:4b-cloud';
+const OLLAMA_MODEL_PREF = process.env.OLLAMA_MODEL || 'kimi-k2.5:cloud';
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || '';
 
 class AIEngine {
