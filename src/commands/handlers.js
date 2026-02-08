@@ -143,7 +143,7 @@ async function handleStats(interaction) {
 async function handleAnalyze(interaction) {
   await interaction.deferReply();
 
-  const ticker = interaction.options.getString('ticker').toUpperCase();
+  const ticker = yahoo.resolveTicker(interaction.options.getString('ticker'));
 
   // Fetch real market data from Yahoo Finance
   const context = await getMarketContext(ticker);
@@ -170,7 +170,7 @@ async function handleAnalyze(interaction) {
 async function handlePrice(interaction) {
   await interaction.deferReply();
 
-  const ticker = interaction.options.getString('ticker').toUpperCase();
+  const ticker = yahoo.resolveTicker(interaction.options.getString('ticker'));
 
   try {
     const context = await getMarketContext(ticker);
@@ -244,11 +244,11 @@ async function handleHelp(interaction) {
   const lines = [
     '**Slash Commands:**',
     '`/ask <question>` — Ask the AI a question',
-    '`/analyze <ticker>` — AI-powered stock analysis with live data',
-    '`/deepanalysis <ticker>` — Multi-agent deep analysis (BUY/SELL/HOLD signal)',
-    '`/price <ticker>` — Quick price + key stats lookup',
+    '`/analyze <ticker>` — AI-powered stock/crypto analysis with live data (e.g. AAPL, BTC, ETH)',
+    '`/deepanalysis <ticker>` — Multi-agent deep analysis — BUY/SELL/HOLD signal (stocks & crypto)',
+    '`/price <ticker>` — Quick price + key stats lookup (stocks & crypto)',
     '`/screen <universe> [rules]` — Run a stock screen',
-    '`/watchlist [action] [ticker]` — Manage your stock watchlist',
+    '`/watchlist [action] [ticker]` — Manage your stock/crypto watchlist',
     '`/sentiment <text>` — Analyze text sentiment',
     '`/topic` — Generate an AI discussion topic',
     '`/profile [@user]` — View user profile and activity',
@@ -320,11 +320,12 @@ async function handleWatchlist(interaction) {
 
   if (action === 'add') {
     if (!ticker) {
-      await interaction.reply({ content: 'Please provide a ticker to add. Example: `/watchlist add AAPL`', ephemeral: true });
+      await interaction.reply({ content: 'Please provide a ticker to add. Example: `/watchlist add AAPL` or `/watchlist add BTC`', ephemeral: true });
       return;
     }
-    const list = memory.addToWatchlist(userId, ticker);
-    await interaction.reply(`Added **${ticker.toUpperCase()}** to your watchlist. (${list.length} stocks total)`);
+    const resolved = yahoo.resolveTicker(ticker);
+    const list = memory.addToWatchlist(userId, resolved);
+    await interaction.reply(`Added **${resolved}** to your watchlist. (${list.length} total)`);
     return;
   }
 
@@ -333,8 +334,9 @@ async function handleWatchlist(interaction) {
       await interaction.reply({ content: 'Please provide a ticker to remove. Example: `/watchlist remove AAPL`', ephemeral: true });
       return;
     }
-    const list = memory.removeFromWatchlist(userId, ticker);
-    await interaction.reply(`Removed **${ticker.toUpperCase()}** from your watchlist. (${list.length} stocks remaining)`);
+    const resolved = yahoo.resolveTicker(ticker);
+    const list = memory.removeFromWatchlist(userId, resolved);
+    await interaction.reply(`Removed **${resolved}** from your watchlist. (${list.length} remaining)`);
     return;
   }
 
@@ -430,7 +432,7 @@ async function handleProfile(interaction) {
 async function handleDeepAnalysis(interaction) {
   await interaction.deferReply();
 
-  const ticker = interaction.options.getString('ticker').toUpperCase();
+  const ticker = yahoo.resolveTicker(interaction.options.getString('ticker'));
 
   // Update progress via editing the deferred reply
   const updateProgress = async (stage, message) => {

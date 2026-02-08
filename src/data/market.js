@@ -16,13 +16,14 @@ const FRESHNESS = {
  * Returns structured data for the AI, or { error: true, missing: [...] }.
  */
 async function getMarketContext(ticker) {
-  const upperTicker = ticker.toUpperCase();
+  // Resolve crypto shorthand: BTC → BTC-USD, ETH → ETH-USD, etc.
+  const resolvedTicker = yahoo.resolveTicker(ticker);
   const missing = [];
-  const context = { ticker: upperTicker, fetchedAt: new Date().toISOString() };
+  const context = { ticker: resolvedTicker, fetchedAt: new Date().toISOString() };
 
   // ── Ticker Snapshot (fundamentals + technicals) ──
   try {
-    const snapshot = await yahoo.getTickerSnapshot(upperTicker);
+    const snapshot = await yahoo.getTickerSnapshot(resolvedTicker);
 
     if (snapshot && snapshot.price != null) {
       context.snapshot = snapshot;
@@ -39,10 +40,10 @@ async function getMarketContext(ticker) {
       };
       context.priceHistory = snapshot.priceHistory;
     } else {
-      missing.push({ field: 'snapshot', reason: `No data returned for ${upperTicker}` });
+      missing.push({ field: 'snapshot', reason: `No data returned for ${resolvedTicker}` });
     }
   } catch (err) {
-    console.error(`[Market] Yahoo snapshot error for ${upperTicker}:`, err.message);
+    console.error(`[Market] Yahoo snapshot error for ${resolvedTicker}:`, err.message);
     missing.push({ field: 'snapshot', reason: err.message });
   }
 
@@ -61,9 +62,9 @@ async function getMarketContext(ticker) {
   if (missing.length > 0 && !context.quote) {
     return {
       error: true,
-      ticker: upperTicker,
+      ticker: resolvedTicker,
       missing,
-      message: `Cannot analyze ${upperTicker}: ${missing.map(m => m.reason).join('; ')}`,
+      message: `Cannot analyze ${resolvedTicker}: ${missing.map(m => m.reason).join('; ')}`,
     };
   }
 

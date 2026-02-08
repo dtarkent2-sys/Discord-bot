@@ -30,19 +30,19 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('analyze')
-    .setDescription('Analyze a stock ticker with real market data')
+    .setDescription('Analyze a stock or crypto with real market data')
     .addStringOption(opt =>
       opt.setName('ticker')
-        .setDescription('Stock ticker symbol (e.g. AAPL, TSLA)')
+        .setDescription('Stock or crypto symbol (e.g. AAPL, TSLA, BTC, ETH)')
         .setRequired(true)
     ),
 
   new SlashCommandBuilder()
     .setName('price')
-    .setDescription('Get current price and key stats for a stock')
+    .setDescription('Get current price and key stats for a stock or crypto')
     .addStringOption(opt =>
       opt.setName('ticker')
-        .setDescription('Stock ticker symbol (e.g. AAPL, TSLA)')
+        .setDescription('Stock or crypto symbol (e.g. AAPL, TSLA, BTC, ETH)')
         .setRequired(true)
     ),
 
@@ -79,7 +79,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('watchlist')
-    .setDescription('Manage your personal stock watchlist')
+    .setDescription('Manage your personal stock/crypto watchlist')
     .addStringOption(opt =>
       opt.setName('action')
         .setDescription('Action to perform')
@@ -92,7 +92,7 @@ const commands = [
     )
     .addStringOption(opt =>
       opt.setName('ticker')
-        .setDescription('Stock ticker symbol (for add/remove)')
+        .setDescription('Stock or crypto symbol (for add/remove, e.g. AAPL, BTC)')
         .setRequired(false)
     ),
 
@@ -110,7 +110,7 @@ const commands = [
     .setDescription('Multi-agent deep analysis (TradingAgents) — BUY/SELL/HOLD signal')
     .addStringOption(opt =>
       opt.setName('ticker')
-        .setDescription('Stock ticker symbol (e.g. AAPL, TSLA)')
+        .setDescription('Stock or crypto symbol (e.g. AAPL, TSLA, BTC, ETH)')
         .setRequired(true)
     ),
 ];
