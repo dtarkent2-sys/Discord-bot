@@ -29,6 +29,7 @@ module.exports = {
   githubRepo: process.env.GITHUB_REPO || 'Discord-bot',
   githubBranch: process.env.GITHUB_BRANCH || 'main',
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
+  searxngUrl: process.env.SEARXNG_URL || '',
   botOwnerId: process.env.BOT_OWNER_ID || '',
   botPrefix: process.env.BOT_PREFIX || '!',
   port: parseInt(process.env.PORT, 10) || 3000,
