@@ -16,7 +16,7 @@ An autonomous, goal-driven Discord trading bot powered by [Ollama](https://ollam
 - **Conversation Memory** — Per-user fact extraction, ticker tracking, topic classification, and sentiment history
 - **Reaction Learning** — Learns from thumbs up/down reactions on its own messages
 - **Image Analysis** — Analyzes images via Ollama vision models when attached to messages
-- **Watchlist** — Per-user stock watchlist with live price lookups via Portfolio123
+- **Watchlist** — Per-user stock watchlist with live price lookups via Yahoo Finance
 
 ### Autonomous Agent
 - **Agent Core** — Goal-driven decision-making brain that evaluates context, classifies user intent, and chooses actions
@@ -75,8 +75,6 @@ All settings are configured through environment variables. See `.env.example`.
 | `OLLAMA_HOST` | Ollama API endpoint | `https://ollama.com` |
 | `OLLAMA_MODEL` | Which Ollama model to use | `gemma4b` |
 | `OLLAMA_API_KEY` | API key for cloud Ollama | — |
-| `P123_API_ID` | Portfolio123 API ID (for `/price`, `/analyze`, `/screen`, `/watchlist`) | — |
-| `P123_API_KEY` | Portfolio123 API Key | — |
 | `GITHUB_TOKEN` | GitHub PAT (for `!update`, `!suggest`, `!autoedit`, `!rollback`, `!selfheal`) | — |
 | `GITHUB_OWNER` | GitHub repo owner | `dtarkent2-sys` |
 | `GITHUB_REPO` | GitHub repo name | `Discord-bot` |
@@ -98,7 +96,7 @@ All settings are configured through environment variables. See `.env.example`.
 | Command | Description |
 |---|---|
 | `/ask <question>` | Ask the AI anything — uses conversation context and memory |
-| `/analyze <ticker>` | AI-powered stock analysis with live Portfolio123 market data |
+| `/analyze <ticker>` | AI-powered stock analysis with live Yahoo Finance market data |
 | `/price <ticker>` | Quick price + key stats lookup (P/E, RSI, moving averages, etc.) |
 | `/screen <universe> [rules]` | Run a stock screen (e.g. `/screen SP500 PE < 15, MktCap > 1e9`) |
 | `/watchlist [action] [ticker]` | Manage your personal stock watchlist (show/add/remove) |
@@ -313,7 +311,7 @@ Discord-bot/
     │   ├── images.js               # Image analysis via Ollama vision models
     │   ├── memory.js               # Per-user memory — facts, tickers, topics, watchlist, context building
     │   ├── mood.js                 # Mood engine — 7 states, P&L-driven, decay, market signals
-    │   ├── p123.js                 # Portfolio123 API client (prices, screens, rankings)
+    │   ├── yahoo.js                # Yahoo Finance client (quotes, history, technicals, screening)
     │   ├── reactions.js            # Reaction-based learning and pattern tracking
     │   ├── sentiment.js            # Sentiment analysis with per-user trend tracking
     │   ├── stats.js                # Uptime, message count, error tracking, memory usage
@@ -394,7 +392,7 @@ curl http://localhost:3000/health
 
 Access the monitoring UI at `http://localhost:3000/monitor` for:
 - Real-time bot logs
-- API usage graphs (Ollama, P123, Serper, GitHub)
+- API usage graphs (Ollama, Yahoo Finance, Serper, GitHub)
 - Goal achievement tracking
 - Safety override alerts
 

@@ -1,10 +1,9 @@
 /**
- * Market context provider — fetches data from Portfolio123 API.
- * Replaces the old stub providers with real P123 data.
+ * Market context provider — fetches data from Yahoo Finance.
  */
 
 const { assertFresh, FreshnessError } = require('./freshness');
-const p123 = require('../services/p123');
+const yahoo = require('../services/yahoo');
 
 // Default freshness limits (in seconds)
 const FRESHNESS = {
@@ -13,72 +12,38 @@ const FRESHNESS = {
 };
 
 /**
- * Fetch market context for a ticker via Portfolio123.
+ * Fetch market context for a ticker via Yahoo Finance.
  * Returns structured data for the AI, or { error: true, missing: [...] }.
  */
 async function getMarketContext(ticker) {
   const upperTicker = ticker.toUpperCase();
-
-  if (!p123.enabled) {
-    return {
-      error: true,
-      ticker: upperTicker,
-      missing: [{ field: 'p123', reason: 'Portfolio123 API not configured (set P123_API_ID and P123_API_KEY)' }],
-      message: `Cannot analyze ${upperTicker}: Portfolio123 API credentials not configured.`,
-    };
-  }
-
   const missing = [];
   const context = { ticker: upperTicker, fetchedAt: new Date().toISOString() };
 
   // ── Ticker Snapshot (fundamentals + technicals) ──
   try {
-    const snapshot = await p123.getTickerSnapshot(upperTicker);
-    if (snapshot && snapshot.rows && snapshot.rows.length > 0) {
-      const row = snapshot.rows[0];
-      const names = snapshot.names || snapshot.columnNames || [];
-      const data = {};
-      for (let i = 0; i < names.length; i++) {
-        data[names[i]] = row[i] !== undefined ? row[i] : (Array.isArray(row) ? row[i] : null);
-      }
-      context.snapshot = data;
-      // Compute daily change percent from 1-day return ratio
-      const changePercent = data['1dReturn'] != null ? ((data['1dReturn'] - 1) * 100) : null;
+    const snapshot = await yahoo.getTickerSnapshot(upperTicker);
 
+    if (snapshot && snapshot.price != null) {
+      context.snapshot = snapshot;
       context.quote = {
-        price: data.Price,
-        volume: data.Volume,
-        mktCap: data.MktCap,
-        pe: data.PE,
-        rsi14: data.RSI14,
-        sma50: data.SMA50,
-        sma200: data.SMA200,
-        changePercent,
-        timestamp: new Date().toISOString(),
+        price: snapshot.price,
+        volume: snapshot.volume,
+        mktCap: snapshot.marketCap,
+        pe: snapshot.pe,
+        rsi14: snapshot.rsi14,
+        sma50: snapshot.sma50,
+        sma200: snapshot.sma200,
+        changePercent: snapshot.changePercent,
+        timestamp: snapshot.timestamp,
       };
+      context.priceHistory = snapshot.priceHistory;
     } else {
       missing.push({ field: 'snapshot', reason: `No data returned for ${upperTicker}` });
     }
   } catch (err) {
-    console.error(`[Market] P123 snapshot error for ${upperTicker}:`, err.message);
+    console.error(`[Market] Yahoo snapshot error for ${upperTicker}:`, err.message);
     missing.push({ field: 'snapshot', reason: err.message });
-  }
-
-  // ── Price History (last 30 days) ──
-  try {
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-    const start = thirtyDaysAgo.toISOString().slice(0, 10);
-    const prices = await p123.getPrices(upperTicker, start);
-    if (prices && Array.isArray(prices) && prices.length > 0) {
-      context.priceHistory = prices;
-      context.candles_1d = prices;
-    } else {
-      missing.push({ field: 'price_history', reason: 'No price history returned' });
-    }
-  } catch (err) {
-    console.error(`[Market] P123 price history error for ${upperTicker}:`, err.message);
-    missing.push({ field: 'price_history', reason: err.message });
   }
 
   // Apply freshness gate to quote data
@@ -128,28 +93,31 @@ function formatContextForAI(context) {
     if (q.pe) lines.push(`  P/E: ${q.pe}`);
     if (q.rsi14) lines.push(`  RSI(14): ${q.rsi14}`);
     if (q.sma50) lines.push(`  SMA(50): $${q.sma50}`);
-    if (q.changePercent != null) lines.push(`  Daily Change: ${q.changePercent > 0 ? '+' : ''}${q.changePercent.toFixed(2)}%`);
     if (q.sma200) lines.push(`  SMA(200): $${q.sma200}`);
+    if (q.changePercent != null) lines.push(`  Daily Change: ${q.changePercent > 0 ? '+' : ''}${q.changePercent.toFixed(2)}%`);
   }
 
   if (context.snapshot) {
     const s = context.snapshot;
-    if (s.PB) lines.push(`  P/B: ${s.PB}`);
-    if (s.DivYield) lines.push(`  Div Yield: ${s.DivYield}%`);
-    if (s.ROE) lines.push(`  ROE: ${s.ROE}%`);
-    if (s.EPS) lines.push(`  EPS: $${s.EPS}`);
-    if (s['1dReturn']) lines.push(`  1-Day Return: ${((s['1dReturn'] - 1) * 100).toFixed(2)}%`);
-    if (s['1wkReturn']) lines.push(`  1-Week Return: ${((s['1wkReturn'] - 1) * 100).toFixed(2)}%`);
-    if (s['1moReturn']) lines.push(`  1-Month Return: ${((s['1moReturn'] - 1) * 100).toFixed(2)}%`);
+    if (s.pb) lines.push(`  P/B: ${s.pb}`);
+    if (s.divYield) lines.push(`  Div Yield: ${s.divYield.toFixed(2)}%`);
+    if (s.roe) lines.push(`  ROE: ${s.roe.toFixed(2)}%`);
+    if (s.eps) lines.push(`  EPS: $${s.eps}`);
+    if (s.beta) lines.push(`  Beta: ${s.beta}`);
+    if (s.profitMargin) lines.push(`  Profit Margin: ${s.profitMargin.toFixed(2)}%`);
+    if (s.revenueGrowth) lines.push(`  Revenue Growth: ${s.revenueGrowth.toFixed(2)}%`);
+    if (s.fiftyTwoWeekHigh) lines.push(`  52-Week High: $${s.fiftyTwoWeekHigh}`);
+    if (s.fiftyTwoWeekLow) lines.push(`  52-Week Low: $${s.fiftyTwoWeekLow}`);
+    if (s.forwardPE) lines.push(`  Forward P/E: ${s.forwardPE}`);
   }
 
   if (context.priceHistory && context.priceHistory.length > 0) {
     const recent = context.priceHistory.slice(-5);
     lines.push('  Recent Prices:');
     for (const p of recent) {
-      const date = p.date || p.Date || p[0];
-      const close = p.close || p.Close || p[4] || p[1];
-      if (date && close) lines.push(`    ${date}: $${close}`);
+      const date = p.date ? new Date(p.date).toISOString().slice(0, 10) : 'N/A';
+      const close = p.close;
+      if (date && close) lines.push(`    ${date}: $${close.toFixed(2)}`);
     }
   }
 
