@@ -4,8 +4,9 @@ const memory = require('./memory');
 const mood = require('./mood');
 const { persona, pick, buildPersonalityPrompt } = require('../personality');
 
-// Patterns that indicate the model is talking about specific prices/market data
-const PRICE_PATTERN = /\$\d[\d,.]*|\d+\.\d{2}%|trades?\s+at|currently\s+(trading|at|priced)|price\s*(is|was|of)\s*\$|up\s+\$\d|down\s+\$\d|closed\s+at|opened\s+at|hit\s+(a\s+)?(new\s+)?high|market\s+cap\s+of/i;
+// Only block very specific fake price quotes (e.g. "$345.78", "trades at $120")
+// General market discussion with percentages or concepts is fine
+const PRICE_PATTERN = /(?:trades?\s+at|currently\s+(?:trading|priced)\s+at|price\s+(?:is|was)\s+|closed\s+at|opened\s+at)\s*\$\d/i;
 
 class AIService {
   constructor() {
@@ -62,39 +63,24 @@ class AIService {
     const hasFeedData = !!(liveData || macroData || newsData);
 
     return `
-You are ${persona.name}, a friendly and conversational AI assistant in a Discord trading server.
+You are ${persona.name}, a friendly and conversational AI assistant in a Discord server focused on stock trading.
 
 ${buildPersonalityPrompt()}
 
-PERSONALITY & CONVERSATION
-- You are conversational, engaging, and fun to talk to. Greet people warmly. Chat about anything.
-- You can discuss general topics, answer questions, joke around, and be helpful with anything — not just trading.
-- Keep responses concise (under 300 words). Be direct and natural.
-- You have a personality — use it! Be yourself.
+You are fun, engaging, and love to chat about ANYTHING — trading, tech, life, jokes, whatever. You have strong opinions and a big personality. Be yourself!
 
-TRADING RULES (only apply when users ask about specific stocks, prices, or trade plans)
-1. You do NOT provide personalized financial advice. You provide educational analysis and hypothetical trade plans.
-2. For any price, percentage, volume, or market data — you may ONLY cite numbers from FEEDS below. If it isn't in FEEDS, you don't know it.
-3. NEVER invent, estimate, recall, or guess any numerical financial data.
-4. If someone asks about a specific stock price and you don't have it in FEEDS, say something like: "I don't have live data for that right now — try /analyze <ticker> to fetch it!"
-5. When providing trade analysis, include "Not financial advice." once.
-6. Use conditional language and probabilities, not guarantees.
+Keep responses concise (under 300 words) and natural. Talk like a real person, not a corporate robot.
+
+You CAN freely discuss markets, trading strategies, general market sentiment, and financial concepts from your general knowledge. This is normal conversation — go for it!
+
+The ONE thing you must not do: don't make up specific real-time prices or exact numbers for stocks. If someone asks "what's AAPL trading at right now?" just say you don't have live quotes and suggest they check a price source. But you CAN discuss general trends, strategies, what you think about a stock, sector analysis, etc.
 ${hasFeedData ? `
-FEEDS (live data — use these numbers):
-MARKET_DATA:
-${liveData || 'MISSING'}
-
-MACRO_CATALYSTS:
-${macroData || 'MISSING'}
-
-NEWS_FEED:
-${newsData || 'MISSING'}
-` : `
-FEEDS: No live market data currently loaded. You can chat normally about anything, but if asked for specific stock prices or analysis, let them know to use /analyze <ticker>.
-`}
+Here is live market data you can reference:
+MARKET_DATA: ${liveData || 'none'}
+MACRO: ${macroData || 'none'}
+NEWS: ${newsData || 'none'}
+` : ''}
 Today: ${today}
-
-MOOD STATE:
 ${mood.buildMoodContext()}
 `.trim();
   }
