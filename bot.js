@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+const http = require('http');
 const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
 const AIEngine = require('./ai-engine');
 const MemorySystem = require('./memory-system');
@@ -250,6 +251,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
 async function shutdown(signal) {
   console.log(`[Bot] ${signal} received, shutting down...`);
   autonomous.stop();
+  healthServer.close();
   await memory.close();
   client.destroy();
   process.exit(0);
@@ -257,6 +259,34 @@ async function shutdown(signal) {
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// --- Health check server for Railway ─────────────────────────────────────────
+const HEALTH_PORT = parseInt(process.env.HEALTH_PORT, 10) || process.env.PORT || 3000;
+const startTime = Date.now();
+
+const healthServer = http.createServer((req, res) => {
+  if (req.url === '/health' && req.method === 'GET') {
+    const uptimeSeconds = Math.floor((Date.now() - startTime) / 1000);
+    const status = {
+      status: client.isReady() ? 'ok' : 'starting',
+      uptime: uptimeSeconds,
+      discord: client.isReady() ? 'connected' : 'connecting',
+      ai: ai.ready ? (ai.ollamaAvailable ? 'ollama' : 'rule-based') : 'initializing',
+      memory: memory.ready ? 'connected' : 'initializing',
+      guilds: client.guilds?.cache?.size || 0,
+      scheduled_jobs: Object.keys(autonomous.jobs).length,
+    };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(status));
+  } else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+});
+
+healthServer.listen(HEALTH_PORT, () => {
+  console.log(`[Health] Listening on port ${HEALTH_PORT}`);
+});
 
 // --- Start ---
 const token = process.env.DISCORD_TOKEN;
