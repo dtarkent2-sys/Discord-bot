@@ -19,9 +19,9 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-const ai = new AIEngine();
-const memory = new MemorySystem();
 const stocks = new StockData();
+const ai = new AIEngine(stocks);
+const memory = new MemorySystem();
 const autonomous = new AutonomousActions(client, ai, memory, stocks);
 
 const PREFIX = process.env.BOT_PREFIX || '!';

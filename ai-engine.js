@@ -8,7 +8,8 @@ const OLLAMA_MODEL_PREF = process.env.OLLAMA_MODEL || 'gemma3:4b-cloud';
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || '';
 
 class AIEngine {
-  constructor() {
+  constructor(stocks) {
+    this.stocks = stocks || null;
     this.ollamaAvailable = false;
     this.ready = false;
 
@@ -72,7 +73,45 @@ class AIEngine {
 
   async _ollamaGenerate(prompt, context = '') {
     const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-    const systemPrompt = `You are a helpful and knowledgeable Discord bot for a stock trading server. Today's date is ${today}. Keep responses concise (under 300 words). Be conversational and engaging. You can discuss trading strategies, market concepts, and financial education. Always remind users that nothing you say is financial advice. Do not use emojis. CRITICAL: You do NOT have access to real-time market data. NEVER quote specific stock prices, index levels, or percentage moves because your data is outdated and will be wrong. If a user asks for current prices or market status, tell them to use !price <ticker> or !market to get live data. You can discuss general concepts, strategies, and education but NEVER fabricate current numbers.`;
+
+    // Auto-fetch live market data to give the AI real numbers
+    let liveData = '';
+    if (this.stocks) {
+      try {
+        // Always fetch indices for market context
+        const indices = await this.stocks.getIndices();
+        const status = this.stocks.isMarketOpen();
+        const indexLines = indices.map(q => {
+          const arrow = q.change >= 0 ? '+' : '';
+          return `  ${q.name}: $${q.price.toFixed(2)} (${arrow}${q.change.toFixed(2)} / ${arrow}${q.changePct.toFixed(2)}%)`;
+        }).join('\n');
+
+        liveData = `\n\nLIVE MARKET DATA (real-time, use these numbers):\nMarket status: ${status.label}\n${indexLines}`;
+
+        // Detect ticker symbols in the prompt (1-5 uppercase letters, common patterns)
+        const tickerPattern = /\b([A-Z]{1,5})\b/g;
+        const words = prompt.toUpperCase().match(tickerPattern) || [];
+        // Filter out common English words that look like tickers
+        const skipWords = new Set(['I', 'A', 'AM', 'PM', 'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS', 'ONE', 'OUR', 'OUT', 'HOW', 'HAS', 'DO', 'IT', 'IS', 'AT', 'BE', 'IN', 'ON', 'OR', 'IF', 'SO', 'UP', 'TO', 'OF', 'MY', 'NO', 'GO', 'DID', 'GET', 'HIM', 'HIS', 'SAY', 'SHE', 'TOO', 'USE', 'WAY', 'WHO', 'MAY', 'NEW', 'NOW', 'OLD', 'SEE', 'BIG', 'HIGH', 'LOW', 'WHAT', 'WHEN', 'WILL', 'WITH', 'THAT', 'THIS', 'HAVE', 'FROM', 'THEY', 'BEEN', 'SOME', 'VERY', 'JUST', 'THAN', 'THEM', 'MADE', 'LIKE', 'LONG', 'MUCH', 'GOOD', 'YEAR', 'BACK', 'EACH', 'MAKE', 'OVER', 'SUCH', 'TAKE', 'ABOUT', 'THINK', 'WHICH', 'COULD', 'WOULD', 'STOCK', 'MARKET', 'PRICE', 'BUY', 'SELL', 'PUT', 'CALL', 'ETF', 'IPO', 'CEO', 'GDP', 'FED', 'SEC', 'EPS', 'DOW', 'ATH', 'DIP', 'RUN', 'ANY', 'DAY', 'TOP', 'WHY']);
+        const candidates = [...new Set(words)].filter(w => !skipWords.has(w) && w.length >= 2);
+
+        // Try to fetch quotes for detected tickers (max 5)
+        if (candidates.length > 0) {
+          const quotes = await this.stocks.getQuotes(candidates.slice(0, 5));
+          if (quotes.length > 0) {
+            const tickerLines = quotes.map(q => {
+              const arrow = q.change >= 0 ? '+' : '';
+              return `  ${q.symbol} (${q.name}): $${q.price.toFixed(2)} (${arrow}${q.change.toFixed(2)} / ${arrow}${q.changePct.toFixed(2)}%) - ${q.marketState}`;
+            }).join('\n');
+            liveData += `\n\nSTOCK DATA for tickers mentioned:\n${tickerLines}`;
+          }
+        }
+      } catch (err) {
+        console.error('[AI Engine] Failed to fetch live data for prompt:', err.message);
+      }
+    }
+
+    const systemPrompt = `You are a helpful and knowledgeable Discord bot for a stock trading server. Today's date is ${today}. Keep responses concise (under 300 words). Be conversational and engaging. You can discuss stocks, markets, trading strategies, and financial concepts. Always remind users that nothing you say is financial advice. Do not use emojis. You have access to LIVE market data provided below — use these real numbers when discussing prices and market conditions. Only reference numbers from the live data provided, never make up prices.${liveData}`;
 
     const userContent = context
       ? `Previous conversation:\n${context}\n\nUser: ${prompt}`
