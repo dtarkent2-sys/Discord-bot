@@ -184,9 +184,11 @@ async function handlePrice(interaction) {
     if (s.EPS) lines.push(`**EPS:** $${s.EPS}`);
     if (s.DivYield) lines.push(`**Div Yield:** ${s.DivYield}%`);
     if (s.ROE) lines.push(`**ROE:** ${s.ROE}%`);
+    if (q.changePercent != null) lines.push(`**Daily Change:** ${q.changePercent > 0 ? '+' : ''}${q.changePercent.toFixed(2)}%`);
     if (q.rsi14) lines.push(`**RSI(14):** ${q.rsi14}`);
     if (q.sma50) lines.push(`**SMA(50):** $${q.sma50}`);
     if (q.sma200) lines.push(`**SMA(200):** $${q.sma200}`);
+    if (s['1dReturn']) lines.push(`**1-Day:** ${((s['1dReturn'] - 1) * 100).toFixed(2)}%`);
     if (s['1wkReturn']) lines.push(`**1-Week:** ${((s['1wkReturn'] - 1) * 100).toFixed(2)}%`);
     if (s['1moReturn']) lines.push(`**1-Month:** ${((s['1moReturn'] - 1) * 100).toFixed(2)}%`);
 

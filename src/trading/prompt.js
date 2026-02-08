@@ -4,11 +4,13 @@
  */
 
 function buildTradeAnalysisPrompt(marketContext) {
+  const snapshot = marketContext.snapshot || {};
+
   return `You are a strict, data-only trade analyst. Follow these rules WITHOUT EXCEPTION:
 
 === HARD RULES ===
 1. ONLY use the market data provided below. Do NOT invent, assume, or hallucinate any prices, dates, percentages, or facts.
-2. If ANY required data field is missing or marked null below, you MUST respond with direction "NO_TRADE" and list every missing field in "missingFields".
+2. If BOTH the Quote AND Price History sections are missing, you MUST respond with direction "NO_TRADE" and list "quote" and "price_history" in "missingFields".
 3. Never reference external knowledge about this stock. You know NOTHING except what is in the PROVIDED DATA section.
 4. Every claim in "reasoning" must directly cite a data point from the PROVIDED DATA.
 5. If you are uncertain, choose NO_TRADE. Never guess.
@@ -34,17 +36,18 @@ Fetched at: ${marketContext.fetchedAt}
 
 Quote: ${JSON.stringify(marketContext.quote, null, 2) ?? 'MISSING'}
 
-Candles (1D): ${formatCandles(marketContext.candles_1d)}
-Candles (1H): ${formatCandles(marketContext.candles_1h)}
-Candles (5M): ${formatCandles(marketContext.candles_5m)}
+Fundamentals:
+  P/B: ${snapshot.PB ?? 'N/A'}
+  Div Yield: ${snapshot.DivYield != null ? snapshot.DivYield + '%' : 'N/A'}
+  ROE: ${snapshot.ROE != null ? snapshot.ROE + '%' : 'N/A'}
+  EPS: ${snapshot.EPS != null ? '$' + snapshot.EPS : 'N/A'}
+  1-Week Return: ${snapshot['1wkReturn'] != null ? ((snapshot['1wkReturn'] - 1) * 100).toFixed(2) + '%' : 'N/A'}
+  1-Month Return: ${snapshot['1moReturn'] != null ? ((snapshot['1moReturn'] - 1) * 100).toFixed(2) + '%' : 'N/A'}
 
-Earnings date: ${marketContext.earningsDate ?? 'MISSING'}
-
-News:
-${formatNews(marketContext.news)}
+Price History (daily, last 30 days): ${formatCandles(marketContext.candles_1d)}
 
 === REMINDER ===
-If ANY data above says "MISSING" or "null" or is empty, you MUST return NO_TRADE with that field listed in missingFields. Do NOT fabricate data.`;
+Use the Quote and Price History to form your analysis. Fundamentals marked "N/A" are not available but do NOT prevent a trade signal — base your analysis on whatever data IS present. Do NOT fabricate data.`;
 }
 
 function formatCandles(candles) {
@@ -52,14 +55,6 @@ function formatCandles(candles) {
   // Show last 10 candles to keep prompt size manageable
   const recent = candles.slice(-10);
   return JSON.stringify(recent, null, 2);
-}
-
-function formatNews(news) {
-  if (!news || news.length === 0) return 'MISSING';
-  return news
-    .slice(0, 5)
-    .map((n, i) => `  ${i + 1}. "${n.headline}" — ${n.source} (${n.publishedAt})`)
-    .join('\n');
 }
 
 module.exports = { buildTradeAnalysisPrompt };

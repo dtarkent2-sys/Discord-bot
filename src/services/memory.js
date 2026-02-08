@@ -2,11 +2,38 @@ const Storage = require('./storage');
 
 // Common ticker patterns for topic extraction
 const KNOWN_TICKERS = new Set([
+  // Mega-cap tech
   'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'META', 'TSLA', 'NVDA', 'AMD',
-  'NFLX', 'DIS', 'BA', 'JPM', 'GS', 'V', 'MA', 'PYPL', 'SQ', 'COIN',
-  'SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO', 'XLK', 'XLF', 'XLE', 'XLV',
-  'INTC', 'CRM', 'ORCL', 'ADBE', 'SHOP', 'SNAP', 'UBER', 'LYFT', 'PLTR',
-  'GME', 'AMC', 'SOFI', 'NIO', 'RIVN', 'LCID', 'F', 'GM', 'NOW', 'SNOW',
+  'AVGO', 'ORCL', 'CRM', 'ADBE', 'INTC', 'QCOM', 'TXN', 'MU', 'AMAT',
+  'LRCX', 'KLAC', 'MRVL', 'SNPS', 'CDNS', 'ARM', 'SMCI', 'DELL',
+  // Consumer / streaming / social
+  'NFLX', 'DIS', 'SNAP', 'UBER', 'LYFT', 'ABNB', 'DASH', 'SHOP', 'PINS',
+  'RBLX', 'ROKU', 'SPOT', 'TTD',
+  // Financials
+  'JPM', 'GS', 'MS', 'BAC', 'WFC', 'C', 'SCHW', 'BLK', 'ICE',
+  'V', 'MA', 'PYPL', 'SQ', 'COIN', 'SOFI', 'HOOD', 'MSTR',
+  // Industrials / defense / aero
+  'BA', 'LMT', 'RTX', 'GE', 'CAT', 'DE', 'HON', 'UNP',
+  // Autos / EV
+  'F', 'GM', 'RIVN', 'LCID', 'NIO', 'LI', 'XPEV',
+  // Healthcare / biotech
+  'UNH', 'JNJ', 'LLY', 'NVO', 'ABBV', 'PFE', 'MRK', 'MRNA', 'BNTX',
+  'AMGN', 'GILD', 'BMY', 'ISRG', 'TMO', 'DHR',
+  // Cybersecurity / SaaS
+  'CRWD', 'PANW', 'ZS', 'FTNT', 'NET', 'DDOG', 'MDB', 'SNOW', 'NOW',
+  'PLTR', 'AI', 'PATH', 'HUBS', 'TEAM', 'ZM', 'OKTA', 'S',
+  // AI / data
+  'GOOG', 'IBM', 'ORCL',
+  // Meme / retail favorites
+  'GME', 'AMC', 'BBBY', 'SPCE',
+  // Energy
+  'XOM', 'CVX', 'COP', 'SLB', 'OXY', 'DVN', 'MPC',
+  // ETFs
+  'SPY', 'QQQ', 'IWM', 'DIA', 'VTI', 'VOO', 'ARKK', 'ARKG', 'ARKF',
+  'XLK', 'XLF', 'XLE', 'XLV', 'XLI', 'XLC', 'XLY', 'XLP', 'XLU', 'XLRE', 'XLB',
+  'TLT', 'HYG', 'GLD', 'SLV', 'USO', 'UNG', 'VXX', 'SOXL', 'TQQQ', 'SQQQ',
+  // Crypto-adjacent
+  'MARA', 'RIOT', 'CLSK', 'BITF',
 ]);
 
 // Topic keywords to track conversational themes
