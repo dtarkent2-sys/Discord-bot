@@ -30,11 +30,34 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('analyze')
-    .setDescription('Analyze a stock ticker (data-only, no hallucination)')
+    .setDescription('Analyze a stock ticker with real market data')
     .addStringOption(opt =>
       opt.setName('ticker')
         .setDescription('Stock ticker symbol (e.g. AAPL, TSLA)')
         .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('price')
+    .setDescription('Get current price and key stats for a stock')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock ticker symbol (e.g. AAPL, TSLA)')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('screen')
+    .setDescription('Run a stock screen on a universe')
+    .addStringOption(opt =>
+      opt.setName('universe')
+        .setDescription('Universe (e.g. SP500, nasdaq100, DJIA)')
+        .setRequired(true)
+    )
+    .addStringOption(opt =>
+      opt.setName('rules')
+        .setDescription('Filter rules, comma-separated (e.g. "PE < 15, MktCap > 1e9")')
+        .setRequired(false)
     ),
 ];
 

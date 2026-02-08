@@ -9,6 +9,8 @@ const stats = require('./src/services/stats');
 const { handleCommand } = require('./src/commands/handlers');
 const { registerCommands } = require('./src/commands/register');
 const { startDashboard } = require('./src/dashboard/server');
+const AutonomousBehaviorEngine = require('./src/services/autonomous');
+const { handlePrefixCommand } = require('./src/commands/prefix');
 
 // ── Discord Client Setup ─────────────────────────────────────────────
 const client = new Client({
@@ -29,11 +31,18 @@ client.once(Events.ClientReady, async (c) => {
   console.log(`Logged in as ${c.user.tag}`);
   stats.setGuildCount(c.guilds.cache.size);
 
+  // Test Ollama connection
+  await ai.initialize();
+
   // Register slash commands
   await registerCommands();
 
   // Start web dashboard
   startDashboard();
+
+  // Start autonomous scheduled behaviors
+  const autonomousEngine = new AutonomousBehaviorEngine(client);
+  autonomousEngine.startAllSchedules();
 });
 
 // ── Slash Command Handler ────────────────────────────────────────────
@@ -59,6 +68,12 @@ client.on(Events.MessageCreate, async (message) => {
   // Ignore bots and system messages
   if (message.author.bot) return;
   if (!message.content && message.attachments.size === 0) return;
+
+  // Check for prefix commands (!update, !suggest, !autoedit) first
+  if (message.content.startsWith(config.botPrefix)) {
+    const handled = await handlePrefixCommand(message);
+    if (handled) return;
+  }
 
   // Only respond when mentioned or in DMs
   const isMentioned = message.mentions.has(client.user);
