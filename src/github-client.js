@@ -1,25 +1,43 @@
-const { Octokit } = require('@octokit/rest');
 const config = require('./config');
 
 class GitHubClient {
   constructor() {
-    this.octokit = config.githubToken
-      ? new Octokit({ auth: config.githubToken })
-      : null;
+    this._octokit = null;
+    this._initFailed = false;
 
-    if (!this.octokit) {
+    if (!config.githubToken) {
       console.warn('[GitHub] GITHUB_TOKEN not set — self-edit commands will be disabled.');
+      this._initFailed = true;
+    }
+  }
+
+  // Lazy-load Octokit (ESM-only package)
+  async _getOctokit() {
+    if (this._octokit) return this._octokit;
+    if (this._initFailed) return null;
+
+    try {
+      const { Octokit } = await import('@octokit/rest');
+      this._octokit = new Octokit({ auth: config.githubToken });
+      return this._octokit;
+    } catch (err) {
+      console.error('[GitHub] Failed to load Octokit:', err.message);
+      this._initFailed = true;
+      return null;
     }
   }
 
   get enabled() {
-    return !!this.octokit;
+    return !!config.githubToken && !this._initFailed;
   }
 
   // Get current file content from the repo
   async getFileContent(filePath) {
+    const octokit = await this._getOctokit();
+    if (!octokit) return null;
+
     try {
-      const response = await this.octokit.repos.getContent({
+      const response = await octokit.repos.getContent({
         owner: config.githubOwner,
         repo: config.githubRepo,
         path: filePath,
@@ -37,16 +55,19 @@ class GitHubClient {
 
   // Update a file (creates a commit)
   async updateFile(filePath, newContent, commitMessage) {
+    const octokit = await this._getOctokit();
+    if (!octokit) return { success: false, error: 'GitHub client not available' };
+
     try {
       // Get the file's current SHA (required by GitHub API)
-      const currentFile = await this.octokit.repos.getContent({
+      const currentFile = await octokit.repos.getContent({
         owner: config.githubOwner,
         repo: config.githubRepo,
         path: filePath,
         ref: config.githubBranch,
       });
 
-      const response = await this.octokit.repos.createOrUpdateFileContents({
+      const response = await octokit.repos.createOrUpdateFileContents({
         owner: config.githubOwner,
         repo: config.githubRepo,
         path: filePath,
