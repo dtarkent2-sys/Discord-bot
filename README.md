@@ -11,7 +11,9 @@ An autonomous, goal-driven Discord trading bot powered by [Ollama](https://ollam
 ### Core
 - **AI Chat** — Conversational responses via Ollama with streaming, conversation history, and Sprocket's personality
 - **Trade Analysis** — `/analyze <ticker>` fetches live market data, builds a structured trade plan with entry/stop/targets
-- **Anti-Hallucination Guard** — Two-layer defense: prompt-level HARD RULES + code-level regex detection blocks fabricated prices
+- **Anti-Hallucination Guard** — Three-layer defense: centralized RAG enforcement (date awareness + freshness rules), prompt-level HARD RULES, and code-level regex detection blocks fabricated prices
+- **Real-Time Price Fetcher** — yahoo-finance2 integration (free, no API key) provides cross-reference pricing for all analysis pipelines
+- **Custom Modelfile** — Ollama Modelfile bakes RAG freshness rules into model behavior (`ollama create sprocket -f Modelfile`)
 - **Mood Engine** — Sprocket's mood shifts based on market conditions (7 states from Euphoric to Distressed)
 - **Conversation Memory** — Per-user fact extraction, ticker tracking, topic classification, and sentiment history
 - **Reaction Learning** — Learns from thumbs up/down reactions on its own messages
@@ -74,7 +76,7 @@ All settings are configured through environment variables. See `.env.example`.
 | `DISCORD_TOKEN` | **Required.** Your Discord bot token | — |
 | `DISCORD_CLIENT_ID` | **Required.** Your bot's application/client ID | — |
 | `OLLAMA_HOST` | Ollama API endpoint | `https://ollama.com` |
-| `OLLAMA_MODEL` | Which Ollama model to use | `gemma4b` |
+| `OLLAMA_MODEL` | Which Ollama model to use (`sprocket` for custom Modelfile) | `qwen2.5:14b` |
 | `OLLAMA_API_KEY` | API key for cloud Ollama | — |
 | `KIMI_API_KEY` | Moonshot Kimi K2.5 agent mode API key (enables built-in web search) | — |
 | `KIMI_BASE_URL` | Kimi API base URL | `https://api.moonshot.ai/v1` |
@@ -95,6 +97,8 @@ All settings are configured through environment variables. See `.env.example`.
 | `PORT` | Dashboard/health check port | `3000` |
 | `TRADING_CHANNEL` | Channel name for market updates | `trading-floor` |
 | `GENERAL_CHANNEL` | Channel name for general posts | `general` |
+| `MODEL_CUTOFF` | Approximate training data cutoff for RAG enforcement | `mid-2024` |
+| `LOG_LEVEL` | Logging level: `debug`, `info`, `warn`, `error` | `info` |
 | `SHARK_AUTO_ENABLE` | Auto-enable SHARK autonomous trading agent on startup | `false` |
 
 ---
@@ -360,11 +364,14 @@ Discord-bot/
 ├── nixpacks.toml                   # Nixpacks build config
 ├── Dockerfile                      # Container deployment (Railway/DigitalOcean)
 ├── docker-compose.yml              # Local dev with optional PostgreSQL + Redis
+├── Modelfile                       # Custom Ollama model with baked-in RAG rules
 ├── .env.example                    # Environment variable template
 ├── .gitignore
 ├── data/                           # Persistent JSON storage (git-ignored)
 └── src/
     ├── config.js                   # Environment config loader
+    ├── date-awareness.js           # Centralized RAG enforcement & date injection utilities
+    ├── logger.js                   # Structured logging with level filtering
     ├── personality.js              # Bot identity, speech patterns, quirks
     ├── github-client.js            # GitHub API integration (file read/update/rollback)
     ├── ai-coder.js                 # Anthropic API wrapper for code generation
@@ -374,7 +381,8 @@ Discord-bot/
     │   ├── prefix.js               # Owner prefix commands (!update, !suggest, !autoedit, !rollback, !selfheal)
     │   └── self-heal.js            # Self-healing — AI auto-fix for critical bugs
     ├── tools/
-    │   └── web-search.js           # SearXNG web search with caching + formatting
+    │   ├── web-search.js           # SearXNG web search with caching + formatting
+    │   └── price-fetcher.js        # Real-time price fetcher via yahoo-finance2 (free, no key)
     ├── dashboard/
     │   ├── server.js               # Express dashboard — /health, /api/stats, /api/safety, /api/audit
     │   └── monitor.html            # Real-time monitoring UI

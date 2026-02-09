@@ -17,6 +17,8 @@ const { Ollama } = require('ollama');
 const config = require('../config');
 const yahoo = require('./yahoo');
 const { getMarketContext, formatContextForAI } = require('../data/market');
+const { todayString, ragEnforcementBlock, ragReminder, MODEL_CUTOFF } = require('../date-awareness');
+const priceFetcher = require('../tools/price-fetcher');
 
 class TradingAgents {
   constructor() {
@@ -46,8 +48,21 @@ class TradingAgents {
     if (context.error) {
       throw new Error(`Cannot fetch data for ${upper}: ${context.message}`);
     }
-    const marketData = formatContextForAI(context);
+    let marketData = formatContextForAI(context);
     const snapshot = context.snapshot || {};
+
+    // Enrich with yahoo-finance2 real-time price as cross-reference
+    if (priceFetcher.isAvailable()) {
+      try {
+        const livePrice = await priceFetcher.getCurrentPrice(upper);
+        if (!livePrice.error) {
+          marketData += `\n\nYAHOO FINANCE CROSS-REFERENCE (fetched ${livePrice.lastUpdated}):\n` +
+            priceFetcher.formatForPrompt([livePrice]);
+        }
+      } catch {
+        // Non-critical — continue without cross-reference
+      }
+    }
 
     // ── Stage 1: Four analysts in parallel ──
     progress('analysts', 'Running analyst agents (market, fundamentals, sentiment, news)...');
@@ -193,7 +208,9 @@ ${analystSummary}
 MARKET DATA:
 ${marketData}
 
-Present your bull case in 150-200 words. Cite specific data points. Acknowledge risks but explain why the opportunity outweighs them. Be persuasive and specific.`;
+Present your bull case in 150-200 words. Cite specific data points. Acknowledge risks but explain why the opportunity outweighs them. Be persuasive and specific.
+
+${ragReminder()}`;
 
     const bullCase = await this._llmCall(bullPrompt);
 
@@ -210,7 +227,9 @@ ${marketData}
 The bull argued:
 ${bullCase}
 
-Present your bear case in 150-200 words. Counter the bull's arguments with specific data. Highlight risks, overvaluation concerns, and warning signs. Be persuasive and specific.`;
+Present your bear case in 150-200 words. Counter the bull's arguments with specific data. Highlight risks, overvaluation concerns, and warning signs. Be persuasive and specific.
+
+${ragReminder()}`;
 
     const bearCase = await this._llmCall(bearPrompt);
 
@@ -320,8 +339,9 @@ SUMMARY: [2-3 sentence summary of the rationale]`;
   // ── LLM Call Helper ───────────────────────────────────────────────────
 
   async _llmCall(prompt) {
-    const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-    const systemMsg = `Today is ${today}. Your training data cuts off around mid-2024 — the current date is REAL and may be well beyond that. You are analyzing LIVE market data provided in the prompt. Use ONLY the data given — do not reference outdated prices, events, or conditions from your training data. All prices, metrics, and market conditions in the prompt are current as of today. Never mention "knowledge cutoff" — just use the live data.`;
+    const systemMsg = `${ragEnforcementBlock()}
+
+You are analyzing LIVE market data provided in the user prompt. All prices, metrics, and market conditions in the prompt are current as of today (${todayString()}). Use ONLY the data given. Never mention "knowledge cutoff" — just use the live data.`;
 
     try {
       const stream = await this.ollama.chat({
