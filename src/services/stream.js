@@ -52,13 +52,14 @@ class AlpacaStream {
 
   /**
    * Connect to the Alpaca WebSocket.
-   * Called once when the Discord bot is ready.
+   * Called lazily on first /stream start to avoid wasting the free-tier connection slot.
    */
   connect() {
     if (!this.enabled) {
       console.warn('[Stream] Alpaca keys not set — WebSocket stream disabled.');
       return;
     }
+    if (this.socket) return; // already connected or connecting
 
     this.alpaca = new Alpaca({
       keyId: config.alpacaApiKey,
@@ -88,7 +89,13 @@ class AlpacaStream {
     });
 
     this.socket.onError((err) => {
-      console.error('[Stream] WebSocket error:', err);
+      const msg = typeof err === 'string' ? err : err?.message || String(err);
+      // Only log unexpected errors — connection limit and auth issues are handled by reconnect
+      if (!msg.includes('connection limit') && !msg.includes('auth timeout')) {
+        console.error('[Stream] WebSocket error:', msg);
+      } else {
+        console.warn(`[Stream] WebSocket: ${msg} (will retry)`);
+      }
     });
 
     this.socket.onStateChange((state) => {
@@ -126,8 +133,13 @@ class AlpacaStream {
    * @returns {{ added: string[], already: string[], error?: string }}
    */
   subscribe(channelId, symbols) {
-    if (!this.connected) {
-      return { added: [], already: [], error: 'WebSocket not connected.' };
+    // Lazy-connect: start WebSocket on first subscription
+    if (!this.socket && this.enabled) {
+      this.connect();
+      // Give it a moment to connect — subscriptions will be queued by the SDK
+    }
+    if (!this.socket) {
+      return { added: [], already: [], error: 'WebSocket not available — check Alpaca API keys.' };
     }
 
     const channelSet = this.channelSubs.get(channelId) || new Set();

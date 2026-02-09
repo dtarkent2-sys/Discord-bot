@@ -400,6 +400,178 @@ class MahoragaEngine {
     }
   }
 
+  // ── Manual Trade Trigger ─────────────────────────────────────────
+
+  /**
+   * Manually trigger the full trade pipeline for a specific ticker.
+   * Called via /agent trade key:AAPL [value:force]
+   *
+   * @param {string} symbol - Ticker to evaluate
+   * @param {object} opts
+   * @param {boolean} [opts.force] - Skip AI gate, buy directly (still runs risk checks)
+   * @returns {{ success: boolean, message: string, details?: object }}
+   */
+  async manualTrade(symbol, { force = false } = {}) {
+    symbol = symbol.toUpperCase();
+
+    if (!alpaca.enabled) {
+      return { success: false, message: 'Alpaca API not configured.' };
+    }
+
+    const cfg = policy.getConfig();
+    if (policy.killSwitch) {
+      return { success: false, message: 'Kill switch is active — trading halted.' };
+    }
+
+    // Check denylist
+    if (cfg.symbol_denylist.length > 0 && cfg.symbol_denylist.includes(symbol)) {
+      return { success: false, message: `${symbol} is on the deny list.` };
+    }
+    if (cfg.symbol_allowlist.length > 0 && !cfg.symbol_allowlist.includes(symbol)) {
+      return { success: false, message: `${symbol} is not on the allow list.` };
+    }
+
+    const steps = [];
+
+    // 1. Account info
+    let account;
+    try {
+      account = await alpaca.getAccount();
+    } catch (err) {
+      return { success: false, message: `Account fetch failed: ${err.message}` };
+    }
+    const equity = Number(account.equity || 0);
+    const buyingPower = Number(account.buying_power || 0);
+    steps.push(`Account: $${equity.toFixed(0)} equity, $${buyingPower.toFixed(0)} buying power`);
+
+    // 2. Current positions
+    let positions;
+    try {
+      positions = await alpaca.getPositions();
+    } catch {
+      positions = [];
+    }
+    const alreadyHolding = positions.some(p => p.symbol === symbol);
+    if (alreadyHolding) {
+      steps.push(`Already holding ${symbol}`);
+    }
+
+    // 3. Sentiment (optional — don't block on failure)
+    let sentimentResult = { score: 0, label: 'unknown', bullish: 0, bearish: 0, neutral: 0, messages: 0 };
+    try {
+      sentimentResult = await stocktwits.analyzeSymbol(symbol);
+      steps.push(`Sentiment: ${sentimentResult.label} (${(sentimentResult.score * 100).toFixed(0)}%)`);
+    } catch (err) {
+      steps.push(`Sentiment: unavailable (${err.message})`);
+    }
+
+    // 4. Technical analysis (optional — don't block on failure)
+    let tech = null;
+    let signals = [];
+    let netSignal = 0;
+    try {
+      const techResult = await technicals.analyze(symbol);
+      tech = techResult.technicals;
+      signals = techResult.signals || [];
+      const bullish = signals.filter(s => s.direction === 'bullish').reduce((a, s) => a + s.strength, 0);
+      const bearish = signals.filter(s => s.direction === 'bearish').reduce((a, s) => a + s.strength, 0);
+      netSignal = bullish - bearish;
+      steps.push(`Technicals: price $${tech.price?.toFixed(2)}, RSI ${tech.rsi_14?.toFixed(1) ?? '—'}, net signal ${netSignal.toFixed(2)}`);
+    } catch (err) {
+      steps.push(`Technicals: unavailable (${err.message})`);
+    }
+
+    // 5. AI decision (skip if force)
+    let decision = { action: 'buy', confidence: 1.0, reason: 'Manual force trade' };
+    if (!force) {
+      if (!tech || !tech.price) {
+        return { success: false, message: 'Cannot evaluate — no price data available.', details: { steps } };
+      }
+      try {
+        decision = await this._askAI(symbol, sentimentResult, tech, signals, netSignal);
+        if (!decision) {
+          steps.push('AI: no response');
+          return { success: false, message: `AI returned no decision for ${symbol}.`, details: { steps } };
+        }
+        steps.push(`AI: ${decision.action.toUpperCase()} — confidence ${((decision.confidence || 0) * 100).toFixed(0)}%, reason: ${decision.reason}`);
+        if (decision.action !== 'buy') {
+          return { success: false, message: `AI says **${decision.action.toUpperCase()}** — ${decision.reason}`, details: { steps } };
+        }
+      } catch (err) {
+        steps.push(`AI: error (${err.message})`);
+        return { success: false, message: `AI evaluation failed: ${err.message}`, details: { steps } };
+      }
+    } else {
+      steps.push('AI: SKIPPED (force mode)');
+    }
+
+    // 6. Calculate notional
+    const notional = Math.min(
+      cfg.max_notional_per_trade,
+      buyingPower * cfg.position_size_pct
+    );
+    if (notional < 10) {
+      return { success: false, message: `Insufficient buying power — calculated $${notional.toFixed(0)}.`, details: { steps } };
+    }
+    steps.push(`Order size: $${notional.toFixed(0)}`);
+
+    // 7. Risk check (always runs, even for force)
+    const riskCheck = policy.evaluate({
+      symbol,
+      side: 'buy',
+      notional,
+      currentPositions: positions.length,
+      currentEquity: equity,
+      buyingPower,
+      sentimentScore: sentimentResult.score,
+      confidence: decision.confidence || 0,
+    });
+
+    if (!riskCheck.allowed) {
+      steps.push(`Risk: BLOCKED — ${riskCheck.violations.join('; ')}`);
+      return { success: false, message: `Risk check failed: ${riskCheck.violations.join('; ')}`, details: { steps } };
+    }
+    if (riskCheck.warnings.length > 0) {
+      steps.push(`Risk warnings: ${riskCheck.warnings.join('; ')}`);
+    }
+    steps.push('Risk: PASSED');
+
+    // 8. Execute
+    try {
+      const order = await alpaca.createOrder({
+        symbol,
+        notional: notional.toFixed(2),
+        side: 'buy',
+        type: 'market',
+        time_in_force: 'day',
+      });
+
+      policy.recordTrade(symbol);
+      this._log('trade', `MANUAL BUY ${symbol} — $${notional.toFixed(0)}${force ? ' (force)' : ''} (confidence: ${((decision.confidence || 0) * 100).toFixed(0)}%)`);
+      console.log(`[MAHORAGA] MANUAL BUY ${symbol} — $${notional.toFixed(0)}`);
+      steps.push(`ORDER PLACED: market buy $${notional.toFixed(0)} of ${symbol}`);
+
+      // Alert trading channel too
+      if (this._postToChannel) {
+        await this._postToChannel(
+          `💰 **MAHORAGA Manual Trade: BUY ${symbol}**\n` +
+          `Amount: \`$${notional.toFixed(0)}\`${force ? ' (forced)' : ` | Confidence: \`${((decision.confidence || 0) * 100).toFixed(0)}%\``}\n` +
+          `_${alpaca.isPaper ? 'Paper trade' : 'LIVE trade'} | Triggered manually_`
+        );
+      }
+
+      return {
+        success: true,
+        message: `BUY ${symbol} — $${notional.toFixed(0)} market order placed.`,
+        details: { steps, orderId: order?.id },
+      };
+    } catch (err) {
+      this._log('error', `Manual order failed for ${symbol}: ${err.message}`);
+      steps.push(`ORDER FAILED: ${err.message}`);
+      return { success: false, message: `Order execution failed: ${err.message}`, details: { steps } };
+    }
+  }
+
   // ── Discord Formatting ────────────────────────────────────────────
 
   formatStatusForDiscord(status) {
