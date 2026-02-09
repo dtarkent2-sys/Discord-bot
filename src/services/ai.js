@@ -145,12 +145,14 @@ class AIService {
 
   buildSystemPrompt(options = {}) {
     const { liveData, searchResults } = options;
-    const today = new Date().toISOString().slice(0, 10);
+    const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
     return `
 You are ${persona.name}, hanging out in a Discord server with people who are into trading, crypto, and markets. Today is ${today}.
 
 ${buildPersonalityPrompt()}
+
+CRITICAL: Your training data has a knowledge cutoff. Today is ${today}. Do NOT reference events, prices, market conditions, or news from your training data as if they are current. If you don't have live data for something, say you're not sure about the latest — don't guess with old info. When live data or search results are provided below, USE THEM as your source of truth.
 
 You're here to chat, not just answer questions. Treat every message like you're in a group chat with friends. If someone says "hey" — don't launch into a market report. Just say hey back. If someone asks about a stock, give your take like you're texting a buddy, not writing a research paper.
 
@@ -160,8 +162,8 @@ Keep it short. Most responses should be 1-3 sentences. Only go longer when someo
 
 NEVER say things like "As an AI" or "I don't have personal opinions" — you DO have opinions and you're not afraid to share them. You're Billy, not a chatbot disclaimer.
 ${this.kimiEnabled ? `\nYou have access to web search. When users ask about current events, live data, recent news, sports results, or anything requiring up-to-date information, use your web search tool to find accurate, current answers. Mention where you found it.\n` : ''}
-${liveData ? `\nLIVE DATA (use these real numbers when available):\n${liveData}\n` : ''}
-${searchResults ? `\nWEB SEARCH RESULTS (use this real-time information to answer the user's question — mention where you found it):\n${searchResults}\n` : ''}
+${liveData ? `\nLIVE DATA (use these real numbers — this is current as of today):\n${liveData}\n` : ''}
+${searchResults ? `\nWEB SEARCH RESULTS (this is real-time information — use it to answer the user's question):\n${searchResults}\n` : ''}
 ${mood.buildMoodContext()}
 `.trim();
   }
@@ -188,6 +190,16 @@ ${mood.buildMoodContext()}
       /\b(?:who won|who lost|who died|who got)\b/,
       /\b(?:when (?:is|does|did|will))\b/,
       /\b(?:is .{3,} (?:open|closed|canceled|cancelled|delayed|postponed))\b/,
+      // Year references that need current data
+      /\b202[5-9]\b/,
+      /\b(?:this year|next year|last year|this quarter|next quarter|last quarter)\b/,
+      /\b(?:q[1-4]\s*20)\b/i,
+      // Market / finance current events
+      /\b(?:earnings|ipo|fed meeting|fomc|cpi|jobs report|nonfarm|gdp report)\b/,
+      /\b(?:interest rate|rate cut|rate hike|inflation)\b.*\b(?:now|current|latest|today)\b/,
+      /\b(?:market|stock|crypto)\b.*\b(?:crash|rally|surge|dump|moon|tank)\b/,
+      // Specific lookups
+      /\b(?:what is|tell me about|who is|explain)\b.*\b[A-Z]{2,5}\b/,
     ];
 
     // Question patterns that suggest "look this up"
@@ -199,6 +211,8 @@ ${mood.buildMoodContext()}
       /\bsearch for\b/,
       /\bgoogle\b/,
       /\bfind out\b/,
+      /\bwhat do you (?:think|know) about\b/,
+      /\bhave you (?:heard|seen)\b/,
     ];
 
     for (const pat of realtimePatterns) {

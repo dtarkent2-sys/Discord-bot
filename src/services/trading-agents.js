@@ -159,17 +159,17 @@ Format your final line exactly as: RATING: [BULLISH/BEARISH/NEUTRAL] | CONFIDENC
   }
 
   async _newsAnalyst(ticker, marketData, snapshot) {
-    const prompt = `You are a financial news analyst at a major trading desk. Based on what you know about ${ticker} and the current market data provided, assess the news and macro environment. Consider:
-- Recent major events or trends affecting this company or sector
-- Macro-economic conditions that could impact the stock
-- Sector-specific headwinds or tailwinds
-- Any known catalysts (earnings season, regulatory changes, product launches)
-- Geopolitical factors that might affect this stock
+    const prompt = `You are a financial news analyst at a major trading desk. Using ONLY the live market data provided below, assess the macro environment and potential catalysts for ${ticker}. Consider:
+- What the price action and data suggest about recent sentiment
+- Macro-economic factors visible in the data (beta, volume trends, market cap changes)
+- Sector positioning based on the available metrics
+- Potential upcoming catalysts based on the company's profile
+- Risk factors visible in the data
 
 MARKET DATA:
 ${marketData}
 
-Note: Use your general knowledge about ${ticker} and its industry. Provide a concise news/macro analysis report (150-200 words). End with a clear BULLISH, BEARISH, or NEUTRAL rating with a confidence score 1-10.
+IMPORTANT: Base your analysis ONLY on the data above and general industry knowledge. Do NOT cite specific news articles, events, or dates unless they appear in the data. Provide a concise news/macro analysis report (150-200 words). End with a clear BULLISH, BEARISH, or NEUTRAL rating with a confidence score 1-10.
 
 Format your final line exactly as: RATING: [BULLISH/BEARISH/NEUTRAL] | CONFIDENCE: [1-10]`;
 
@@ -320,10 +320,16 @@ SUMMARY: [2-3 sentence summary of the rationale]`;
   // ── LLM Call Helper ───────────────────────────────────────────────────
 
   async _llmCall(prompt) {
+    const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    const systemMsg = `Today is ${today}. You are analyzing LIVE market data provided in the prompt. Use ONLY the data given — do not reference outdated information from your training data. Never mention "knowledge cutoff" — the market data provided is current.`;
+
     try {
       const stream = await this.ollama.chat({
         model: this.model,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [
+          { role: 'system', content: systemMsg },
+          { role: 'user', content: prompt },
+        ],
         stream: true,
       });
 
