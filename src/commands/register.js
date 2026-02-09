@@ -47,6 +47,22 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName('news')
+    .setDescription('Fetch the latest market news from Alpaca')
+    .addStringOption(opt =>
+      opt.setName('symbols')
+        .setDescription('Comma-separated tickers (e.g. AAPL,TSLA) — optional')
+        .setRequired(false)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('limit')
+        .setDescription('Number of articles (1-10)')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(10)
+    ),
+
+  new SlashCommandBuilder()
     .setName('screen')
     .setDescription('Run a stock screen on a universe')
     .addStringOption(opt =>

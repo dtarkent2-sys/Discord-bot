@@ -159,6 +159,41 @@ class AlpacaService {
     return allSnapshots;
   }
 
+  // ── News ────────────────────────────────────────────────────────────
+
+  /**
+   * Fetch Alpaca News articles.
+   * @param {Object} options
+   * @param {string[]} [options.symbols] - Array of ticker symbols
+   * @param {string} [options.start] - ISO timestamp or date
+   * @param {string} [options.end] - ISO timestamp or date
+   * @param {number} [options.limit] - Max articles (1-50)
+   * @param {boolean} [options.includeContent] - Include full content when available
+   * @param {string} [options.sort] - 'asc' or 'desc'
+   * @returns {Array} news articles
+   */
+  async getNews({
+    symbols = [],
+    start,
+    end,
+    limit = 5,
+    includeContent = false,
+    sort = 'desc',
+  } = {}) {
+    const params = {
+      limit: Math.min(Math.max(limit, 1), 50),
+      sort,
+    };
+    if (symbols.length > 0) params.symbols = symbols.join(',');
+    if (start) params.start = start;
+    if (end) params.end = end;
+    if (includeContent) params.include_content = true;
+
+    const data = await this._fetch('/v1beta1/news', params);
+    if (Array.isArray(data)) return data;
+    return data.news || [];
+  }
+
   _parseOptionSnapshot(symbol, snap) {
     const greeks = snap.greeks || {};
     const quote = snap.latestQuote || {};
