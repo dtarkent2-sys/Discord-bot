@@ -15,10 +15,11 @@
  */
 
 const config = require('../config');
+const Storage = require('./storage');
 
-// Default configuration — tunable via /agent config or runtime
+// Default configuration — tunable via /agent set or runtime
 const DEFAULT_CONFIG = {
-  max_positions: 10,
+  max_positions: 5,
   max_notional_per_trade: 5000,    // $5,000
   max_daily_loss_pct: 0.02,         // 2%
   stop_loss_pct: 0.05,              // 5%
@@ -27,13 +28,37 @@ const DEFAULT_CONFIG = {
   min_sentiment_score: 0.3,         // -1 to +1 scale
   min_analyst_confidence: 0.6,      // 0 to 1 scale
   allow_shorting: false,
+  crypto_enabled: false,             // enable 24/7 crypto trading
+  options_enabled: false,            // enable options trading
+  scan_interval_minutes: 5,          // how often the agent scans for signals
+  position_size_pct: 0.25,           // max % of cash per trade (25%)
   symbol_allowlist: [],              // empty = allow all
-  symbol_denylist: [],
+  symbol_denylist: [],               // ticker blacklist
 };
+
+// Keys that accept numeric values
+const NUMERIC_KEYS = new Set([
+  'max_positions', 'max_notional_per_trade', 'max_daily_loss_pct',
+  'stop_loss_pct', 'take_profit_pct', 'cooldown_minutes',
+  'min_sentiment_score', 'min_analyst_confidence', 'scan_interval_minutes',
+  'position_size_pct',
+]);
+
+// Keys that accept boolean values
+const BOOLEAN_KEYS = new Set([
+  'allow_shorting', 'crypto_enabled', 'options_enabled',
+]);
+
+// Keys that accept comma-separated list values
+const LIST_KEYS = new Set([
+  'symbol_allowlist', 'symbol_denylist',
+]);
 
 class PolicyEngine {
   constructor() {
-    this.config = { ...DEFAULT_CONFIG };
+    this._storage = new Storage('policy-config.json');
+    const saved = this._storage.get('config', {});
+    this.config = { ...DEFAULT_CONFIG, ...saved };
     this.killSwitch = false;
     this.dailyPnL = 0;
     this.dailyStartEquity = 0;
@@ -47,13 +72,83 @@ class PolicyEngine {
     return { ...this.config, killSwitch: this.killSwitch };
   }
 
+  getDefaultConfig() {
+    return { ...DEFAULT_CONFIG };
+  }
+
+  getConfigKeyInfo() {
+    return { NUMERIC_KEYS, BOOLEAN_KEYS, LIST_KEYS };
+  }
+
+  /**
+   * Set a single config key to a new value.
+   * Validates the key exists and coerces the value to the correct type.
+   * @returns {{ success: boolean, key?: string, value?: any, error?: string }}
+   */
+  setConfigKey(key, rawValue) {
+    if (!(key in DEFAULT_CONFIG)) {
+      const validKeys = Object.keys(DEFAULT_CONFIG).join(', ');
+      return { success: false, error: `Unknown key \`${key}\`. Valid keys: ${validKeys}` };
+    }
+
+    let value;
+
+    if (NUMERIC_KEYS.has(key)) {
+      value = Number(rawValue);
+      if (isNaN(value)) {
+        return { success: false, error: `\`${key}\` requires a number. Got: \`${rawValue}\`` };
+      }
+      // Validate ranges
+      if (key.includes('pct') && (value < 0 || value > 1)) {
+        return { success: false, error: `\`${key}\` must be between 0 and 1 (e.g. 0.05 for 5%). Got: \`${value}\`` };
+      }
+      if (key === 'max_positions' && (value < 1 || value > 50)) {
+        return { success: false, error: `\`max_positions\` must be between 1 and 50. Got: \`${value}\`` };
+      }
+      if (key === 'max_notional_per_trade' && value < 10) {
+        return { success: false, error: `\`max_notional_per_trade\` must be at least $10. Got: \`${value}\`` };
+      }
+      if (key === 'cooldown_minutes' && (value < 0 || value > 1440)) {
+        return { success: false, error: `\`cooldown_minutes\` must be 0–1440. Got: \`${value}\`` };
+      }
+      if (key === 'scan_interval_minutes' && (value < 1 || value > 60)) {
+        return { success: false, error: `\`scan_interval_minutes\` must be 1–60. Got: \`${value}\`` };
+      }
+    } else if (BOOLEAN_KEYS.has(key)) {
+      const lower = String(rawValue).toLowerCase();
+      if (['true', '1', 'yes', 'on'].includes(lower)) value = true;
+      else if (['false', '0', 'no', 'off'].includes(lower)) value = false;
+      else return { success: false, error: `\`${key}\` requires true/false. Got: \`${rawValue}\`` };
+    } else if (LIST_KEYS.has(key)) {
+      value = String(rawValue).split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+    } else {
+      value = rawValue;
+    }
+
+    this.config[key] = value;
+    this._persist();
+    console.log(`[Policy] Config set: ${key} = ${JSON.stringify(value)}`);
+    return { success: true, key, value };
+  }
+
   updateConfig(updates) {
     for (const [key, value] of Object.entries(updates)) {
       if (key in this.config) {
         this.config[key] = value;
       }
     }
+    this._persist();
     console.log('[Policy] Config updated:', JSON.stringify(updates));
+  }
+
+  resetConfig() {
+    this.config = { ...DEFAULT_CONFIG };
+    this._persist();
+    console.log('[Policy] Config reset to defaults');
+  }
+
+  _persist() {
+    this._storage.set('config', { ...this.config });
   }
 
   // ── Kill Switch ───────────────────────────────────────────────────
