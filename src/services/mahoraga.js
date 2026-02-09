@@ -20,12 +20,18 @@ const technicals = require('./technicals');
 const policy = require('./policy');
 const ai = require('./ai');
 const config = require('../config');
+const Storage = require('./storage');
 
 class MahoragaEngine {
   constructor() {
-    this._enabled = false;
+    this._storage = new Storage('mahoraga-state.json');
+    this._enabled = this._storage.get('enabled', false);
     this._logs = [];       // recent activity log (ring buffer, max 100)
     this._postToChannel = null; // set by autonomous.js to post Discord alerts
+
+    if (this._enabled) {
+      console.log('[MAHORAGA] Restored enabled state from previous session');
+    }
   }
 
   get enabled() {
@@ -42,18 +48,21 @@ class MahoragaEngine {
   enable() {
     if (!alpaca.enabled) throw new Error('Cannot enable: ALPACA_API_KEY not configured');
     this._enabled = true;
+    this._storage.set('enabled', true);
     this._log('agent', 'MAHORAGA agent ENABLED');
     console.log('[MAHORAGA] Agent enabled');
   }
 
   disable() {
     this._enabled = false;
+    this._storage.set('enabled', false);
     this._log('agent', 'MAHORAGA agent DISABLED');
     console.log('[MAHORAGA] Agent disabled');
   }
 
   async kill() {
     this._enabled = false;
+    this._storage.set('enabled', false);
     policy.activateKillSwitch();
     this._log('kill', 'EMERGENCY KILL SWITCH — closing all positions');
     console.log('[MAHORAGA] KILL SWITCH ACTIVATED');
@@ -107,14 +116,14 @@ class MahoragaEngine {
   _log(type, message) {
     const entry = { type, message, timestamp: new Date().toISOString() };
     this._logs.push(entry);
-    if (this._logs.length > 100) this._logs.shift();
+    if (this._logs.length > 200) this._logs.shift();
     return entry;
   }
 
   // ── Core Trading Loop (called on schedule) ────────────────────────
 
   /**
-   * Main autonomous cycle. Called every 5 min during market hours.
+   * Main autonomous cycle. Called on configurable interval during market hours.
    *
    * 1. Check account + reset daily P/L
    * 2. Monitor existing positions (stop loss / take profit)
@@ -131,11 +140,14 @@ class MahoragaEngine {
       policy.resetDaily(equity);
       policy.updateDailyPnL(equity);
 
-      // Check clock
+      // Check clock — but for paper trading, also allow extended hours
       const clock = await alpaca.getClock();
       if (!clock.is_open) {
-        return; // market closed
+        this._log('cycle', 'Market closed — skipping cycle');
+        return;
       }
+
+      this._log('cycle', `Cycle started — equity: $${equity.toFixed(0)}, buying power: $${Number(account.buying_power || 0).toFixed(0)}`);
 
       // ── 2. Monitor existing positions ──
       await this._checkPositions();
@@ -185,27 +197,37 @@ class MahoragaEngine {
     try {
       // Get trending tickers from StockTwits
       const trending = await stocktwits.getTrending();
-      if (!trending || trending.length === 0) return;
+      if (!trending || trending.length === 0) {
+        this._log('scan', 'No trending tickers from StockTwits — nothing to scan');
+        return;
+      }
 
       // Pick top 5 trending symbols to evaluate
       const candidates = trending.slice(0, 5).map(t => t.symbol);
       const positions = await alpaca.getPositions();
       const positionSymbols = new Set(positions.map(p => p.symbol));
 
+      this._log('scan', `Scanning ${candidates.length} candidates: ${candidates.join(', ')} (${positions.length} positions open)`);
+
       for (const symbol of candidates) {
         // Skip if we already hold this
         if (positionSymbols.has(symbol)) continue;
 
+        // Check denylist/allowlist early
+        const cfg = policy.getConfig();
+        if (cfg.symbol_denylist.length > 0 && cfg.symbol_denylist.includes(symbol)) continue;
+        if (cfg.symbol_allowlist.length > 0 && !cfg.symbol_allowlist.includes(symbol)) continue;
+
         try {
           await this._evaluateSignal(symbol, account, positions.length);
         } catch (err) {
-          // Don't log every failed eval — many will fail (e.g. no data for penny stocks)
           if (!err.message?.includes('Not enough') && !err.message?.includes('No data')) {
-            console.warn(`[MAHORAGA] Eval error for ${symbol}: ${err.message}`);
+            this._log('scan', `${symbol}: eval error — ${err.message}`);
           }
         }
       }
     } catch (err) {
+      this._log('error', `Signal scan error: ${err.message}`);
       console.warn('[MAHORAGA] Signal scan error:', err.message);
     }
   }
@@ -213,22 +235,31 @@ class MahoragaEngine {
   // ── Evaluate a Single Signal ──────────────────────────────────────
 
   async _evaluateSignal(symbol, account, currentPositions) {
+    const cfg = policy.getConfig();
+
     // 1. Get social sentiment
     const sentiment = await stocktwits.analyzeSymbol(symbol);
 
     // Quick filter: skip if sentiment is too weak
-    if (Math.abs(sentiment.score) < policy.getConfig().min_sentiment_score) return;
+    if (Math.abs(sentiment.score) < cfg.min_sentiment_score) {
+      this._log('scan', `${symbol}: skipped — sentiment ${(sentiment.score * 100).toFixed(0)}% below threshold ${(cfg.min_sentiment_score * 100).toFixed(0)}%`);
+      return;
+    }
 
     // 2. Get technical analysis
     let techResult;
     try {
       techResult = await technicals.analyze(symbol);
-    } catch {
-      return; // skip if we can't get technical data
+    } catch (err) {
+      this._log('scan', `${symbol}: skipped — technicals unavailable (${err.message})`);
+      return;
     }
 
     const { technicals: tech, signals } = techResult;
-    if (!tech || !tech.price) return;
+    if (!tech || !tech.price) {
+      this._log('scan', `${symbol}: skipped — no price data from technicals`);
+      return;
+    }
 
     // 3. Score the signals
     const bullishScore = signals
@@ -239,21 +270,37 @@ class MahoragaEngine {
       .reduce((a, s) => a + s.strength, 0);
     const netSignal = bullishScore - bearishScore;
 
-    // Skip if signals are mixed / weak
-    if (netSignal < 0.5) return;
+    // Skip if signals are mixed / weak — but use a lower threshold (0.3 instead of 0.5)
+    if (netSignal < 0.3) {
+      this._log('scan', `${symbol}: skipped — net signal ${netSignal.toFixed(2)} too weak (need 0.3+, bull: ${bullishScore.toFixed(2)}, bear: ${bearishScore.toFixed(2)})`);
+      return;
+    }
+
+    this._log('scan', `${symbol}: passed filters — sentiment ${(sentiment.score * 100).toFixed(0)}%, net signal ${netSignal.toFixed(2)}, price $${tech.price.toFixed(2)}`);
 
     // 4. Ask AI for a decision
     const decision = await this._askAI(symbol, sentiment, tech, signals, netSignal);
-    if (!decision || decision.action !== 'buy') return;
+    if (!decision) {
+      this._log('scan', `${symbol}: skipped — AI returned no decision`);
+      return;
+    }
+    if (decision.action !== 'buy') {
+      this._log('scan', `${symbol}: AI says PASS — confidence ${((decision.confidence || 0) * 100).toFixed(0)}%, reason: ${decision.reason || 'none'}`);
+      return;
+    }
+
+    this._log('scan', `${symbol}: AI says BUY — confidence ${((decision.confidence || 0) * 100).toFixed(0)}%`);
 
     // 5. Pre-trade risk check
-    const cfg = policy.getConfig();
     const notional = Math.min(
       cfg.max_notional_per_trade,
       Number(account.buying_power || 0) * cfg.position_size_pct
     );
 
-    if (notional < 100) return; // don't bother with tiny orders
+    if (notional < 100) {
+      this._log('blocked', `${symbol}: order too small ($${notional.toFixed(0)}) — need at least $100`);
+      return;
+    }
 
     const riskCheck = policy.evaluate({
       symbol,
