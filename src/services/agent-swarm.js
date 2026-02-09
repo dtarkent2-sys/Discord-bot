@@ -16,6 +16,7 @@
 const { Ollama } = require('ollama');
 const config = require('../config');
 const { webSearch, formatResultsForAI } = require('../tools/web-search');
+const marketData = require('./yahoo');
 
 const KIMI_TOOLS = [
   { type: 'builtin_function', function: { name: '$web_search' } },
@@ -43,19 +44,100 @@ class AgentSwarm {
   async research(query, onProgress) {
     const progress = onProgress || (() => {});
 
+    // Step 0: Gather real-time context (FMP market data + web search)
+    progress('Gathering real-time data...');
+    const realTimeContext = await this._gatherRealTimeContext(query);
+
     // Step 1: Decompose query into sub-tasks
     progress('Breaking down your query into research tasks...');
     const subtasks = await this._decompose(query);
     progress(`Spawned **${subtasks.length}** research agents in parallel...`);
 
-    // Step 2: Run all agents in parallel (each with web search)
-    const results = await this._runAgents(subtasks, progress);
+    // Step 2: Run all agents in parallel with real-time context injected
+    const results = await this._runAgents(subtasks, progress, realTimeContext);
     const successful = results.filter(r => !r.failed);
     progress(`${successful.length}/${subtasks.length} agents finished. Synthesizing findings...`);
 
     // Step 3: Synthesize into one coherent response
     const synthesis = await this._synthesize(query, results);
     return { synthesis, agents: results, taskCount: subtasks.length };
+  }
+
+  // ── Step 0: Gather real-time context ──────────────────────────────────
+
+  async _gatherRealTimeContext(query) {
+    const parts = [];
+
+    // Extract potential stock tickers from query and fetch live FMP data
+    const tickers = this._extractTickers(query);
+    if (tickers.length > 0 && marketData.enabled) {
+      const fmpResults = await Promise.all(
+        tickers.slice(0, 5).map(async (ticker) => {
+          try {
+            const snapshot = await marketData.getTickerSnapshot(ticker);
+            return this._formatSnapshot(snapshot);
+          } catch (err) {
+            console.warn(`[AgentSwarm] FMP data for ${ticker} failed:`, err.message);
+            return null;
+          }
+        })
+      );
+      const validData = fmpResults.filter(Boolean);
+      if (validData.length > 0) {
+        parts.push(`LIVE MARKET DATA (real-time from FMP, use these numbers):\n${validData.join('\n\n')}`);
+      }
+    }
+
+    // Web search on the full query for current information
+    if (config.searxngUrl) {
+      try {
+        const searchResult = await webSearch(query, 5);
+        if (!searchResult.error && searchResult.results?.length > 0) {
+          parts.push(`WEB SEARCH RESULTS (current as of today):\n${formatResultsForAI(searchResult)}`);
+        }
+      } catch (err) {
+        console.warn('[AgentSwarm] Initial web search failed:', err.message);
+      }
+    }
+
+    return parts.length > 0 ? parts.join('\n\n---\n\n') : '';
+  }
+
+  _extractTickers(query) {
+    // Match uppercase words 1-5 chars that look like stock tickers
+    const words = query.match(/\b[A-Z]{1,5}\b/g) || [];
+    // Filter out common English words
+    const stopWords = new Set([
+      'THE', 'FOR', 'AND', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS',
+      'ONE', 'OUR', 'OUT', 'ARE', 'HAS', 'HIS', 'HOW', 'ITS', 'MAY', 'NEW',
+      'NOW', 'OLD', 'SEE', 'WAY', 'WHO', 'DID', 'GET', 'HAS', 'HIM', 'LET',
+      'SAY', 'SHE', 'TOO', 'USE', 'TOP', 'BEST', 'MOST', 'WHAT', 'WITH',
+      'THAT', 'THIS', 'WILL', 'YOUR', 'FROM', 'THEY', 'BEEN', 'HAVE', 'MANY',
+      'SOME', 'THEM', 'THAN', 'EACH', 'MAKE', 'LIKE', 'INTO', 'OVER', 'SUCH',
+      'TECH', 'BUY', 'SELL', 'HOLD', 'IPO', 'ETF', 'GDP', 'FED', 'SEC',
+    ]);
+    return [...new Set(words.filter(w => !stopWords.has(w)))];
+  }
+
+  _formatSnapshot(s) {
+    const lines = [`${s.ticker} (${s.name || s.ticker}):`];
+    if (s.price != null) lines.push(`  Price: $${s.price}`);
+    if (s.changePercent != null) lines.push(`  Daily Change: ${s.changePercent > 0 ? '+' : ''}${s.changePercent.toFixed(2)}%`);
+    if (s.volume) lines.push(`  Volume: ${Number(s.volume).toLocaleString()}`);
+    if (s.marketCap) lines.push(`  Market Cap: $${(s.marketCap / 1e9).toFixed(2)}B`);
+    if (s.pe) lines.push(`  P/E: ${s.pe}`);
+    if (s.eps) lines.push(`  EPS: $${s.eps}`);
+    if (s.sma50) lines.push(`  SMA(50): $${s.sma50}`);
+    if (s.sma200) lines.push(`  SMA(200): $${s.sma200}`);
+    if (s.rsi14) lines.push(`  RSI(14): ${s.rsi14}`);
+    if (s.fiftyTwoWeekHigh) lines.push(`  52W High: $${s.fiftyTwoWeekHigh}`);
+    if (s.fiftyTwoWeekLow) lines.push(`  52W Low: $${s.fiftyTwoWeekLow}`);
+    if (s.beta) lines.push(`  Beta: ${s.beta}`);
+    if (s.divYield) lines.push(`  Div Yield: ${s.divYield.toFixed(2)}%`);
+    if (s.roe) lines.push(`  ROE: ${s.roe.toFixed(2)}%`);
+    if (s.profitMargin) lines.push(`  Profit Margin: ${s.profitMargin.toFixed(2)}%`);
+    lines.push(`  Data as of: ${s.timestamp}`);
+    return lines.join('\n');
   }
 
   // ── Step 1: Decompose ────────────────────────────────────────────────
@@ -103,21 +185,31 @@ Make tasks specific and non-overlapping. Each should produce independently usefu
 
   // ── Step 2: Run agents in parallel ───────────────────────────────────
 
-  async _runAgents(subtasks, progress) {
+  async _runAgents(subtasks, progress, realTimeContext = '') {
     const promises = subtasks.map(async (subtask, i) => {
       const label = `[${i + 1}/${subtasks.length}] ${subtask.role}`;
       try {
         progress(`${label}: researching...`);
 
-        const agentPrompt = `You are a ${subtask.role}. Your specific research task:
+        let agentPrompt = `You are a ${subtask.role}. Your specific research task:
 
-${subtask.task}
+${subtask.task}`;
 
-Search the web thoroughly. Provide a detailed, factual report with:
-- Specific data points, numbers, and dates
-- Source attribution (mention where you found key facts)
+        if (realTimeContext) {
+          agentPrompt += `
+
+--- REAL-TIME DATA (current as of today, ${new Date().toLocaleDateString()}) ---
+${realTimeContext}
+--- END REAL-TIME DATA ---
+
+IMPORTANT: Use the real-time data above as your primary source. Do NOT mention "knowledge cutoff" — you have live data.`;
+        }
+
+        agentPrompt += `
+
+Provide a detailed, factual report with:
+- Specific data points, numbers, and dates from the data provided
 - Key takeaways clearly highlighted
-
 Be thorough but structured. Use bullet points for clarity.`;
 
         const result = await this._llmCall(agentPrompt, true);
@@ -238,16 +330,24 @@ Keep it under 1800 characters total (Discord limit). Use markdown formatting.`;
 
     if (withWebSearch && config.searxngUrl) {
       try {
-        // Extract a search query from the prompt (first 100 chars of the task)
-        const queryMatch = prompt.match(/task[:\s]*\n?(.*?)(?:\n|$)/i);
-        const searchQuery = queryMatch
-          ? queryMatch[1].slice(0, 100)
-          : prompt.slice(0, 100);
+        // Extract a good search query from the prompt
+        // Try "task:" line first, then "research task:" block, then first meaningful line
+        let searchQuery = '';
+        const taskMatch = prompt.match(/(?:research )?task[:\s]*\n\s*(.+?)(?:\n|$)/i);
+        if (taskMatch) {
+          searchQuery = taskMatch[1].trim();
+        } else {
+          // Use the first non-boilerplate line after "You are a..."
+          const lines = prompt.split('\n').filter(l => l.trim().length > 10);
+          searchQuery = lines.find(l => !l.startsWith('You are') && !l.startsWith('---') && !l.startsWith('IMPORTANT')) || '';
+        }
+        searchQuery = searchQuery.slice(0, 150).replace(/[*_#]/g, '').trim();
+        if (!searchQuery) searchQuery = prompt.slice(0, 100);
 
         const searchResult = await webSearch(searchQuery, 5);
         if (!searchResult.error && searchResult.results?.length > 0) {
           const formatted = formatResultsForAI(searchResult);
-          enrichedPrompt = `${prompt}\n\nWEB SEARCH RESULTS (use these for your research):\n${formatted}`;
+          enrichedPrompt = `${prompt}\n\nADDITIONAL WEB SEARCH RESULTS:\n${formatted}`;
         }
       } catch (err) {
         console.error('[AgentSwarm] SearXNG search failed:', err.message);
