@@ -19,6 +19,7 @@ const path = require('path');
 const config = require('../config');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 const { registerFont } = require('canvas');
+const alpaca = require('./alpaca');
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
@@ -548,51 +549,134 @@ class GammaService {
     return chartRenderer.renderToBuffer(chartConfig);
   }
 
+  // ── Alpaca GEX (uses pre-calculated greeks — no Black-Scholes needed) ─
+
+  /**
+   * Calculate GEX using Alpaca options snapshots.
+   * Alpaca provides gamma directly, so this is more accurate than our BS estimate.
+   */
+  calculateGEXFromAlpaca(options, spotPrice, expiration) {
+    const gexMap = new Map();
+
+    for (const opt of options) {
+      if (expiration && opt.expiration !== expiration) continue;
+
+      const strike = opt.strike;
+      const oi = opt.openInterest || 0;
+      const gamma = opt.gamma || 0;
+      const type = opt.type;
+
+      if (!strike || oi === 0 || gamma === 0) continue;
+
+      // GEX = OI × gamma × 100 (contract multiplier) × spot
+      const gexValue = oi * gamma * 100 * spotPrice;
+
+      const current = gexMap.get(strike) || 0;
+      if (type === 'call') {
+        gexMap.set(strike, current + gexValue);
+      } else if (type === 'put') {
+        gexMap.set(strike, current - gexValue);
+      }
+    }
+
+    const sorted = [...gexMap.entries()].sort((a, b) => a[0] - b[0]);
+    const lo = spotPrice * 0.85;
+    const hi = spotPrice * 1.15;
+    const filtered = sorted.filter(([k]) => k >= lo && k <= hi);
+
+    const strikes = filtered.map(([k]) => k);
+    const gex = filtered.map(([, v]) => v);
+
+    const totalGEX = gex.reduce((a, b) => a + b, 0);
+    let maxGEX = { strike: 0, value: -Infinity };
+    let minGEX = { strike: 0, value: Infinity };
+    for (let i = 0; i < strikes.length; i++) {
+      if (gex[i] > maxGEX.value) maxGEX = { strike: strikes[i], value: gex[i] };
+      if (gex[i] < minGEX.value) minGEX = { strike: strikes[i], value: gex[i] };
+    }
+
+    return { strikes, gex, totalGEX, maxGEX, minGEX };
+  }
+
+  /**
+   * Pick the best monthly OPEX from Alpaca options data.
+   */
+  _pickAlpacaExpiration(options) {
+    const now = Date.now();
+    const expirations = [...new Set(options.map(o => o.expiration).filter(Boolean))].sort();
+
+    // Find monthly OPEX dates (3rd Friday)
+    const monthlyExps = expirations.filter(exp => {
+      const d = new Date(exp + 'T00:00:00Z');
+      return d.getUTCDay() === 5 && d.getUTCDate() >= 15 && d.getUTCDate() <= 21;
+    });
+
+    const upcoming = monthlyExps.filter(exp => new Date(exp + 'T00:00:00Z') - now > 2 * 86400000);
+    if (upcoming.length > 0) return upcoming[0];
+
+    // Fallback: nearest future expiration
+    const futureExps = expirations.filter(exp => new Date(exp + 'T00:00:00Z') - now > 2 * 86400000);
+    return futureExps[0] || expirations[0];
+  }
+
   // ── Full analysis (single entry point) ───────────────────────────────
 
   /**
-   * Run full GEX analysis for a ticker:
-   *   1. Fetch options chain from Yahoo Finance
-   *   2. Get spot price (from Yahoo quote, FMP fallback)
-   *   3. Calculate GEX per strike
-   *   4. Find gamma flip
-   *   5. Render chart
+   * Run full GEX analysis for a ticker.
+   * Prefers Alpaca (pre-calculated greeks, more reliable) → falls back to Yahoo Finance.
    *
-   * @returns {{ gexData, flip, spotPrice, expiration, chartBuffer, ticker }}
+   * @returns {{ gexData, flip, spotPrice, expiration, chartBuffer, ticker, source }}
    */
   async analyze(ticker) {
     const upper = ticker.toUpperCase();
 
-    // Fetch options chain (includes spot price from Yahoo)
+    // ── Try Alpaca first (pre-calculated greeks, no auth headaches) ──
+    if (alpaca.enabled) {
+      try {
+        console.log(`[Gamma] Trying Alpaca for ${upper}...`);
+
+        const [options, snapshot] = await Promise.all([
+          alpaca.getOptionsSnapshots(upper),
+          alpaca.getSnapshot(upper),
+        ]);
+
+        if (options.length > 0 && snapshot.price) {
+          const spotPrice = snapshot.price;
+          const expiration = this._pickAlpacaExpiration(options);
+
+          const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
+          if (gexData.strikes.length > 0) {
+            const flip = this.findGammaFlip(gexData, spotPrice);
+            const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
+
+            console.log(`[Gamma] ${upper}: Alpaca OK — ${options.length} contracts, exp ${expiration}`);
+            return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Alpaca' };
+          }
+        }
+        console.log(`[Gamma] Alpaca returned insufficient data for ${upper}, falling back to Yahoo`);
+      } catch (err) {
+        console.warn(`[Gamma] Alpaca failed for ${upper}: ${err.message}, falling back to Yahoo`);
+      }
+    }
+
+    // ── Fallback: Yahoo Finance ──
     const { chain, spotPrice: yahooSpot, expiration } = await this.fetchOptionsChain(upper);
 
-    // Use Yahoo spot price, fall back to FMP
     let spotPrice = yahooSpot;
     if (!spotPrice) {
       spotPrice = await this._fmpSpotPrice(upper);
     }
     if (!spotPrice) throw new Error(`Could not determine spot price for ${upper}`);
 
-    // Calculate GEX
     const gexData = this.calculateGEX(chain, spotPrice);
     if (gexData.strikes.length === 0) {
       throw new Error(`Not enough options data at strikes near the current price for ${upper}`);
     }
 
-    // Find gamma flip
     const flip = this.findGammaFlip(gexData, spotPrice);
-
-    // Generate chart
     const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
 
-    return {
-      ticker: upper,
-      spotPrice,
-      expiration,
-      gexData,
-      flip,
-      chartBuffer,
-    };
+    return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Yahoo' };
   }
 
   // ── Discord formatting ───────────────────────────────────────────────
@@ -624,6 +708,7 @@ class GammaService {
       `🔴 **Put Wall (min GEX):** \`$${minGEX.strike}\` (${fmt(minGEX.value)})`,
       ``,
       `_Call wall = magnet/resistance | Put wall = support | Flip = regime boundary_`,
+      `_Data: ${result.source || 'Yahoo'}_`,
     ];
 
     return lines.join('\n');
