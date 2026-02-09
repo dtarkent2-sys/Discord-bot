@@ -25,12 +25,21 @@ const Storage = require('./storage');
 class SharkEngine {
   constructor() {
     this._storage = new Storage('shark-state.json');
-    this._enabled = this._storage.get('enabled', false);
     this._logs = [];       // recent activity log (ring buffer, max 100)
     this._postToChannel = null; // set by autonomous.js to post Discord alerts
 
-    if (this._enabled) {
+    // Resolve enabled state: env var wins over file persistence
+    // (Railway wipes the filesystem on each deploy, so SHARK_AUTO_ENABLE env var
+    //  ensures the agent stays enabled across deploys without manual /agent enable)
+    const savedEnabled = this._storage.get('enabled', false);
+    if (config.sharkAutoEnable) {
+      this._enabled = true;
+      console.log('[SHARK] Auto-enabled via SHARK_AUTO_ENABLE env var');
+    } else if (savedEnabled) {
+      this._enabled = true;
       console.log('[SHARK] Restored enabled state from previous session');
+    } else {
+      this._enabled = false;
     }
   }
 
