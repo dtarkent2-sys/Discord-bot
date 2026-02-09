@@ -171,6 +171,23 @@ const commands = [
     .setDescription('See what tickers are trending on StockTwits right now'),
 
   new SlashCommandBuilder()
+    .setName('validea')
+    .setDescription('Validea guru fundamental analysis — scores from Buffett, Lynch, Graham & more')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock symbol (e.g. AAPL, TSLA, MSFT)')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('macro')
+    .setDescription('Macro environment — market regime, benchmarks, breadth, risk signals'),
+
+  new SlashCommandBuilder()
+    .setName('sectors')
+    .setDescription('Sector rotation heatmap — leading/lagging sectors with multi-timeframe returns'),
+
+  new SlashCommandBuilder()
     .setName('agent')
     .setDescription('Control the SHARK autonomous trading agent')
     .addStringOption(opt =>
