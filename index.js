@@ -65,6 +65,9 @@ client.once(Events.ClientReady, async (c) => {
   const autonomousEngine = new AutonomousBehaviorEngine(client);
   autonomousEngine.startAllSchedules();
 
+  // Store reference on client so prefix commands (!emergency) can access it
+  client._autonomousEngine = autonomousEngine;
+
   // Initialize Alpaca stream (connects lazily on first /stream start)
   stream.init(client);
 });

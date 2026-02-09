@@ -3,6 +3,9 @@ const config = require('../config');
 const stats = require('../services/stats');
 const reactions = require('../services/reactions');
 const ai = require('../services/ai');
+const auditLog = require('../services/audit-log');
+const circuitBreaker = require('../services/circuit-breaker');
+const mood = require('../services/mood');
 
 function startDashboard() {
   const app = express();
@@ -20,6 +23,25 @@ function startDashboard() {
       ...summary,
       model: ai.getModel(),
       reactions: reactionStats,
+    });
+  });
+
+  // Trading safety status — circuit breaker, mood, audit log summary
+  app.get('/api/safety', (req, res) => {
+    res.json({
+      circuitBreaker: circuitBreaker.getStatus(),
+      mood: mood.getSummary(),
+      auditLog: auditLog.getStats(),
+    });
+  });
+
+  // Recent audit log entries (JSON)
+  app.get('/api/audit', (req, res) => {
+    const count = Math.min(parseInt(req.query.count) || 50, 200);
+    const category = req.query.cat || null;
+    res.json({
+      entries: auditLog.getRecent(count, category),
+      stats: auditLog.getStats(),
     });
   });
 
@@ -117,7 +139,30 @@ function startDashboard() {
     </div>
   </div>
 
-  <footer>Auto-refreshes every 30s &bull; <a href="/api/stats" style="color:#7289da">JSON API</a></footer>
+  <h2>Trading Safety</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="label">Mood</div>
+      <div class="value info">${mood.getSummary().mood}</div>
+      <div style="font-size:0.85rem;margin-top:0.25rem">
+        Score: ${mood.getSummary().score} | Rolling PNL: ${(mood.getSummary().rollingAvgPnL || 0).toFixed(2)}%
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Circuit Breaker</div>
+      <div class="value ${circuitBreaker.isPaused() ? 'warn' : 'positive'}">${circuitBreaker.isPaused() ? 'PAUSED' : 'OK'}</div>
+      <div style="font-size:0.85rem;margin-top:0.25rem">
+        Bad trades: ${circuitBreaker.getStatus().consecutiveBadTrades}/3 | Trips: ${circuitBreaker.getStatus().totalTrips}
+      </div>
+    </div>
+    <div class="card">
+      <div class="label">Audit Log</div>
+      <div class="value">${auditLog.getStats().total}</div>
+      <div style="font-size:0.85rem;margin-top:0.25rem">entries today</div>
+    </div>
+  </div>
+
+  <footer>Auto-refreshes every 30s &bull; <a href="/api/stats" style="color:#7289da">Stats API</a> &bull; <a href="/api/safety" style="color:#7289da">Safety API</a> &bull; <a href="/api/audit" style="color:#7289da">Audit Log</a></footer>
   <script>setTimeout(() => location.reload(), 30000);</script>
 </body>
 </html>`);

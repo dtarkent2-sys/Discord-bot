@@ -2,6 +2,10 @@ const config = require('../config');
 const aicoder = require('../ai-coder.js');
 const github = require('../github-client.js');
 
+// Cooldown: prevent selfheal recursion. Max 1 selfheal per file per 30 minutes.
+const SELFHEAL_COOLDOWN_MS = 30 * 60 * 1000;
+const selfhealCooldowns = new Map(); // filePath -> lastRunTimestamp
+
 module.exports = {
     name: 'selfheal',
     description: 'Bot automatically finds and fixes bugs in a file. Usage: !selfheal <file_path>',
@@ -16,6 +20,14 @@ module.exports = {
         }
 
         const filePath = args[0];
+
+        // Recursion guard: enforce cooldown per file
+        const lastRun = selfhealCooldowns.get(filePath) || 0;
+        const elapsed = Date.now() - lastRun;
+        if (elapsed < SELFHEAL_COOLDOWN_MS) {
+            const remaining = Math.ceil((SELFHEAL_COOLDOWN_MS - elapsed) / 60000);
+            return message.reply(`⏳ Selfheal cooldown: \`${filePath}\` was healed recently. Try again in ${remaining} min.`);
+        }
         const thinkingMsg = await message.channel.send(`🔍 **${this.name}** analyzing \`${filePath}\` for critical bugs...`);
 
         // 2. Get current code
@@ -79,6 +91,7 @@ Output the complete fixed file:
         const updateResult = await github.updateFile(filePath, aiResult.newCode, commitMsg);
 
         if (updateResult.success) {
+            selfhealCooldowns.set(filePath, Date.now());
             await thinkingMsg.edit(`✅ **Self-healed \`${filePath}\`!** Fix committed automatically.\n${updateResult.url}\n\n**Bot restart required on Railway.**`);
         } else {
             await thinkingMsg.edit(`❌ Commit failed: ${updateResult.error}`);
