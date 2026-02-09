@@ -265,10 +265,18 @@ class AutonomousBehaviorEngine {
    */
   async _runGEXMonitor() {
     const cooldown = 2 * 60 * 60 * 1000; // 2h cooldown per ticker between alerts
+    let consecutiveFailures = 0;
 
     for (const ticker of this.gexWatchlist) {
+      // Fail-fast: if 3 tickers in a row fail, there's probably a connectivity issue
+      if (consecutiveFailures >= 3) {
+        console.warn(`[Sprocket] GEX monitor: 3 consecutive failures, skipping remaining tickers`);
+        break;
+      }
+
       try {
         const result = await gamma.analyze(ticker);
+        consecutiveFailures = 0; // reset on success
         const { spotPrice, flip } = result;
 
         if (!flip.flipStrike) continue;
@@ -324,6 +332,7 @@ class AutonomousBehaviorEngine {
           this.gexState.set(ticker, { ...prev, flipStrike: flip.flipStrike, regime: flip.regime, spotPrice });
         }
       } catch (err) {
+        consecutiveFailures++;
         // Don't spam logs for tickers without options data
         if (!err.message?.includes('No options data')) {
           console.warn(`[Sprocket] GEX monitor error for ${ticker}:`, err.message);

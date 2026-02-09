@@ -85,7 +85,7 @@ class GammaService {
     const cookieRes = await fetch('https://fc.yahoo.com', {
       headers: { 'User-Agent': YAHOO_UA },
       redirect: 'manual', // don't follow — we just need the set-cookie header
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(15000),
     });
 
     // Extract all Set-Cookie headers
@@ -109,7 +109,7 @@ class GammaService {
         'User-Agent': YAHOO_UA,
         'Cookie': this._yahooCookie,
       },
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(15000),
     });
 
     if (!crumbRes.ok) {
@@ -144,7 +144,7 @@ class GammaService {
         'Accept': 'application/json',
         'Cookie': this._yahooCookie,
       },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(20000),
     });
 
     // If 401, refresh auth and retry once
@@ -177,7 +177,7 @@ class GammaService {
         'Accept': 'application/json',
         'Cookie': this._yahooCookie,
       },
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(20000),
     });
 
     if (!res.ok) {
@@ -619,6 +619,38 @@ class GammaService {
     return futureExps[0] || expirations[0];
   }
 
+  /**
+   * Pre-compute the next monthly OPEX date without fetching any data.
+   * Returns YYYY-MM-DD string for the 3rd Friday of the current or next month.
+   */
+  _computeNextMonthlyOPEX() {
+    const now = new Date();
+
+    // Check current month and next 2 months
+    for (let offset = 0; offset <= 2; offset++) {
+      const year = now.getFullYear();
+      const month = now.getMonth() + offset;
+      const d = new Date(year, month, 1);
+
+      // Find 3rd Friday: first Friday + 14 days
+      const firstDay = d.getDay(); // 0=Sun
+      const firstFriday = firstDay <= 5 ? (5 - firstDay + 1) : (5 + 7 - firstDay + 1);
+      const thirdFriday = firstFriday + 14;
+
+      const opex = new Date(d.getFullYear(), d.getMonth(), thirdFriday);
+
+      // Must be at least 2 days out
+      if (opex.getTime() - now.getTime() > 2 * 86400000) {
+        const yyyy = opex.getFullYear();
+        const mm = String(opex.getMonth() + 1).padStart(2, '0');
+        const dd = String(opex.getDate()).padStart(2, '0');
+        return `${yyyy}-${mm}-${dd}`;
+      }
+    }
+
+    return null; // shouldn't happen
+  }
+
   // ── Full analysis (single entry point) ───────────────────────────────
 
   /**
@@ -635,14 +667,20 @@ class GammaService {
       try {
         console.log(`[Gamma] Trying Alpaca for ${upper}...`);
 
+        // Pre-compute the monthly OPEX so we only fetch one expiration's options
+        // (SPY/QQQ have daily expirations — fetching all = 10k+ contracts = timeout)
+        const targetExp = this._computeNextMonthlyOPEX();
+        console.log(`[Gamma] Target OPEX: ${targetExp}`);
+
         const [options, snapshot] = await Promise.all([
-          alpaca.getOptionsSnapshots(upper),
+          alpaca.getOptionsSnapshots(upper, targetExp),
           alpaca.getSnapshot(upper),
         ]);
 
         if (options.length > 0 && snapshot.price) {
           const spotPrice = snapshot.price;
-          const expiration = this._pickAlpacaExpiration(options);
+          // Use the actual expiration from returned data (may differ slightly)
+          const expiration = this._pickAlpacaExpiration(options) || targetExp;
 
           const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
           if (gexData.strikes.length > 0) {
