@@ -47,6 +47,8 @@ async function handleCommand(interaction) {
       return handleResearch(interaction);
     case 'gex':
       return handleGEX(interaction);
+    case 'news':
+      return handleNews(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   }
@@ -256,6 +258,7 @@ async function handleHelp(interaction) {
     '`/deepanalysis <ticker>` — Multi-agent deep analysis — BUY/SELL/HOLD signal (stocks & crypto)',
     '`/research <query>` — Agent Swarm — parallel AI agents research any complex topic',
     '`/price <ticker>` — Quick price + key stats lookup (stocks & crypto)',
+    '`/news [symbols] [limit]` — Latest market news (Alpaca)',
     '`/screen <universe> [rules]` — Run a stock screen',
     '`/watchlist [action] [ticker]` — Manage your stock/crypto watchlist',
     '`/sentiment <text>` — Analyze text sentiment',
@@ -279,6 +282,56 @@ async function handleHelp(interaction) {
   ];
 
   await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+}
+
+// ── /news — Alpaca news ──────────────────────────────────────────────
+async function handleNews(interaction) {
+  await interaction.deferReply();
+
+  if (!alpaca.enabled) {
+    await interaction.editReply('Alpaca news requires `ALPACA_API_KEY` and `ALPACA_API_SECRET` in your .env.');
+    return;
+  }
+
+  const symbolsInput = interaction.options.getString('symbols');
+  const limit = interaction.options.getInteger('limit') ?? 5;
+
+  const symbols = symbolsInput
+    ? symbolsInput.split(',').map(s => s.trim().toUpperCase()).filter(Boolean)
+    : [];
+
+  try {
+    const news = await alpaca.getNews({ symbols, limit });
+
+    if (!news || news.length === 0) {
+      await interaction.editReply('No news articles found. Try a different symbol or check back later.');
+      return;
+    }
+
+    const headerSymbols = symbols.length > 0 ? ` for ${symbols.join(', ')}` : '';
+    const lines = [`**Market News${headerSymbols}**`];
+
+    for (const item of news) {
+      const headline = item.headline || item.title || 'Untitled';
+      const source = item.source || 'Alpaca News';
+      const createdAt = item.created_at || item.createdAt || item.time;
+      const dateLabel = createdAt ? new Date(createdAt).toLocaleString() : 'Unknown time';
+      const summary = item.summary || item.description || '';
+      const shortSummary = summary.length > 220 ? `${summary.slice(0, 220)}...` : summary;
+      const articleSymbols = Array.isArray(item.symbols) ? item.symbols.join(', ') : '';
+
+      lines.push(`\n**${headline}**`);
+      lines.push(`${source} — ${dateLabel}${articleSymbols ? ` — ${articleSymbols}` : ''}`);
+      if (item.url) lines.push(`<${item.url}>`);
+      if (shortSummary) lines.push(shortSummary);
+    }
+
+    lines.push(`\n_Data via Alpaca | ${new Date().toLocaleString()}_`);
+    await interaction.editReply(lines.join('\n'));
+  } catch (err) {
+    console.error('[News] Error:', err);
+    await interaction.editReply(`News lookup failed: ${err.message}`);
+  }
 }
 
 // ── /sentiment — Analyze text sentiment ─────────────────────────────

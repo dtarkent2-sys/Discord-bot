@@ -100,6 +100,7 @@ All settings are configured through environment variables. See `.env.example`.
 | `/analyze <ticker>` | AI-powered stock analysis with live Yahoo Finance market data |
 | `/deepanalysis <ticker>` | Multi-agent deep analysis — 4 analysts, debate, trader, risk → BUY/SELL/HOLD |
 | `/price <ticker>` | Quick price + key stats lookup (P/E, RSI, moving averages, etc.) |
+| `/news [symbols] [limit]` | Latest market news from Alpaca (optionally filtered by symbols) |
 | `/screen <universe> [rules]` | Run a stock screen (e.g. `/screen SP500 PE < 15, MktCap > 1e9`) |
 | `/watchlist [action] [ticker]` | Manage your personal stock watchlist (show/add/remove) |
 | `/sentiment <text>` | Analyze text sentiment — score, positive/negative words |
