@@ -26,39 +26,141 @@ const RISK_FREE_RATE = 0.045; // approximate 10Y yield
 const chartRenderer = new ChartJSNodeCanvas({ width: 700, height: 420, backgroundColour: '#1e1e2e' });
 
 // Yahoo expects browser-like headers
-const YAHOO_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'application/json',
-};
+const YAHOO_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 class GammaService {
+  constructor() {
+    // Yahoo Finance crumb/cookie auth state (cached across calls)
+    this._yahooCookie = null;
+    this._yahooCrumb = null;
+    this._yahooAuthExpiry = 0; // ms timestamp — refresh after 30 min
+  }
+
   get enabled() {
     // Works with or without FMP — Yahoo Finance provides options data for free
     return true;
   }
 
+  // ── Yahoo Finance auth (crumb + cookie) ──────────────────────────────
+
+  /**
+   * Yahoo Finance requires a session cookie + crumb token for API calls.
+   * Flow:
+   *   1. GET https://fc.yahoo.com → extracts "set-cookie" header
+   *   2. GET https://query2.finance.yahoo.com/v1/test/getcrumb (with cookie) → returns crumb string
+   *   3. Pass both cookie + crumb on all subsequent /v7/ API calls
+   *
+   * Cached for 30 minutes; auto-refreshes on 401.
+   */
+  async _ensureYahooAuth(forceRefresh = false) {
+    if (!forceRefresh && this._yahooCrumb && Date.now() < this._yahooAuthExpiry) {
+      return; // still valid
+    }
+
+    console.log('[Gamma] Refreshing Yahoo Finance auth (cookie + crumb)...');
+
+    // Step 1: get session cookie
+    const cookieRes = await fetch('https://fc.yahoo.com', {
+      headers: { 'User-Agent': YAHOO_UA },
+      redirect: 'manual', // don't follow — we just need the set-cookie header
+      signal: AbortSignal.timeout(10000),
+    });
+
+    // Extract all Set-Cookie headers
+    const rawCookies = cookieRes.headers.getSetCookie?.() || [];
+    if (rawCookies.length === 0) {
+      // Fallback: try raw header
+      const single = cookieRes.headers.get('set-cookie');
+      if (single) rawCookies.push(single);
+    }
+
+    // Build cookie string (just the key=value parts)
+    const cookieParts = rawCookies.map(c => c.split(';')[0]).filter(Boolean);
+    if (cookieParts.length === 0) {
+      throw new Error('Yahoo Finance auth failed: no cookies returned from fc.yahoo.com');
+    }
+    this._yahooCookie = cookieParts.join('; ');
+
+    // Step 2: get crumb using the cookie
+    const crumbRes = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb', {
+      headers: {
+        'User-Agent': YAHOO_UA,
+        'Cookie': this._yahooCookie,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!crumbRes.ok) {
+      const text = await crumbRes.text().catch(() => '');
+      throw new Error(`Yahoo crumb fetch failed (${crumbRes.status}): ${text.slice(0, 200)}`);
+    }
+
+    this._yahooCrumb = (await crumbRes.text()).trim();
+    if (!this._yahooCrumb || this._yahooCrumb.includes('Too Many Requests')) {
+      throw new Error('Yahoo Finance auth failed: bad crumb value');
+    }
+
+    this._yahooAuthExpiry = Date.now() + 30 * 60 * 1000; // 30 min TTL
+    console.log(`[Gamma] Yahoo auth OK (crumb: ${this._yahooCrumb.slice(0, 8)}...)`);
+  }
+
   // ── Yahoo Finance options chain ──────────────────────────────────────
 
   /**
-   * Fetch options chain from Yahoo Finance.
-   * Returns { calls: [...], puts: [...], spotPrice, expirations: [epoch, ...] }
-   *
-   * @param {string} ticker - stock symbol
-   * @param {number} [expirationEpoch] - specific expiration as unix timestamp (seconds)
+   * Fetch options chain from Yahoo Finance (with crumb auth).
    */
   async _yahooFetch(ticker, expirationEpoch) {
-    let url = `${YAHOO_OPTIONS_BASE}/${encodeURIComponent(ticker)}`;
-    if (expirationEpoch) url += `?date=${expirationEpoch}`;
+    await this._ensureYahooAuth();
+
+    let url = `${YAHOO_OPTIONS_BASE}/${encodeURIComponent(ticker)}?crumb=${encodeURIComponent(this._yahooCrumb)}`;
+    if (expirationEpoch) url += `&date=${expirationEpoch}`;
 
     console.log(`[Gamma] Yahoo options: ${ticker}${expirationEpoch ? ` exp=${expirationEpoch}` : ''}`);
     const res = await fetch(url, {
-      headers: YAHOO_HEADERS,
+      headers: {
+        'User-Agent': YAHOO_UA,
+        'Accept': 'application/json',
+        'Cookie': this._yahooCookie,
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+
+    // If 401, refresh auth and retry once
+    if (res.status === 401) {
+      console.log('[Gamma] Got 401, refreshing Yahoo auth and retrying...');
+      await this._ensureYahooAuth(true);
+      return this._yahooFetchInner(ticker, expirationEpoch);
+    }
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Yahoo Finance ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    const data = await res.json();
+    const result = data?.optionChain?.result?.[0];
+    if (!result) throw new Error(`No options data found for ${ticker}`);
+
+    return result;
+  }
+
+  /** Inner fetch (used for retry after auth refresh — avoids infinite loop) */
+  async _yahooFetchInner(ticker, expirationEpoch) {
+    let url = `${YAHOO_OPTIONS_BASE}/${encodeURIComponent(ticker)}?crumb=${encodeURIComponent(this._yahooCrumb)}`;
+    if (expirationEpoch) url += `&date=${expirationEpoch}`;
+
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': YAHOO_UA,
+        'Accept': 'application/json',
+        'Cookie': this._yahooCookie,
+      },
       signal: AbortSignal.timeout(15000),
     });
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`Yahoo Finance ${res.status}: ${text.slice(0, 200)}`);
+      throw new Error(`Yahoo Finance ${res.status} (after auth refresh): ${text.slice(0, 200)}`);
     }
 
     const data = await res.json();
