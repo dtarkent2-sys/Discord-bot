@@ -19,6 +19,7 @@ const commentary = require('./commentary');
 const stats = require('./stats');
 const gamma = require('./gamma');
 const mahoraga = require('./mahoraga');
+const policy = require('./policy');
 const config = require('../config');
 
 class AutonomousBehaviorEngine {
@@ -153,17 +154,24 @@ class AutonomousBehaviorEngine {
       console.log(`[Sprocket] GEX monitor active — watching: ${this.gexWatchlist.join(', ')}`);
     }
 
-    // 6. MAHORAGA AUTONOMOUS TRADING (every 5 min during market hours, Mon-Fri)
+    // 6. MAHORAGA AUTONOMOUS TRADING (configurable interval during market hours)
     // Signal ingestion → technical analysis → AI decision → trade execution
     mahoraga.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
-    this.jobs.push(
-      schedule.scheduleJob({ rule: '*/5 9-16 * * 1-5', tz: 'America/New_York' }, async () => {
-        if (!mahoraga.enabled) return; // only runs when enabled via /agent enable
-        console.log('[MAHORAGA] Running autonomous trading cycle...');
-        await mahoraga.runCycle();
-      })
-    );
-    console.log(`[Sprocket] MAHORAGA trading schedule active (runs when enabled via /agent enable)`);
+    const scanMinutes = policy.getConfig().scan_interval_minutes || 5;
+    this._mahoragaInterval = setInterval(async () => {
+      if (!mahoraga.enabled) return;
+      // Only trade during market hours (Mon-Fri, roughly 9:30-16:00 ET)
+      const now = new Date();
+      const etOptions = { timeZone: 'America/New_York', hour: 'numeric', minute: 'numeric', hour12: false };
+      const etParts = new Intl.DateTimeFormat('en-US', etOptions).formatToParts(now);
+      const etHour = parseInt(etParts.find(p => p.type === 'hour').value, 10);
+      const day = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' })).getDay();
+      if (day === 0 || day === 6) return; // weekend
+      if (etHour < 9 || etHour >= 16) return; // outside market hours
+      console.log('[MAHORAGA] Running autonomous trading cycle...');
+      await mahoraga.runCycle();
+    }, scanMinutes * 60 * 1000);
+    console.log(`[Sprocket] MAHORAGA trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
 
     console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
   }
@@ -173,6 +181,10 @@ class AutonomousBehaviorEngine {
       if (job) job.cancel();
     }
     this.jobs = [];
+    if (this._mahoragaInterval) {
+      clearInterval(this._mahoragaInterval);
+      this._mahoragaInterval = null;
+    }
     console.log('[Sprocket] All scheduled behaviors stopped.');
   }
 
