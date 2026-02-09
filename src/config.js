@@ -32,6 +32,7 @@ module.exports = {
   kimiApiKey: process.env.KIMI_API_KEY || '',
   kimiBaseUrl: process.env.KIMI_BASE_URL || 'https://api.moonshot.ai/v1',
   kimiModel: process.env.KIMI_MODEL || 'kimi-k2.5-preview',
+  fmpApiKey: process.env.FMP_API_KEY || '',
   searxngUrl: process.env.SEARXNG_URL || '',
   botOwnerId: process.env.BOT_OWNER_ID || '',
   botPrefix: process.env.BOT_PREFIX || '!',

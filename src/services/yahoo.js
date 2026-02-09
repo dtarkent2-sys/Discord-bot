@@ -1,110 +1,104 @@
 /**
- * Yahoo Finance client using yahoo-finance2 v3 (Node.js).
- * No API key required — uses Yahoo's public APIs.
+ * Market data client using Financial Modeling Prep (FMP) API.
+ * Requires an API key — set FMP_API_KEY in your .env file.
+ * Get your free key at https://financialmodelingprep.com/developer
  * Supports stocks AND crypto (BTC, ETH, SOL, etc.)
- *
- * Has a direct HTTP fallback for when the yahoo-finance2 library
- * fails (cookie/crumb issues in certain deployment environments).
  */
 
-// Common crypto symbols → Yahoo Finance format
+const config = require('../config');
+
+const FMP_BASE = 'https://financialmodelingprep.com/api/v3';
+
+// Common crypto symbols → FMP format (BTCUSD, not BTC-USD)
 const CRYPTO_MAP = {
-  BTC: 'BTC-USD', ETH: 'ETH-USD', SOL: 'SOL-USD', XRP: 'XRP-USD',
-  DOGE: 'DOGE-USD', ADA: 'ADA-USD', AVAX: 'AVAX-USD', DOT: 'DOT-USD',
-  LINK: 'LINK-USD', MATIC: 'MATIC-USD', SHIB: 'SHIB-USD', LTC: 'LTC-USD',
-  BNB: 'BNB-USD', ATOM: 'ATOM-USD', UNI: 'UNI-USD', FIL: 'FIL-USD',
-  APT: 'APT-USD', ARB: 'ARB-USD', OP: 'OP-USD', NEAR: 'NEAR-USD',
-  SUI: 'SUI-USD', SEI: 'SEI-USD', TIA: 'TIA-USD', INJ: 'INJ-USD',
-  PEPE: 'PEPE-USD', WIF: 'WIF-USD', BONK: 'BONK-USD', FLOKI: 'FLOKI-USD',
-  RENDER: 'RENDER-USD', FET: 'FET-USD', TAO: 'TAO-USD', HBAR: 'HBAR-USD',
-  ALGO: 'ALGO-USD', XLM: 'XLM-USD', VET: 'VET-USD', ICP: 'ICP-USD',
-  AAVE: 'AAVE-USD', MKR: 'MKR-USD', CRV: 'CRV-USD', SAND: 'SAND-USD',
-  MANA: 'MANA-USD', AXS: 'AXS-USD', GALA: 'GALA-USD', IMX: 'IMX-USD',
+  BTC: 'BTCUSD', ETH: 'ETHUSD', SOL: 'SOLUSD', XRP: 'XRPUSD',
+  DOGE: 'DOGEUSD', ADA: 'ADAUSD', AVAX: 'AVAXUSD', DOT: 'DOTUSD',
+  LINK: 'LINKUSD', MATIC: 'MATICUSD', SHIB: 'SHIBUSD', LTC: 'LTCUSD',
+  BNB: 'BNBUSD', ATOM: 'ATOMUSD', UNI: 'UNIUSD', FIL: 'FILUSD',
+  APT: 'APTUSD', ARB: 'ARBUSD', OP: 'OPUSD', NEAR: 'NEARUSD',
+  SUI: 'SUIUSD', SEI: 'SEIUSD', TIA: 'TIAUSD', INJ: 'INJUSD',
+  PEPE: 'PEPEUSD', WIF: 'WIFUSD', BONK: 'BONKUSD', FLOKI: 'FLOKIUSD',
+  RENDER: 'RENDERUSD', FET: 'FETUSD', TAO: 'TAOUSD', HBAR: 'HBARUSD',
+  ALGO: 'ALGOUSD', XLM: 'XLMUSD', VET: 'VETUSD', ICP: 'ICPUSD',
+  AAVE: 'AAVEUSD', MKR: 'MKRUSD', CRV: 'CRVUSD', SAND: 'SANDUSD',
+  MANA: 'MANAUSD', AXS: 'AXSUSD', GALA: 'GALAUSD', IMX: 'IMXUSD',
 };
 
-class YahooFinanceClient {
-  constructor() {
-    this._yf = null;
-    this._initFailed = false;
-    // Cookie/crumb cache for direct HTTP fallback
-    this._cookie = null;
-    this._crumb = null;
-    this._crumbExpiry = 0; // timestamp when crumb expires
-  }
-
-  // yahoo-finance2 v3: import class and instantiate
-  async _getYF() {
-    if (this._yf) return this._yf;
-    if (this._initFailed) return null;
-
-    try {
-      const YahooFinance = (await import('yahoo-finance2')).default;
-      this._yf = new YahooFinance({ suppressNotices: ['yahooSurvey', 'ripHistorical'] });
-      console.log('[Yahoo] yahoo-finance2 v3 loaded successfully.');
-      return this._yf;
-    } catch (err) {
-      console.error('[Yahoo] Failed to load yahoo-finance2:', err.message);
-      this._initFailed = true;
-      return null;
-    }
-  }
+class MarketDataClient {
+  constructor() {}
 
   get enabled() {
-    return !this._initFailed;
+    return !!config.fmpApiKey;
   }
 
   /**
-   * Resolve a user-provided ticker to a Yahoo Finance symbol.
-   * Handles crypto shorthand: BTC → BTC-USD, ETH → ETH-USD, etc.
-   * Already-suffixed tickers (BTC-USD) pass through unchanged.
-   * Regular stock tickers (AAPL, TSLA) pass through unchanged.
+   * Resolve a user-provided ticker to an FMP-compatible symbol.
+   * Handles crypto shorthand: BTC → BTCUSD, ETH → ETHUSD, etc.
    */
   resolveTicker(ticker) {
     const upper = ticker.toUpperCase().trim();
-    // Already has -USD suffix (user typed BTC-USD)
-    if (upper.endsWith('-USD')) return upper;
+    // Already in FMP crypto format (BTCUSD)
+    if (upper.endsWith('USD') && CRYPTO_MAP[upper.replace('USD', '')]) return upper;
+    // Yahoo-style crypto (BTC-USD) → FMP format
+    if (upper.endsWith('-USD')) {
+      const base = upper.replace('-USD', '');
+      if (CRYPTO_MAP[base]) return CRYPTO_MAP[base];
+    }
     // Known crypto symbol
     if (CRYPTO_MAP[upper]) return CRYPTO_MAP[upper];
     // Regular stock ticker
     return upper;
   }
 
-  /**
-   * Check if a resolved ticker is a cryptocurrency.
-   */
   isCrypto(ticker) {
-    return ticker.toUpperCase().endsWith('-USD') && CRYPTO_MAP[ticker.replace('-USD', '')];
+    const upper = ticker.toUpperCase();
+    if (upper.endsWith('USD')) return !!CRYPTO_MAP[upper.replace('USD', '')];
+    if (upper.endsWith('-USD')) return !!CRYPTO_MAP[upper.replace('-USD', '')];
+    return !!CRYPTO_MAP[upper];
   }
 
-  // ── Retry helper — retries on transient network failures ────────────
-  async _retry(fn, label, maxRetries = 3) {
+  // ── FMP API fetch helper ──────────────────────────────────────────────
+
+  async _fmpFetch(endpoint, params = {}) {
+    if (!config.fmpApiKey) throw new Error('FMP API key not configured — set FMP_API_KEY in .env');
+
+    const url = new URL(`${FMP_BASE}${endpoint}`);
+    url.searchParams.set('apikey', config.fmpApiKey);
+    for (const [k, v] of Object.entries(params)) {
+      url.searchParams.set(k, String(v));
+    }
+
+    console.log(`[FMP] Fetching: ${endpoint}`);
+    const res = await fetch(url.toString(), {
+      headers: { 'Accept': 'application/json' },
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`FMP API ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    return res.json();
+  }
+
+  // ── Retry helper ──────────────────────────────────────────────────────
+
+  async _retry(fn, label, maxRetries = 2) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         return await fn();
       } catch (err) {
         const msg = err.message || '';
         const isTransient = msg.includes('fetch failed') ||
-          msg.includes('ECONNREFUSED') ||
-          msg.includes('ECONNRESET') ||
-          msg.includes('ETIMEDOUT') ||
-          msg.includes('socket hang up') ||
-          msg.includes('network') ||
-          msg.includes('Timeout') ||
-          msg.includes('HTTP 429') ||
-          msg.includes('HTTP 5');
+          msg.includes('ECONNREFUSED') || msg.includes('ECONNRESET') ||
+          msg.includes('ETIMEDOUT') || msg.includes('Timeout') ||
+          msg.includes('429') || /HTTP 5\d\d/.test(msg);
 
         if (isTransient && attempt < maxRetries) {
-          const delay = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
-          console.warn(`[Yahoo] ${label} attempt ${attempt + 1}/${maxRetries} failed (${msg}), retrying in ${delay}ms...`);
+          const delay = Math.pow(2, attempt + 1) * 1000;
+          console.warn(`[FMP] ${label} attempt ${attempt + 1}/${maxRetries} failed (${msg}), retrying in ${delay}ms...`);
           await new Promise(r => setTimeout(r, delay));
-
-          // Reset the client on repeated failures (stale session/cookies)
-          if (attempt >= 1) {
-            console.warn(`[Yahoo] Resetting client after ${attempt + 1} failures...`);
-            this._yf = null;
-            this._initFailed = false;
-            this._invalidateCrumb(); // Also reset direct-fetch auth
-          }
           continue;
         }
         throw err;
@@ -112,388 +106,183 @@ class YahooFinanceClient {
     }
   }
 
-  // ── Direct HTTP fallback — bypasses yahoo-finance2 library entirely ──
+  // ── Quote — current price + key stats ─────────────────────────────────
 
-  /**
-   * Acquire a Yahoo session cookie + crumb token for authenticated API access.
-   * Yahoo requires these for ALL v8/v10 API endpoints.
-   * Flow: GET fc.yahoo.com (cookie) → GET v1/test/getcrumb (crumb)
-   */
-  async _acquireCrumb() {
-    // Return cached values if still fresh (cache for 30 minutes)
-    if (this._cookie && this._crumb && Date.now() < this._crumbExpiry) {
-      return { cookie: this._cookie, crumb: this._crumb };
-    }
-
-    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
-    // Step 1: Hit fc.yahoo.com to get a session cookie
-    console.log('[Yahoo] Acquiring session cookie...');
-    const cookieRes = await fetch('https://fc.yahoo.com/', {
-      headers: { 'User-Agent': UA },
-      redirect: 'manual', // Don't follow redirects — we just need the Set-Cookie
-      signal: AbortSignal.timeout(10000),
-    });
-
-    // Extract cookies from response headers (works even on 404/3xx)
-    const setCookies = cookieRes.headers.getSetCookie?.() || [];
-    let cookieJar = '';
-    if (setCookies.length > 0) {
-      // Collect all cookie name=value pairs
-      cookieJar = setCookies
-        .map(sc => sc.split(';')[0]) // Take just the name=value part
-        .join('; ');
-    }
-
-    if (!cookieJar) {
-      // Fallback: try raw header
-      const rawCookie = cookieRes.headers.get('set-cookie');
-      if (rawCookie) {
-        cookieJar = rawCookie.split(',')
-          .map(c => c.split(';')[0].trim())
-          .join('; ');
-      }
-    }
-
-    if (!cookieJar) {
-      throw new Error('Failed to acquire Yahoo session cookie');
-    }
-
-    console.log('[Yahoo] Got cookie, fetching crumb...');
-
-    // Step 2: Use the cookie to fetch the crumb token
-    const crumbRes = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb', {
-      headers: {
-        'User-Agent': UA,
-        'Cookie': cookieJar,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (!crumbRes.ok) {
-      const errText = await crumbRes.text().catch(() => '');
-      throw new Error(`Crumb fetch failed: HTTP ${crumbRes.status} ${errText.slice(0, 100)}`);
-    }
-
-    const crumb = (await crumbRes.text()).trim();
-    if (!crumb || crumb.length > 50) {
-      throw new Error(`Invalid crumb received: "${crumb.slice(0, 30)}"`);
-    }
-
-    // Cache for 30 minutes
-    this._cookie = cookieJar;
-    this._crumb = crumb;
-    this._crumbExpiry = Date.now() + 30 * 60 * 1000;
-
-    console.log('[Yahoo] Cookie + crumb acquired successfully.');
-    return { cookie: this._cookie, crumb: this._crumb };
-  }
-
-  /**
-   * Invalidate cached crumb (call on 401/403 to force re-auth).
-   */
-  _invalidateCrumb() {
-    this._cookie = null;
-    this._crumb = null;
-    this._crumbExpiry = 0;
-  }
-
-  /**
-   * Fetch data directly from Yahoo's v8 chart API using native fetch.
-   * Includes cookie/crumb authentication required by Yahoo.
-   */
-  async _directChartFetch(ticker, range = '200d', interval = '1d') {
-    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
-
-    // Try up to 2 times — first with cached crumb, then with fresh crumb
-    for (let attempt = 0; attempt < 2; attempt++) {
-      let cookie, crumb;
-      try {
-        ({ cookie, crumb } = await this._acquireCrumb());
-      } catch (err) {
-        console.error(`[Yahoo] Crumb acquisition failed: ${err.message}`);
-        // On second attempt, propagate the error
-        if (attempt > 0) throw err;
-        this._invalidateCrumb();
-        continue;
-      }
-
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${range}&interval=${interval}&includePrePost=false&crumb=${encodeURIComponent(crumb)}`;
-      console.log(`[Yahoo] Direct fetch (attempt ${attempt + 1}): ${ticker} range=${range}`);
-
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': UA,
-          'Accept': 'application/json',
-          'Cookie': cookie,
-        },
-        signal: AbortSignal.timeout(15000),
-      });
-
-      if (res.status === 401 || res.status === 403) {
-        console.warn(`[Yahoo] Got ${res.status} — crumb expired, refreshing...`);
-        this._invalidateCrumb();
-        continue; // Retry with fresh crumb
-      }
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`Yahoo HTTP ${res.status}: ${text.slice(0, 200)}`);
-      }
-
-      const data = await res.json();
-      const result = data?.chart?.result?.[0];
-      if (!result) throw new Error('No chart data returned');
-      return result;
-    }
-
-    throw new Error('Direct fetch failed after crumb refresh');
-  }
-
-  /**
-   * Build a quote object from a direct chart API response.
-   * Returns the same shape as yf.quote() for compatibility.
-   */
-  _chartToQuote(chart) {
-    const meta = chart.meta || {};
-    return {
-      symbol: meta.symbol,
-      shortName: meta.shortName || meta.symbol,
-      longName: meta.longName,
-      regularMarketPrice: meta.regularMarketPrice,
-      regularMarketPreviousClose: meta.chartPreviousClose || meta.previousClose,
-      regularMarketOpen: meta.regularMarketOpen,
-      regularMarketDayHigh: meta.regularMarketDayHigh,
-      regularMarketDayLow: meta.regularMarketDayLow,
-      regularMarketVolume: meta.regularMarketVolume,
-      regularMarketChange: meta.regularMarketPrice && meta.chartPreviousClose
-        ? meta.regularMarketPrice - meta.chartPreviousClose : null,
-      regularMarketChangePercent: meta.regularMarketPrice && meta.chartPreviousClose
-        ? ((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose) * 100 : null,
-      marketCap: meta.marketCap,
-      fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh,
-      fiftyTwoWeekLow: meta.fiftyTwoWeekLow,
-    };
-  }
-
-  /**
-   * Build price history from a direct chart API response.
-   * Returns the same shape as yf.chart().quotes for compatibility.
-   */
-  _chartToHistory(chart) {
-    const timestamps = chart.timestamp || [];
-    const indicators = chart.indicators?.quote?.[0] || {};
-    const quotes = [];
-    for (let i = 0; i < timestamps.length; i++) {
-      quotes.push({
-        date: new Date(timestamps[i] * 1000),
-        open: indicators.open?.[i],
-        high: indicators.high?.[i],
-        low: indicators.low?.[i],
-        close: indicators.close?.[i],
-        volume: indicators.volume?.[i],
-      });
-    }
-    return quotes;
-  }
-
-  /**
-   * Build a full snapshot from a direct chart API response.
-   */
-  _chartToSnapshot(chart, history) {
-    const meta = chart.meta || {};
-    const closes = history.map(d => d.close).filter(c => c != null);
-    const sma50 = closes.length >= 50 ? this._sma(closes, 50) : null;
-    const sma200 = closes.length >= 200 ? this._sma(closes, 200) : null;
-    const rsi14 = closes.length >= 15 ? this._rsi(closes, 14) : null;
-
-    return {
-      ticker: meta.symbol,
-      name: meta.shortName || meta.longName || meta.symbol,
-      price: meta.regularMarketPrice,
-      previousClose: meta.chartPreviousClose || meta.previousClose,
-      open: meta.regularMarketOpen,
-      dayHigh: meta.regularMarketDayHigh,
-      dayLow: meta.regularMarketDayLow,
-      volume: meta.regularMarketVolume,
-      marketCap: meta.marketCap,
-      change: meta.regularMarketPrice && meta.chartPreviousClose
-        ? meta.regularMarketPrice - meta.chartPreviousClose : null,
-      changePercent: meta.regularMarketPrice && meta.chartPreviousClose
-        ? ((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose) * 100 : null,
-      pe: null, forwardPE: null, pb: null, eps: null,
-      divYield: null, roe: null, profitMargin: null, revenueGrowth: null,
-      beta: null,
-      fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh,
-      fiftyTwoWeekLow: meta.fiftyTwoWeekLow,
-      sma50, sma200, rsi14,
-      priceHistory: history.slice(-30),
-      timestamp: new Date().toISOString(),
-    };
-  }
-
-  // ── Quote — current price + key stats ───────────────────────────────
   async getQuote(ticker) {
     const upper = ticker.toUpperCase();
-    try {
-      const yf = await this._getYF();
-      if (yf) return await this._retry(() => yf.quote(upper), `quote(${upper})`);
-    } catch (err) {
-      console.warn(`[Yahoo] Library quote failed for ${upper} (${err.message}), trying direct fetch...`);
-    }
-    // Direct HTTP fallback
-    const chart = await this._directChartFetch(upper, '1d', '1d');
-    return this._chartToQuote(chart);
+    const data = await this._retry(
+      () => this._fmpFetch(`/quote/${encodeURIComponent(upper)}`),
+      `quote(${upper})`
+    );
+
+    const q = Array.isArray(data) ? data[0] : data;
+    if (!q || q.price == null) throw new Error(`No quote data for ${upper}`);
+
+    // Map to backward-compatible field names
+    return {
+      symbol: q.symbol,
+      shortName: q.name,
+      longName: q.name,
+      regularMarketPrice: q.price,
+      regularMarketPreviousClose: q.previousClose,
+      regularMarketOpen: q.open,
+      regularMarketDayHigh: q.dayHigh,
+      regularMarketDayLow: q.dayLow,
+      regularMarketVolume: q.volume,
+      regularMarketChange: q.change,
+      regularMarketChangePercent: q.changesPercentage,
+      marketCap: q.marketCap,
+      fiftyTwoWeekHigh: q.yearHigh,
+      fiftyTwoWeekLow: q.yearLow,
+    };
   }
 
-  // ── Quotes — batch price lookup ─────────────────────────────────────
+  // ── Quotes — batch price lookup ───────────────────────────────────────
+
   async getQuotes(tickers) {
-    const results = [];
-    for (const ticker of tickers) {
-      try {
-        const quote = await this.getQuote(ticker);
-        results.push(quote);
-      } catch (err) {
-        console.error(`[Yahoo] Quote error for ${ticker}:`, err.message);
-        results.push({ symbol: ticker.toUpperCase(), error: err.message });
+    if (tickers.length === 0) return [];
+
+    // FMP supports comma-separated batch quotes in a single request
+    const symbols = tickers.map(t => t.toUpperCase()).join(',');
+    try {
+      const data = await this._retry(
+        () => this._fmpFetch(`/quote/${encodeURIComponent(symbols)}`),
+        `quotes(batch)`
+      );
+
+      const results = (Array.isArray(data) ? data : [data]).filter(Boolean);
+      return results.map(q => ({
+        symbol: q.symbol,
+        shortName: q.name,
+        regularMarketPrice: q.price,
+        regularMarketPreviousClose: q.previousClose,
+        regularMarketVolume: q.volume,
+        regularMarketChange: q.change,
+        regularMarketChangePercent: q.changesPercentage,
+        marketCap: q.marketCap,
+      }));
+    } catch (err) {
+      console.error(`[FMP] Batch quote error:`, err.message);
+      // Fall back to individual fetches
+      const results = [];
+      for (const ticker of tickers) {
+        try {
+          results.push(await this.getQuote(ticker));
+        } catch (e) {
+          results.push({ symbol: ticker.toUpperCase(), error: e.message });
+        }
       }
+      return results;
     }
-    return results;
   }
 
-  // ── Historical — price history via chart() API ─────────────────────
+  // ── Historical — price history ────────────────────────────────────────
+
   async getHistory(ticker, days = 30) {
     const upper = ticker.toUpperCase();
-    try {
-      const yf = await this._getYF();
-      if (yf) {
-        const now = new Date();
-        const startDate = new Date();
-        startDate.setDate(startDate.getDate() - days);
-        const period1 = Math.floor(startDate.getTime() / 1000);
-        const period2 = Math.floor(now.getTime() / 1000);
+    const data = await this._retry(
+      () => this._fmpFetch(`/historical-price-full/${encodeURIComponent(upper)}`, {
+        timeseries: days,
+      }),
+      `history(${upper})`
+    );
 
-        const result = await this._retry(
-          () => yf.chart(upper, { period1, period2, interval: '1d' }),
-          `chart(${upper})`
-        );
-        return result.quotes || [];
-      }
-    } catch (err) {
-      console.warn(`[Yahoo] Library chart failed for ${upper} (${err.message}), trying direct fetch...`);
+    const historical = data?.historical || [];
+    if (historical.length === 0) {
+      console.warn(`[FMP] No historical data for ${upper}`);
+      return [];
     }
-    // Direct HTTP fallback
-    const range = days <= 30 ? '1mo' : days <= 90 ? '3mo' : days <= 200 ? '1y' : '2y';
-    const chart = await this._directChartFetch(upper, range, '1d');
-    return this._chartToHistory(chart);
+
+    // FMP returns newest-first → reverse to oldest-first
+    return historical.reverse().map(d => ({
+      date: new Date(d.date),
+      open: d.open,
+      high: d.high,
+      low: d.low,
+      close: d.close,
+      volume: d.volume,
+    }));
   }
 
-  // ── Ticker Snapshot — full fundamentals + technicals ────────────────
+  // ── Ticker Snapshot — full fundamentals + technicals ──────────────────
+
   async getTickerSnapshot(ticker) {
     const upper = ticker.toUpperCase();
-    const yf = await this._getYF();
+    const isCrypto = this.isCrypto(upper);
 
-    // ── Try 1: Library quoteSummary (richest data) ──
-    let summary, history;
-    if (yf) {
-      try {
-        [summary, history] = await Promise.all([
-          this._retry(
-            () => yf.quoteSummary(upper, {
-              modules: ['price', 'summaryDetail', 'defaultKeyStatistics', 'financialData'],
-            }),
-            `quoteSummary(${upper})`
-          ),
-          this.getHistory(upper, 200).catch(err => {
-            console.warn(`[Yahoo] History fetch failed for ${upper}, continuing without:`, err.message);
-            return [];
-          }),
-        ]);
-      } catch (err) {
-        console.warn(`[Yahoo] quoteSummary failed for ${upper}: ${err.message}`);
-      }
-    }
+    // Fetch quote + history in parallel (always needed)
+    // Also fetch profile + ratios for stocks (extra fundamentals)
+    const [quoteData, history, profileData, ratiosData] = await Promise.all([
+      this._retry(
+        () => this._fmpFetch(`/quote/${encodeURIComponent(upper)}`),
+        `quote(${upper})`
+      ).catch(err => { console.warn(`[FMP] Quote failed: ${err.message}`); return null; }),
 
-    // ── Try 2: Library quote() (less data but simpler) ──
-    if (!summary && yf) {
-      try {
-        console.warn(`[Yahoo] Trying quote() fallback for ${upper}...`);
-        const [quote, historyFallback] = await Promise.all([
-          this._retry(() => yf.quote(upper), `quote-fallback(${upper})`),
-          this.getHistory(upper, 200).catch(() => []),
-        ]);
-        summary = {
-          price: {
-            shortName: quote.shortName || quote.longName,
-            regularMarketPrice: quote.regularMarketPrice,
-            regularMarketPreviousClose: quote.regularMarketPreviousClose,
-            regularMarketOpen: quote.regularMarketOpen,
-            regularMarketDayHigh: quote.regularMarketDayHigh,
-            regularMarketDayLow: quote.regularMarketDayLow,
-            regularMarketVolume: quote.regularMarketVolume,
-            marketCap: quote.marketCap,
-            regularMarketChange: quote.regularMarketChange,
-            regularMarketChangePercent: quote.regularMarketChangePercent,
-          },
-          summaryDetail: {
-            trailingPE: quote.trailingPE,
-            forwardPE: quote.forwardPE,
-            fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,
-            fiftyTwoWeekLow: quote.fiftyTwoWeekLow,
-          },
-          defaultKeyStatistics: {},
-          financialData: {},
-        };
-        history = historyFallback;
-      } catch (err) {
-        console.warn(`[Yahoo] quote() fallback also failed for ${upper}: ${err.message}`);
-      }
-    }
+      this.getHistory(upper, 200).catch(err => {
+        console.warn(`[FMP] History failed for ${upper}:`, err.message);
+        return [];
+      }),
 
-    // ── Try 3: Direct HTTP fetch (bypasses library entirely) ──
-    if (!summary) {
-      console.warn(`[Yahoo] Library completely failed for ${upper}. Using direct HTTP fallback...`);
-      const chart = await this._directChartFetch(upper, '1y', '1d');
-      history = this._chartToHistory(chart);
-      return this._chartToSnapshot(chart, history);
-    }
+      // Profile gives us beta, sector, description
+      isCrypto ? Promise.resolve(null) :
+        this._retry(
+          () => this._fmpFetch(`/profile/${encodeURIComponent(upper)}`),
+          `profile(${upper})`
+        ).catch(err => { console.warn(`[FMP] Profile failed: ${err.message}`); return null; }),
 
-    const price = summary.price || {};
-    const detail = summary.summaryDetail || {};
-    const keyStats = summary.defaultKeyStatistics || {};
-    const financials = summary.financialData || {};
+      // Key metrics TTM gives us ROE, P/B, profit margin, etc.
+      isCrypto ? Promise.resolve(null) :
+        this._retry(
+          () => this._fmpFetch(`/key-metrics-ttm/${encodeURIComponent(upper)}`),
+          `metrics(${upper})`
+        ).catch(err => { console.warn(`[FMP] Key metrics failed: ${err.message}`); return null; }),
+    ]);
+
+    const quote = Array.isArray(quoteData) ? quoteData[0] : quoteData;
+    if (!quote || quote.price == null) throw new Error(`No data returned for ${upper}`);
+
+    const profile = Array.isArray(profileData) ? profileData?.[0] : profileData;
+    const ratios = Array.isArray(ratiosData) ? ratiosData?.[0] : ratiosData;
 
     // Compute technicals from history
     const closes = history.map(d => d.close).filter(c => c != null);
-    const sma50 = closes.length >= 50 ? this._sma(closes, 50) : null;
-    const sma200 = closes.length >= 200 ? this._sma(closes, 200) : null;
+    const sma50 = closes.length >= 50 ? this._sma(closes, 50) : (quote.priceAvg50 || null);
+    const sma200 = closes.length >= 200 ? this._sma(closes, 200) : (quote.priceAvg200 || null);
     const rsi14 = closes.length >= 15 ? this._rsi(closes, 14) : null;
+
+    // Compute dividend yield from profile if ratios unavailable
+    let divYield = null;
+    if (ratios?.dividendYieldTTM != null) {
+      divYield = ratios.dividendYieldTTM * 100;
+    } else if (profile?.lastDiv && quote.price) {
+      divYield = (profile.lastDiv / quote.price) * 100;
+    }
 
     return {
       ticker: upper,
-      name: price.shortName || price.longName,
-      price: price.regularMarketPrice,
-      previousClose: price.regularMarketPreviousClose,
-      open: price.regularMarketOpen,
-      dayHigh: price.regularMarketDayHigh,
-      dayLow: price.regularMarketDayLow,
-      volume: price.regularMarketVolume,
-      marketCap: price.marketCap,
-      change: price.regularMarketChange,
-      changePercent: price.regularMarketChangePercent,
+      name: quote.name || profile?.companyName || upper,
+      price: quote.price,
+      previousClose: quote.previousClose,
+      open: quote.open,
+      dayHigh: quote.dayHigh,
+      dayLow: quote.dayLow,
+      volume: quote.volume,
+      marketCap: quote.marketCap,
+      change: quote.change,
+      changePercent: quote.changesPercentage,
 
       // Fundamentals
-      pe: detail.trailingPE,
-      forwardPE: detail.forwardPE,
-      pb: keyStats.priceToBook,
-      eps: financials.earningsPerShare || keyStats.trailingEps,
-      divYield: detail.dividendYield != null ? detail.dividendYield * 100 : null,
-      roe: financials.returnOnEquity != null ? financials.returnOnEquity * 100 : null,
-      profitMargin: financials.profitMargins != null ? financials.profitMargins * 100 : null,
-      revenueGrowth: financials.revenueGrowth != null ? financials.revenueGrowth * 100 : null,
-      beta: detail.beta,
-      fiftyTwoWeekHigh: detail.fiftyTwoWeekHigh,
-      fiftyTwoWeekLow: detail.fiftyTwoWeekLow,
+      pe: quote.pe || null,
+      forwardPE: ratios?.peRatioTTM || null,
+      pb: ratios?.pbRatioTTM || ratios?.priceToBookRatioTTM || null,
+      eps: quote.eps || null,
+      divYield,
+      roe: ratios?.roeTTM != null ? ratios.roeTTM * 100 : null,
+      profitMargin: ratios?.netProfitMarginTTM != null ? ratios.netProfitMarginTTM * 100 : null,
+      revenueGrowth: ratios?.revenueGrowthTTM != null ? ratios.revenueGrowthTTM * 100 : null,
+      beta: profile?.beta || null,
+      fiftyTwoWeekHigh: quote.yearHigh,
+      fiftyTwoWeekLow: quote.yearLow,
 
       // Technicals (computed from history)
       sma50,
@@ -507,35 +296,42 @@ class YahooFinanceClient {
     };
   }
 
-  // ── Search — find tickers by name ───────────────────────────────────
+  // ── Search — find tickers by name ─────────────────────────────────────
+
   async search(query) {
-    const yf = await this._getYF();
-    if (!yf) throw new Error('Yahoo Finance not available');
-
-    const result = await this._retry(() => yf.search(query), `search(${query})`);
-    return (result.quotes || []).filter(q => q.quoteType === 'EQUITY' || q.quoteType === 'CRYPTOCURRENCY').slice(0, 10);
+    const data = await this._retry(
+      () => this._fmpFetch('/search', { query, limit: 10 }),
+      `search(${query})`
+    );
+    return (Array.isArray(data) ? data : []).map(r => ({
+      symbol: r.symbol,
+      shortname: r.name,
+      quoteType: r.currency === 'USD' && r.symbol?.endsWith('USD') ? 'CRYPTOCURRENCY' : 'EQUITY',
+      exchange: r.exchangeShortName || r.stockExchange,
+    }));
   }
 
-  // ── Screening — v3 uses screener() API ────────────────────────────
+  // ── Screening — top gainers ───────────────────────────────────────────
+
   async screenByGainers() {
-    const yf = await this._getYF();
-    if (!yf) throw new Error('Yahoo Finance not available');
+    const data = await this._retry(
+      () => this._fmpFetch('/stock_market/gainers'),
+      'gainers'
+    );
 
-    try {
-      const result = await this._retry(
-        () => yf.screener({ scrIds: 'day_gainers', count: 20 }),
-        'screener(day_gainers)'
-      );
-      if (result && result.quotes) {
-        return result.quotes;
-      }
-    } catch (err) {
-      console.error('[Yahoo] Screener error:', err.message);
-    }
-    return [];
+    if (!Array.isArray(data) || data.length === 0) return [];
+
+    return data.slice(0, 20).map(q => ({
+      symbol: q.symbol,
+      shortName: q.name,
+      regularMarketPrice: q.price,
+      regularMarketChangePercent: q.changesPercentage,
+      regularMarketVolume: q.volume || null,
+      marketCap: q.marketCap || null,
+    }));
   }
 
-  // ── Format helpers ──────────────────────────────────────────────────
+  // ── Format helpers ────────────────────────────────────────────────────
 
   formatQuoteForDiscord(quote) {
     if (!quote) return 'No data available.';
@@ -575,7 +371,7 @@ class YahooFinanceClient {
     return output;
   }
 
-  // ── Technical indicator calculations ────────────────────────────────
+  // ── Technical indicator calculations ──────────────────────────────────
 
   _sma(prices, period) {
     const recent = prices.slice(-period);
@@ -599,4 +395,4 @@ class YahooFinanceClient {
   }
 }
 
-module.exports = new YahooFinanceClient();
+module.exports = new MarketDataClient();

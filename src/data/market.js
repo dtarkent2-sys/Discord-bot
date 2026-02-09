@@ -1,5 +1,5 @@
 /**
- * Market context provider — fetches data from Yahoo Finance.
+ * Market context provider — fetches data from FMP (Financial Modeling Prep).
  */
 
 const { assertFresh, FreshnessError } = require('./freshness');
@@ -12,7 +12,7 @@ const FRESHNESS = {
 };
 
 /**
- * Fetch market context for a ticker via Yahoo Finance.
+ * Fetch market context for a ticker via FMP.
  * Returns structured data for the AI, or { error: true, missing: [...] }.
  */
 async function getMarketContext(ticker) {
@@ -43,7 +43,7 @@ async function getMarketContext(ticker) {
       missing.push({ field: 'snapshot', reason: `No data returned for ${resolvedTicker}` });
     }
   } catch (err) {
-    console.error(`[Market] Yahoo snapshot error for ${resolvedTicker}:`, err.message);
+    console.error(`[Market] FMP snapshot error for ${resolvedTicker}:`, err.message);
     missing.push({ field: 'snapshot', reason: err.message });
   }
 
