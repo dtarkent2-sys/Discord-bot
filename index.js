@@ -11,6 +11,7 @@ const { registerCommands } = require('./src/commands/register');
 const { startDashboard } = require('./src/dashboard/server');
 const AutonomousBehaviorEngine = require('./src/services/autonomous');
 const { handlePrefixCommand } = require('./src/commands/prefix');
+const stream = require('./src/services/stream');
 
 // ── Discord Client Setup ─────────────────────────────────────────────
 const client = new Client({
@@ -45,6 +46,12 @@ client.once(Events.ClientReady, async (c) => {
   // Start autonomous scheduled behaviors
   const autonomousEngine = new AutonomousBehaviorEngine(client);
   autonomousEngine.startAllSchedules();
+
+  // Connect Alpaca real-time WebSocket stream
+  const alpacaStream = stream.init(client);
+  if (alpacaStream.enabled) {
+    alpacaStream.connect();
+  }
 });
 
 // ── Slash Command Handler ────────────────────────────────────────────
