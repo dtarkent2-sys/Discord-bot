@@ -185,6 +185,9 @@ const commands = [
           { name: 'logs', value: 'logs' },
           { name: 'kill', value: 'kill' },
         )
+    ),
+
+  new SlashCommandBuilder()
     .setName('stream')
     .setDescription('Real-time Alpaca WebSocket market data stream')
     .addStringOption(opt =>
