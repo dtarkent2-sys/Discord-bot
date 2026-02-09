@@ -86,6 +86,47 @@ class AgentSwarm {
       if (validData.length > 0) {
         parts.push(`LIVE MARKET DATA (real-time from FMP, use these numbers):\n${validData.join('\n\n')}`);
       }
+    } else if (marketData.enabled) {
+      // No specific tickers found — fetch market overview so agents have real data
+      // This covers open-ended queries like "top stocks to buy tomorrow"
+      const overviewParts = [];
+
+      // Fetch major indices/ETFs for broad market context
+      const majorTickers = ['SPY', 'QQQ', 'DIA', 'IWM'];
+      try {
+        const quotes = await marketData.getQuotes(majorTickers);
+        const valid = quotes.filter(q => q.regularMarketPrice != null);
+        if (valid.length > 0) {
+          const lines = valid.map(q => {
+            const pct = q.regularMarketChangePercent;
+            const dir = pct > 0 ? '+' : '';
+            return `${q.symbol}: $${q.regularMarketPrice.toFixed(2)} (${dir}${pct?.toFixed(2) || '?'}%)`;
+          });
+          overviewParts.push(`MARKET INDICES:\n${lines.join('\n')}`);
+        }
+      } catch (err) {
+        console.warn('[AgentSwarm] Market indices fetch failed:', err.message);
+      }
+
+      // Fetch top gainers for actionable stock ideas
+      try {
+        const gainers = await marketData.screenByGainers();
+        if (gainers.length > 0) {
+          const top = gainers.slice(0, 10);
+          const lines = top.map(g => {
+            const pct = g.regularMarketChangePercent;
+            const dir = pct > 0 ? '+' : '';
+            return `${g.symbol} (${g.shortName || ''}): $${g.regularMarketPrice?.toFixed(2) || '?'} ${dir}${pct?.toFixed(2) || '?'}% | Vol: ${g.regularMarketVolume ? (g.regularMarketVolume / 1e6).toFixed(1) + 'M' : 'N/A'}`;
+          });
+          overviewParts.push(`TOP GAINERS TODAY:\n${lines.join('\n')}`);
+        }
+      } catch (err) {
+        console.warn('[AgentSwarm] Top gainers fetch failed:', err.message);
+      }
+
+      if (overviewParts.length > 0) {
+        parts.push(`LIVE MARKET OVERVIEW (real-time from FMP — use these numbers):\n${overviewParts.join('\n\n')}`);
+      }
     }
 
     // Web search on the full query for current information
