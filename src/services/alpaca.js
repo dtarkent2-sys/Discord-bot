@@ -1,8 +1,8 @@
 /**
- * Alpaca Markets Data Service
+ * Alpaca Markets Data + Trading Service
  *
  * Provides real-time stock quotes, options snapshots (with greeks),
- * and historical bars via Alpaca's free data API.
+ * historical bars, AND trade execution via Alpaca's API.
  *
  * Auth: ALPACA_API_KEY + ALPACA_API_SECRET in .env
  * Free tier: real-time IEX data, 200 req/min
@@ -12,6 +12,10 @@
 const config = require('../config');
 
 const DATA_BASE = config.alpacaDataUrl || 'https://data.alpaca.markets';
+// Paper vs live trading endpoint
+const TRADING_BASE = config.alpacaPaper !== 'false'
+  ? 'https://paper-api.alpaca.markets'
+  : 'https://api.alpaca.markets';
 
 class AlpacaService {
   constructor() {
@@ -303,6 +307,72 @@ class AlpacaService {
       timestamp: data.trade?.t,
     };
   }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  TRADING API (broker endpoints — paper or live)
+  // ═══════════════════════════════════════════════════════════════════
+
+  /** Generic trading API fetch (hits paper-api or api.alpaca.markets) */
+  async _tradeFetch(path, method = 'GET', body = null) {
+    if (!this.enabled) throw new Error('Alpaca API keys not configured');
+
+    const url = `${TRADING_BASE}${path}`;
+    const opts = {
+      method,
+      headers: { ...this._getHeaders(), 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(15000),
+    };
+    if (body) opts.body = JSON.stringify(body);
+
+    console.log(`[Alpaca:Trade] ${method} ${path}`);
+    const res = await fetch(url, opts);
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Alpaca ${res.status}: ${text.slice(0, 300)}`);
+    }
+
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('json')) return res.json();
+    return null;
+  }
+
+  // ── Account ───────────────────────────────────────────────────────
+
+  async getAccount() { return this._tradeFetch('/v2/account'); }
+  async getClock() { return this._tradeFetch('/v2/clock'); }
+
+  // ── Positions ─────────────────────────────────────────────────────
+
+  async getPositions() { return this._tradeFetch('/v2/positions'); }
+  async getPosition(symbol) { return this._tradeFetch(`/v2/positions/${symbol.toUpperCase()}`); }
+
+  async closePosition(symbol, qty, percentage) {
+    const params = new URLSearchParams();
+    if (qty) params.set('qty', String(qty));
+    if (percentage) params.set('percentage', String(percentage));
+    const qs = params.toString() ? `?${params}` : '';
+    return this._tradeFetch(`/v2/positions/${symbol.toUpperCase()}${qs}`, 'DELETE');
+  }
+
+  async closeAllPositions() { return this._tradeFetch('/v2/positions', 'DELETE'); }
+
+  // ── Orders ────────────────────────────────────────────────────────
+
+  async createOrder(params) {
+    console.log(`[Alpaca:Trade] ORDER ${params.side} ${params.qty || params.notional} ${params.symbol} @ ${params.type}`);
+    return this._tradeFetch('/v2/orders', 'POST', params);
+  }
+
+  async listOrders(status = 'open') { return this._tradeFetch(`/v2/orders?status=${status}&limit=50`); }
+  async getOrder(orderId) { return this._tradeFetch(`/v2/orders/${orderId}`); }
+  async cancelOrder(orderId) { return this._tradeFetch(`/v2/orders/${orderId}`, 'DELETE'); }
+  async cancelAllOrders() { return this._tradeFetch('/v2/orders', 'DELETE'); }
+  async getPortfolioHistory(period = '1M', timeframe = '1D') {
+    return this._tradeFetch(`/v2/account/portfolio/history?period=${period}&timeframe=${timeframe}`);
+  }
+  async getAsset(symbol) { return this._tradeFetch(`/v2/assets/${symbol.toUpperCase()}`); }
+  get isPaper() { return TRADING_BASE.includes('paper'); }
 }
 
 module.exports = new AlpacaService();

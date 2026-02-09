@@ -709,10 +709,12 @@ async function handleTrending(interaction) {
 // ── /agent — MAHORAGA autonomous trading agent control ───────────────
 async function handleAgent(interaction) {
   const action = interaction.options.getString('action');
+  const alpacaSvc = require('../services/alpaca');
 
-  if (!mahoraga.enabled) {
+  // Status/config/logs work without Alpaca keys; enable/kill need them
+  if (['enable', 'kill'].includes(action) && !alpacaSvc.enabled) {
     return interaction.reply({
-      content: '**MAHORAGA not configured.** Set `MAHORAGA_URL` and `MAHORAGA_TOKEN` in your `.env` file.\nDeploy MAHORAGA: https://github.com/ygwyg/MAHORAGA',
+      content: '**MAHORAGA requires Alpaca.** Set `ALPACA_API_KEY` and `ALPACA_API_SECRET` in your `.env` file.',
       ephemeral: true,
     });
   }
@@ -727,28 +729,28 @@ async function handleAgent(interaction) {
         break;
       }
       case 'enable': {
-        await mahoraga.enable();
-        await interaction.editReply('🟢 **MAHORAGA agent enabled.** Autonomous trading is now active.');
+        mahoraga.enable();
+        await interaction.editReply(`🟢 **MAHORAGA agent enabled.** Autonomous trading is now active.\nMode: ${alpacaSvc.isPaper ? '📄 Paper Trading' : '💵 LIVE Trading'}`);
         break;
       }
       case 'disable': {
-        await mahoraga.disable();
+        mahoraga.disable();
         await interaction.editReply('🔴 **MAHORAGA agent disabled.** Autonomous trading stopped.');
         break;
       }
       case 'config': {
-        const cfg = await mahoraga.getConfig();
+        const cfg = mahoraga.getConfig();
         await interaction.editReply(mahoraga.formatConfigForDiscord(cfg));
         break;
       }
       case 'logs': {
-        const logs = await mahoraga.getLogs();
+        const logs = mahoraga.getLogs();
         await interaction.editReply(mahoraga.formatLogsForDiscord(logs));
         break;
       }
       case 'kill': {
         await mahoraga.kill();
-        await interaction.editReply('🛑 **EMERGENCY KILL SWITCH ACTIVATED.** All positions will be closed and agent halted.');
+        await interaction.editReply('🛑 **EMERGENCY KILL SWITCH ACTIVATED.** All orders cancelled, positions closed, agent halted.');
         break;
       }
     }
