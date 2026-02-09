@@ -131,6 +131,45 @@ const commands = [
         .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY, QQQ)')
         .setRequired(true)
     ),
+
+  new SlashCommandBuilder()
+    .setName('technicals')
+    .setDescription('Technical analysis — RSI, MACD, Bollinger, SMA/EMA, ATR + signal detection')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY)')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('social')
+    .setDescription('Social sentiment from StockTwits — bullish/bearish score + recent posts')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock symbol (e.g. AAPL, TSLA, NVDA)')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('trending')
+    .setDescription('See what tickers are trending on StockTwits right now'),
+
+  new SlashCommandBuilder()
+    .setName('agent')
+    .setDescription('Control the MAHORAGA autonomous trading agent')
+    .addStringOption(opt =>
+      opt.setName('action')
+        .setDescription('Action to perform')
+        .setRequired(true)
+        .addChoices(
+          { name: 'status', value: 'status' },
+          { name: 'enable', value: 'enable' },
+          { name: 'disable', value: 'disable' },
+          { name: 'config', value: 'config' },
+          { name: 'logs', value: 'logs' },
+          { name: 'kill', value: 'kill' },
+        )
+    ),
 ];
 
 async function registerCommands() {

@@ -8,6 +8,9 @@ const yahoo = require('../services/yahoo');
 const tradingAgents = require('../services/trading-agents');
 const agentSwarm = require('../services/agent-swarm');
 const gamma = require('../services/gamma');
+const technicals = require('../services/technicals');
+const stocktwits = require('../services/stocktwits');
+const mahoraga = require('../services/mahoraga');
 const { AttachmentBuilder } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 
@@ -46,6 +49,14 @@ async function handleCommand(interaction) {
       return handleResearch(interaction);
     case 'gex':
       return handleGEX(interaction);
+    case 'technicals':
+      return handleTechnicals(interaction);
+    case 'social':
+      return handleSocial(interaction);
+    case 'trending':
+      return handleTrending(interaction);
+    case 'agent':
+      return handleAgent(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   }
@@ -263,6 +274,11 @@ async function handleHelp(interaction) {
     '`/memory` — See what the bot remembers about you',
     '`/model <name>` — Switch the AI model',
     '`/stats` — View bot statistics',
+    '`/gex <ticker>` — Gamma exposure analysis with chart',
+    '`/technicals <ticker>` — Technical analysis (RSI, MACD, Bollinger, SMA/EMA, ATR)',
+    '`/social <ticker>` — Social sentiment from StockTwits',
+    '`/trending` — See trending tickers on StockTwits',
+    '`/agent <action>` — Control MAHORAGA autonomous trading agent',
     '`/help` — Show this message',
     '',
     '**Prefix Commands (owner only):**',
@@ -557,6 +573,109 @@ async function handleGEX(interaction) {
     console.error(`[GEX] Error for ${ticker}:`, err);
     const msg = err.message || 'Unknown error';
     await interaction.editReply(`**${ticker} — Gamma Exposure**\n❌ ${msg}`);
+  }
+}
+
+// ── /technicals — Technical analysis (RSI, MACD, Bollinger, etc.) ────
+async function handleTechnicals(interaction) {
+  await interaction.deferReply();
+
+  const ticker = interaction.options.getString('ticker').toUpperCase();
+
+  try {
+    await interaction.editReply(`**${ticker} — Technical Analysis**\n⏳ Fetching 200+ days of price history & computing indicators...`);
+
+    const result = await technicals.analyze(ticker);
+    const formatted = technicals.formatForDiscord(result);
+
+    await interaction.editReply(formatted);
+  } catch (err) {
+    console.error(`[Technicals] Error for ${ticker}:`, err);
+    await interaction.editReply(`**${ticker} — Technical Analysis**\n❌ ${err.message}`);
+  }
+}
+
+// ── /social — StockTwits social sentiment ────────────────────────────
+async function handleSocial(interaction) {
+  await interaction.deferReply();
+
+  const ticker = interaction.options.getString('ticker').toUpperCase();
+
+  try {
+    const result = await stocktwits.analyzeSymbol(ticker);
+    const formatted = stocktwits.formatSentimentForDiscord(result);
+
+    await interaction.editReply(formatted);
+  } catch (err) {
+    console.error(`[Social] Error for ${ticker}:`, err);
+    await interaction.editReply(`**${ticker} — Social Sentiment**\n❌ ${err.message}`);
+  }
+}
+
+// ── /trending — StockTwits trending tickers ──────────────────────────
+async function handleTrending(interaction) {
+  await interaction.deferReply();
+
+  try {
+    const trending = await stocktwits.getTrending();
+    const formatted = stocktwits.formatTrendingForDiscord(trending);
+
+    await interaction.editReply(formatted);
+  } catch (err) {
+    console.error(`[Trending] Error:`, err);
+    await interaction.editReply(`**Trending Tickers**\n❌ ${err.message}`);
+  }
+}
+
+// ── /agent — MAHORAGA autonomous trading agent control ───────────────
+async function handleAgent(interaction) {
+  const action = interaction.options.getString('action');
+
+  if (!mahoraga.enabled) {
+    return interaction.reply({
+      content: '**MAHORAGA not configured.** Set `MAHORAGA_URL` and `MAHORAGA_TOKEN` in your `.env` file.\nDeploy MAHORAGA: https://github.com/ygwyg/MAHORAGA',
+      ephemeral: true,
+    });
+  }
+
+  await interaction.deferReply();
+
+  try {
+    switch (action) {
+      case 'status': {
+        const status = await mahoraga.getStatus();
+        await interaction.editReply(mahoraga.formatStatusForDiscord(status));
+        break;
+      }
+      case 'enable': {
+        await mahoraga.enable();
+        await interaction.editReply('🟢 **MAHORAGA agent enabled.** Autonomous trading is now active.');
+        break;
+      }
+      case 'disable': {
+        await mahoraga.disable();
+        await interaction.editReply('🔴 **MAHORAGA agent disabled.** Autonomous trading stopped.');
+        break;
+      }
+      case 'config': {
+        const cfg = await mahoraga.getConfig();
+        await interaction.editReply(mahoraga.formatConfigForDiscord(cfg));
+        break;
+      }
+      case 'logs': {
+        const logs = await mahoraga.getLogs();
+        await interaction.editReply(mahoraga.formatLogsForDiscord(logs));
+        break;
+      }
+      case 'kill': {
+        await mahoraga.kill();
+        await interaction.editReply('🛑 **EMERGENCY KILL SWITCH ACTIVATED.** All positions will be closed and agent halted.');
+        break;
+      }
+    }
+  } catch (err) {
+    console.error(`[Agent] Error (${action}):`, err);
+    await interaction.editReply(`**MAHORAGA — ${action}**\n❌ ${err.message}`);
   }
 }
 
