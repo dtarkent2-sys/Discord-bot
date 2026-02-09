@@ -321,7 +321,7 @@ SUMMARY: [2-3 sentence summary of the rationale]`;
 
   async _llmCall(prompt) {
     const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-    const systemMsg = `Today is ${today}. You are analyzing LIVE market data provided in the prompt. Use ONLY the data given — do not reference outdated information from your training data. Never mention "knowledge cutoff" — the market data provided is current.`;
+    const systemMsg = `Today is ${today}. Your training data cuts off around mid-2024 — the current date is REAL and may be well beyond that. You are analyzing LIVE market data from FMP provided in the prompt. Use ONLY the data given — do not reference outdated prices, events, or conditions from your training data. All prices, metrics, and market conditions in the prompt are current as of today. Never mention "knowledge cutoff" — just use the live data.`;
 
     try {
       const stream = await this.ollama.chat({
