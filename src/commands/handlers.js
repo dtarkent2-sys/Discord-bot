@@ -13,6 +13,7 @@ const technicals = require('../services/technicals');
 const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
 const stream = require('../services/stream');
+const reddit = require('../services/reddit');
 const validea = require('../services/validea');
 const macro = require('../services/macro');
 const sectors = require('../services/sectors');
@@ -63,6 +64,8 @@ async function handleCommand(interaction) {
       return handleSocial(interaction);
     case 'trending':
       return handleTrending(interaction);
+    case 'reddit':
+      return handleReddit(interaction);
     case 'validea':
       return handleValidea(interaction);
     case 'macro':
@@ -282,7 +285,7 @@ async function handleHelp(interaction) {
     '`/macro` — Market regime | `/sectors` — Sector rotation | `/validea` — Guru scores',
     '`/gex` — Gamma exposure | `/news` — Market news',
     '`/research` — Agent Swarm research | `/screen` — Stock screener',
-    '`/social` `/trending` — StockTwits sentiment',
+    '`/social` `/trending` — StockTwits | `/reddit` — Reddit sentiment',
     '`/watchlist` — Manage watchlist | `/sentiment` — Text analysis',
     '`/stream start|stop|list|status` — Live Alpaca WebSocket data',
     '`/memory` `/profile` `/stats` `/model` `/topic`',
@@ -817,6 +820,40 @@ async function handleTrending(interaction) {
   } catch (err) {
     console.error(`[Trending] Error:`, err);
     await interaction.editReply(`**Trending Tickers**\n❌ ${err.message}`);
+  }
+}
+
+// ── /reddit — Reddit social sentiment ─────────────────────────────
+async function handleReddit(interaction) {
+  await interaction.deferReply();
+
+  const ticker = interaction.options.getString('ticker');
+
+  try {
+    if (ticker) {
+      // Per-symbol analysis
+      const upper = ticker.toUpperCase();
+      await interaction.editReply(`**${upper} — Reddit Sentiment**\n⏳ Scanning r/wallstreetbets, r/stocks, r/investing, r/options...`);
+
+      const result = await reddit.analyzeSymbol(upper);
+      const formatted = reddit.formatSymbolForDiscord(result);
+      await interaction.editReply(formatted);
+    } else {
+      // Trending tickers
+      await interaction.editReply('**Reddit Trending**\n⏳ Scanning 4 subreddits for trending tickers...');
+
+      const trending = await reddit.getTrendingTickers();
+      const formatted = reddit.formatTrendingForDiscord(trending);
+
+      if (formatted.length <= 2000) {
+        await interaction.editReply(formatted);
+      } else {
+        await interaction.editReply(formatted.slice(0, 1990) + '...');
+      }
+    }
+  } catch (err) {
+    console.error('[Reddit] Error:', err);
+    await interaction.editReply(`**Reddit Sentiment**\n❌ ${err.message}`);
   }
 }
 

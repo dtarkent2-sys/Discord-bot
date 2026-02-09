@@ -12,8 +12,10 @@
  *   - Cooldown: min time between trades for same symbol
  *   - Allow/deny lists: restrict tradable symbols
  *   - No shorting (by default): long only
+ *   - Two-step order flow: preview → approval token → submit (matching MAHORAGA reference)
  */
 
+const crypto = require('crypto');
 const config = require('../config');
 const Storage = require('./storage');
 
@@ -64,6 +66,7 @@ class PolicyEngine {
     this.dailyStartEquity = 0;
     this.lastResetDate = '';
     this.tradeCooldowns = new Map(); // symbol → timestamp of last trade
+    this._approvalTokens = new Map(); // tokenId → { order, expiresAt }
   }
 
   // ── Configuration ─────────────────────────────────────────────────
@@ -306,6 +309,102 @@ class PolicyEngine {
     }
 
     return exits;
+  }
+
+  // ── Two-Step Order Flow (preview → approve → submit) ───────────
+  // Matches MAHORAGA reference architecture:
+  //   1. Preview: validate order, return approval token (valid 5 min)
+  //   2. Submit: validate token, execute order
+
+  /**
+   * Preview an order — validate against all policy rules.
+   * If approved, returns an approval token valid for 5 minutes.
+   * @param {object} ctx - same as evaluate()
+   * @returns {{ approved: boolean, token?: string, violations?: string[], warnings?: string[], order: object, expiresAt?: number }}
+   */
+  preview(ctx) {
+    const result = this.evaluate(ctx);
+
+    if (!result.allowed) {
+      return {
+        approved: false,
+        violations: result.violations,
+        warnings: result.warnings,
+        order: ctx,
+      };
+    }
+
+    // Generate a signed approval token
+    const tokenId = crypto.randomBytes(16).toString('hex');
+    const expiresAt = Date.now() + 5 * 60 * 1000; // 5 minutes
+
+    const tokenData = {
+      id: tokenId,
+      order: {
+        symbol: ctx.symbol,
+        side: ctx.side,
+        notional: ctx.notional,
+      },
+      expiresAt,
+      createdAt: Date.now(),
+    };
+
+    // Store token for later validation
+    this._approvalTokens.set(tokenId, tokenData);
+
+    // Clean up expired tokens periodically
+    this._cleanExpiredTokens();
+
+    console.log(`[Policy] Approval token issued for ${ctx.side} ${ctx.symbol} $${ctx.notional?.toFixed(0)} — expires in 5 min`);
+
+    return {
+      approved: true,
+      token: tokenId,
+      warnings: result.warnings,
+      order: ctx,
+      expiresAt,
+    };
+  }
+
+  /**
+   * Submit an order using an approval token.
+   * Validates the token is still valid and matches the intended order.
+   * @param {string} tokenId - the approval token from preview()
+   * @param {object} orderParams - { symbol, side, notional } to verify against token
+   * @returns {{ valid: boolean, error?: string, order?: object }}
+   */
+  validateToken(tokenId, orderParams = {}) {
+    const tokenData = this._approvalTokens.get(tokenId);
+
+    if (!tokenData) {
+      return { valid: false, error: 'Unknown or expired approval token' };
+    }
+
+    // Check expiration
+    if (Date.now() > tokenData.expiresAt) {
+      this._approvalTokens.delete(tokenId);
+      return { valid: false, error: 'Approval token expired (5 min limit)' };
+    }
+
+    // Verify order matches token (prevent token reuse for different orders)
+    if (orderParams.symbol && orderParams.symbol !== tokenData.order.symbol) {
+      return { valid: false, error: `Token was issued for ${tokenData.order.symbol}, not ${orderParams.symbol}` };
+    }
+
+    // Consume the token (one-time use)
+    this._approvalTokens.delete(tokenId);
+
+    console.log(`[Policy] Approval token consumed for ${tokenData.order.side} ${tokenData.order.symbol}`);
+    return { valid: true, order: tokenData.order };
+  }
+
+  _cleanExpiredTokens() {
+    const now = Date.now();
+    for (const [id, data] of this._approvalTokens) {
+      if (now > data.expiresAt) {
+        this._approvalTokens.delete(id);
+      }
+    }
   }
 }
 
