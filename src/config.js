@@ -36,6 +36,7 @@ module.exports = {
   alpacaApiKey: process.env.ALPACA_API_KEY || '',
   alpacaApiSecret: process.env.ALPACA_API_SECRET || '',
   alpacaDataUrl: process.env.ALPACA_DATA_URL || 'https://data.alpaca.markets',
+  alpacaPaper: process.env.ALPACA_PAPER || 'true', // 'true' = paper trading (default safe)
   alpacaFeed: process.env.ALPACA_FEED || 'iex',
   searxngUrl: process.env.SEARXNG_URL || '',
   botOwnerId: process.env.BOT_OWNER_ID || '',

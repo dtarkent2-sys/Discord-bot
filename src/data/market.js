@@ -5,6 +5,8 @@
 const { assertFresh, FreshnessError } = require('./freshness');
 const yahoo = require('../services/yahoo');
 const alpaca = require('../services/alpaca');
+const technicals = require('../services/technicals');
+const stocktwits = require('../services/stocktwits');
 
 // Default freshness limits (in seconds)
 const FRESHNESS = {
@@ -142,6 +144,26 @@ async function getMarketContext(ticker) {
     };
   }
 
+  // ── Enrich with technical indicators (non-blocking) ──
+  try {
+    const techResult = await technicals.analyze(resolvedTicker);
+    context.technicals = techResult.technicals;
+    context.signals = techResult.signals;
+  } catch (err) {
+    // Technical analysis is supplementary — don't fail the whole request
+    missing.push({ field: 'technicals', reason: err.message });
+  }
+
+  // ── Enrich with social sentiment (non-blocking) ──
+  try {
+    const social = await stocktwits.analyzeSymbol(resolvedTicker);
+    if (social.messages > 0) {
+      context.socialSentiment = social;
+    }
+  } catch {
+    // StockTwits is supplementary — silently skip
+  }
+
   // Partial data is OK — include what we have and note what's missing
   if (missing.length > 0) {
     context.missingFields = missing;
@@ -197,6 +219,35 @@ function formatContextForAI(context) {
       const close = p.close;
       if (date && close) lines.push(`    ${date}: $${close.toFixed(2)}`);
     }
+  }
+
+  // Technical indicators (from MAHORAGA engine)
+  if (context.technicals) {
+    const t = context.technicals;
+    lines.push('  Technical Indicators:');
+    if (t.rsi_14 !== null) lines.push(`    RSI(14): ${t.rsi_14.toFixed(1)}`);
+    if (t.macd) lines.push(`    MACD: ${t.macd.macd.toFixed(3)} | Signal: ${t.macd.signal.toFixed(3)} | Hist: ${t.macd.histogram.toFixed(3)}`);
+    if (t.bollinger) lines.push(`    Bollinger: $${t.bollinger.lower.toFixed(2)} — $${t.bollinger.middle.toFixed(2)} — $${t.bollinger.upper.toFixed(2)} (width: ${(t.bollinger.width * 100).toFixed(1)}%)`);
+    if (t.sma_20 !== null) lines.push(`    SMA(20): $${t.sma_20.toFixed(2)}`);
+    if (t.sma_50 !== null) lines.push(`    SMA(50): $${t.sma_50.toFixed(2)}`);
+    if (t.sma_200 !== null) lines.push(`    SMA(200): $${t.sma_200.toFixed(2)}`);
+    if (t.ema_12 !== null) lines.push(`    EMA(12): $${t.ema_12.toFixed(2)} | EMA(26): $${t.ema_26?.toFixed(2) ?? '—'}`);
+    if (t.atr_14 !== null) lines.push(`    ATR(14): $${t.atr_14.toFixed(2)}`);
+    if (t.relative_volume !== null) lines.push(`    Relative Volume: ${t.relative_volume.toFixed(1)}x average`);
+  }
+
+  // Signal detection
+  if (context.signals && context.signals.length > 0) {
+    lines.push('  Detected Signals:');
+    for (const sig of context.signals) {
+      lines.push(`    [${sig.direction.toUpperCase()}] ${sig.description} (strength: ${(sig.strength * 100).toFixed(0)}%)`);
+    }
+  }
+
+  // Social sentiment
+  if (context.socialSentiment) {
+    const s = context.socialSentiment;
+    lines.push(`  Social Sentiment (StockTwits): ${s.label} (score: ${(s.score * 100).toFixed(0)}%) — ${s.bullish} bullish / ${s.bearish} bearish / ${s.neutral} neutral (${s.messages} posts)`);
   }
 
   if (context.missingFields) {
