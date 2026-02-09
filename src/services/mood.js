@@ -7,16 +7,15 @@
  */
 
 const Storage = require('./storage');
-const { persona, pick } = require('../personality');
 
 const MOODS = {
-  EUPHORIC:             { label: 'Euphoric',              threshold: 5,   patterns: 'marketUp' },
-  OPTIMISTICALLY_BULL:  { label: 'Optimistically Bullish', threshold: 2,   patterns: 'marketUp' },
-  CONTENT:              { label: 'Content',                threshold: 0.5, patterns: 'greetings' },
-  NEUTRAL:              { label: 'Neutral',                threshold: -0.5, patterns: 'greetings' },
-  CAUTIOUS:             { label: 'Cautious',               threshold: -2,  patterns: 'marketDown' },
-  MEASUREDLY_CONCERNED: { label: 'Measuredly Concerned',   threshold: -5,  patterns: 'marketDown' },
-  DISTRESSED:           { label: 'Distressed',             threshold: -Infinity, patterns: 'error' },
+  EUPHORIC:             { label: 'Euphoric',              threshold: 5 },
+  OPTIMISTICALLY_BULL:  { label: 'Optimistically Bullish', threshold: 2 },
+  CONTENT:              { label: 'Content',                threshold: 0.5 },
+  NEUTRAL:              { label: 'Neutral',                threshold: -0.5 },
+  CAUTIOUS:             { label: 'Cautious',               threshold: -2 },
+  MEASUREDLY_CONCERNED: { label: 'Measuredly Concerned',   threshold: -5 },
+  DISTRESSED:           { label: 'Distressed',             threshold: -Infinity },
 };
 
 class MoodEngine {
@@ -36,23 +35,6 @@ class MoodEngine {
   // Get current mood
   getMood() {
     return this.state.currentMood;
-  }
-
-  // Get the speech pattern key that matches current mood
-  getMoodPatterns() {
-    for (const mood of Object.values(MOODS)) {
-      if (this.state.score >= mood.threshold) {
-        return mood.patterns;
-      }
-    }
-    return 'greetings';
-  }
-
-  // Get a mood-appropriate line from persona speech patterns
-  getMoodLine() {
-    const patternKey = this.getMoodPatterns();
-    const patterns = persona.speechPatterns[patternKey];
-    return patterns ? pick(patterns) : '';
   }
 
   // Update mood based on portfolio/market P&L percentage change

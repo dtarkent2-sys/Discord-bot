@@ -2,7 +2,7 @@ const { Ollama } = require('ollama');
 const config = require('../config');
 const memory = require('./memory');
 const mood = require('./mood');
-const { persona, pick, buildPersonalityPrompt } = require('../personality');
+const { persona, buildPersonalityPrompt } = require('../personality');
 const { webSearch, formatResultsForAI } = require('../tools/web-search');
 
 class AIService {
