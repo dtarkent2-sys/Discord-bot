@@ -122,6 +122,15 @@ const commands = [
         .setDescription('Your research question (e.g. "Top 10 tech stocks for Q1 2026")')
         .setRequired(true)
     ),
+
+  new SlashCommandBuilder()
+    .setName('gex')
+    .setDescription('Gamma Exposure (GEX) analysis — options gamma by strike with chart')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY, QQQ)')
+        .setRequired(true)
+    ),
 ];
 
 async function registerCommands() {
