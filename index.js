@@ -1,3 +1,21 @@
+// ── Process-level error handlers (before any other imports) ─────────
+// Prevent unhandled errors from silently crashing the process.
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled rejection:', reason);
+});
+
+// ── Start health server IMMEDIATELY ─────────────────────────────────
+// Railway's healthcheck begins as soon as the container launches.
+// Bind the HTTP server before loading heavy modules (canvas, chartjs)
+// so the /health endpoint is reachable even if later imports fail.
+const { startDashboard } = require('./src/dashboard/server');
+startDashboard();
+console.log('[Boot] Health server started');
+
+// ── Load remaining modules ──────────────────────────────────────────
 const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
 const config = require('./src/config');
 const ai = require('./src/services/ai');
@@ -8,10 +26,11 @@ const images = require('./src/services/images');
 const stats = require('./src/services/stats');
 const { handleCommand } = require('./src/commands/handlers');
 const { registerCommands } = require('./src/commands/register');
-const { startDashboard } = require('./src/dashboard/server');
 const AutonomousBehaviorEngine = require('./src/services/autonomous');
 const { handlePrefixCommand } = require('./src/commands/prefix');
 const stream = require('./src/services/stream');
+
+console.log('[Boot] All modules loaded');
 
 // ── Discord Client Setup ─────────────────────────────────────────────
 const client = new Client({
@@ -183,10 +202,6 @@ client.on(Events.GuildDelete, () => {
 });
 
 // ── Start Bot ────────────────────────────────────────────────────────
-// Start web dashboard + health endpoint immediately (before Discord login)
-// so Railway healthcheck can pass while Discord is still connecting.
-startDashboard();
-
 if (!config.token) {
   console.error('ERROR: DISCORD_TOKEN is not set.');
   console.error('Create a .env file with your bot token. See .env.example for reference.');

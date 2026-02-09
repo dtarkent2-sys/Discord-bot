@@ -640,13 +640,16 @@ async function handleGEX(interaction) {
     // Build the text summary
     const summary = gamma.formatForDiscord(result);
 
-    // Attach the chart image
-    const attachment = new AttachmentBuilder(result.chartBuffer, { name: `${ticker}-gex.png` });
-
-    await interaction.editReply({
-      content: summary,
-      files: [attachment],
-    });
+    // Attach the chart image if available
+    if (result.chartBuffer) {
+      const attachment = new AttachmentBuilder(result.chartBuffer, { name: `${ticker}-gex.png` });
+      await interaction.editReply({
+        content: summary,
+        files: [attachment],
+      });
+    } else {
+      await interaction.editReply(summary + '\n\n_Chart unavailable — canvas module not loaded._');
+    }
   } catch (err) {
     console.error(`[GEX] Error for ${ticker}:`, err);
     const msg = err.message || 'Unknown error';
