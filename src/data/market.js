@@ -221,7 +221,7 @@ function formatContextForAI(context) {
     }
   }
 
-  // Technical indicators (from MAHORAGA engine)
+  // Technical indicators (from SHARK engine)
   if (context.technicals) {
     const t = context.technicals;
     lines.push('  Technical Indicators:');

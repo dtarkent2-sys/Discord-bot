@@ -172,7 +172,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('agent')
-    .setDescription('Control the MAHORAGA autonomous trading agent')
+    .setDescription('Control the SHARK autonomous trading agent')
     .addStringOption(opt =>
       opt.setName('action')
         .setDescription('Action to perform')

@@ -1,5 +1,5 @@
 /**
- * MAHORAGA — Autonomous Trading Engine
+ * SHARK — Autonomous Trading Engine
  *
  * Runs directly inside the Discord bot on Railway.
  * Core loop: Signal Ingestion → Technical Analysis → LLM Decision → Trade Execution
@@ -11,7 +11,7 @@
  *
  * Risk management via policy.js (kill switch, position limits, stop losses, etc.)
  *
- * Based on https://github.com/ygwyg/MAHORAGA (MIT license)
+ * Based on https://github.com/ygwyg/SHARK (MIT license)
  */
 
 const alpaca = require('./alpaca');
@@ -22,15 +22,15 @@ const ai = require('./ai');
 const config = require('../config');
 const Storage = require('./storage');
 
-class MahoragaEngine {
+class SharkEngine {
   constructor() {
-    this._storage = new Storage('mahoraga-state.json');
+    this._storage = new Storage('shark-state.json');
     this._enabled = this._storage.get('enabled', false);
     this._logs = [];       // recent activity log (ring buffer, max 100)
     this._postToChannel = null; // set by autonomous.js to post Discord alerts
 
     if (this._enabled) {
-      console.log('[MAHORAGA] Restored enabled state from previous session');
+      console.log('[SHARK] Restored enabled state from previous session');
     }
   }
 
@@ -49,15 +49,15 @@ class MahoragaEngine {
     if (!alpaca.enabled) throw new Error('Cannot enable: ALPACA_API_KEY not configured');
     this._enabled = true;
     this._storage.set('enabled', true);
-    this._log('agent', 'MAHORAGA agent ENABLED');
-    console.log('[MAHORAGA] Agent enabled');
+    this._log('agent', 'SHARK agent ENABLED');
+    console.log('[SHARK] Agent enabled');
   }
 
   disable() {
     this._enabled = false;
     this._storage.set('enabled', false);
-    this._log('agent', 'MAHORAGA agent DISABLED');
-    console.log('[MAHORAGA] Agent disabled');
+    this._log('agent', 'SHARK agent DISABLED');
+    console.log('[SHARK] Agent disabled');
   }
 
   async kill() {
@@ -65,7 +65,7 @@ class MahoragaEngine {
     this._storage.set('enabled', false);
     policy.activateKillSwitch();
     this._log('kill', 'EMERGENCY KILL SWITCH — closing all positions');
-    console.log('[MAHORAGA] KILL SWITCH ACTIVATED');
+    console.log('[SHARK] KILL SWITCH ACTIVATED');
 
     try {
       await alpaca.cancelAllOrders();
@@ -156,7 +156,7 @@ class MahoragaEngine {
       await this._scanSignals(account);
 
     } catch (err) {
-      console.error('[MAHORAGA] Cycle error:', err.message);
+      console.error('[SHARK] Cycle error:', err.message);
       this._log('error', `Cycle error: ${err.message}`);
     }
   }
@@ -174,12 +174,12 @@ class MahoragaEngine {
         try {
           await alpaca.closePosition(exit.symbol);
           this._log('trade', `CLOSE ${exit.symbol}: ${exit.message}`);
-          console.log(`[MAHORAGA] ${exit.message}`);
+          console.log(`[SHARK] ${exit.message}`);
 
           if (this._postToChannel) {
             const emoji = exit.reason === 'take_profit' ? '🟢' : '🔴';
             await this._postToChannel(
-              `${emoji} **MAHORAGA Auto-Exit: ${exit.symbol}**\n${exit.message}\n_Position closed automatically._`
+              `${emoji} **SHARK Auto-Exit: ${exit.symbol}**\n${exit.message}\n_Position closed automatically._`
             );
           }
         } catch (err) {
@@ -187,7 +187,7 @@ class MahoragaEngine {
         }
       }
     } catch (err) {
-      console.warn('[MAHORAGA] Position check error:', err.message);
+      console.warn('[SHARK] Position check error:', err.message);
     }
   }
 
@@ -228,7 +228,7 @@ class MahoragaEngine {
       }
     } catch (err) {
       this._log('error', `Signal scan error: ${err.message}`);
-      console.warn('[MAHORAGA] Signal scan error:', err.message);
+      console.warn('[SHARK] Signal scan error:', err.message);
     }
   }
 
@@ -330,7 +330,7 @@ class MahoragaEngine {
 
       policy.recordTrade(symbol);
       this._log('trade', `BUY ${symbol} — $${notional.toFixed(0)} (confidence: ${((decision.confidence || 0) * 100).toFixed(0)}%)`);
-      console.log(`[MAHORAGA] BUY ${symbol} — $${notional.toFixed(0)}`);
+      console.log(`[SHARK] BUY ${symbol} — $${notional.toFixed(0)}`);
 
       // Alert Discord
       if (this._postToChannel) {
@@ -338,7 +338,7 @@ class MahoragaEngine {
           ? `\n⚠️ ${riskCheck.warnings.join('\n⚠️ ')}`
           : '';
         await this._postToChannel(
-          `💰 **MAHORAGA Trade: BUY ${symbol}**\n` +
+          `💰 **SHARK Trade: BUY ${symbol}**\n` +
           `Amount: \`$${notional.toFixed(0)}\` | Confidence: \`${((decision.confidence || 0) * 100).toFixed(0)}%\`\n` +
           `Sentiment: \`${sentiment.label} (${(sentiment.score * 100).toFixed(0)}%)\`\n` +
           `Signals: ${signals.filter(s => s.direction === 'bullish').map(s => s.description).join(', ') || 'none'}\n` +
@@ -349,7 +349,7 @@ class MahoragaEngine {
       }
     } catch (err) {
       this._log('error', `Order failed for ${symbol}: ${err.message}`);
-      console.error(`[MAHORAGA] Order failed for ${symbol}:`, err.message);
+      console.error(`[SHARK] Order failed for ${symbol}:`, err.message);
     }
   }
 
@@ -395,7 +395,7 @@ class MahoragaEngine {
         reason: parsed.reason || '',
       };
     } catch (err) {
-      console.warn(`[MAHORAGA] AI decision error for ${symbol}: ${err.message}`);
+      console.warn(`[SHARK] AI decision error for ${symbol}: ${err.message}`);
       return null;
     }
   }
@@ -548,13 +548,13 @@ class MahoragaEngine {
 
       policy.recordTrade(symbol);
       this._log('trade', `MANUAL BUY ${symbol} — $${notional.toFixed(0)}${force ? ' (force)' : ''} (confidence: ${((decision.confidence || 0) * 100).toFixed(0)}%)`);
-      console.log(`[MAHORAGA] MANUAL BUY ${symbol} — $${notional.toFixed(0)}`);
+      console.log(`[SHARK] MANUAL BUY ${symbol} — $${notional.toFixed(0)}`);
       steps.push(`ORDER PLACED: market buy $${notional.toFixed(0)} of ${symbol}`);
 
       // Alert trading channel too
       if (this._postToChannel) {
         await this._postToChannel(
-          `💰 **MAHORAGA Manual Trade: BUY ${symbol}**\n` +
+          `💰 **SHARK Manual Trade: BUY ${symbol}**\n` +
           `Amount: \`$${notional.toFixed(0)}\`${force ? ' (forced)' : ` | Confidence: \`${((decision.confidence || 0) * 100).toFixed(0)}%\``}\n` +
           `_${alpaca.isPaper ? 'Paper trade' : 'LIVE trade'} | Triggered manually_`
         );
@@ -578,7 +578,7 @@ class MahoragaEngine {
     if (!status) return '_Could not fetch agent status._';
 
     const lines = [
-      `**MAHORAGA — Autonomous Trading Agent**`,
+      `**SHARK — Autonomous Trading Agent**`,
       `Mode: ${status.paper ? '📄 Paper Trading' : '💵 LIVE Trading'}`,
       `Agent: ${status.agent_enabled ? '🟢 **ENABLED**' : '🔴 **DISABLED**'}`,
       ``,
@@ -629,7 +629,7 @@ class MahoragaEngine {
   formatConfigForDiscord(cfg) {
     if (!cfg) return '_Could not fetch config._';
 
-    const lines = [`**MAHORAGA Configuration**`, ``];
+    const lines = [`**SHARK Configuration**`, ``];
 
     // Trading limits
     lines.push(`__Trading Limits__`);
@@ -691,7 +691,7 @@ class MahoragaEngine {
   formatLogsForDiscord(logs) {
     if (!logs || logs.length === 0) return '_No recent agent activity._';
 
-    const lines = [`**MAHORAGA Recent Activity**`, ``];
+    const lines = [`**SHARK Recent Activity**`, ``];
     for (const log of logs.slice(-15).reverse()) {
       const time = new Date(log.timestamp).toLocaleTimeString('en-US', { timeZone: 'America/New_York' });
       const emoji = log.type === 'trade' ? '💰' : log.type === 'blocked' ? '🚫' : log.type === 'kill' ? '🛑' : log.type === 'error' ? '❌' : '📋';
@@ -701,4 +701,4 @@ class MahoragaEngine {
   }
 }
 
-module.exports = new MahoragaEngine();
+module.exports = new SharkEngine();
