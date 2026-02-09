@@ -65,11 +65,8 @@ client.once(Events.ClientReady, async (c) => {
   const autonomousEngine = new AutonomousBehaviorEngine(client);
   autonomousEngine.startAllSchedules();
 
-  // Connect Alpaca real-time WebSocket stream
-  const alpacaStream = stream.init(client);
-  if (alpacaStream.enabled) {
-    alpacaStream.connect();
-  }
+  // Initialize Alpaca stream (connects lazily on first /stream start)
+  stream.init(client);
 });
 
 // ── Slash Command Handler ────────────────────────────────────────────
