@@ -17,12 +17,18 @@ const { getMarketContext } = require('../data/market');
 const mood = require('./mood');
 const commentary = require('./commentary');
 const stats = require('./stats');
+const gamma = require('./gamma');
 const config = require('../config');
 
 class AutonomousBehaviorEngine {
   constructor(client) {
     this.client = client;
     this.jobs = [];
+
+    // GEX monitor state — tracks last-known regime so we only alert on flips
+    // Key: ticker, Value: { flipStrike, regime, spotPrice, lastAlertTime }
+    this.gexState = new Map();
+    this.gexWatchlist = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'MSFT', 'AMD', 'META', 'AMZN', 'IWM'];
   }
 
   startAllSchedules() {
@@ -134,6 +140,18 @@ class AutonomousBehaviorEngine {
       })
     );
 
+    // 5. GAMMA EXPOSURE MONITOR (every 30 min during market hours, Mon-Fri)
+    // Scans watchlist tickers for gamma flip breaches and alerts the trading channel
+    if (gamma.enabled) {
+      this.jobs.push(
+        schedule.scheduleJob({ rule: '*/30 9-16 * * 1-5', tz: 'America/New_York' }, async () => {
+          console.log('[Sprocket] Running GEX flip monitor...');
+          await this._runGEXMonitor();
+        })
+      );
+      console.log(`[Sprocket] GEX monitor active — watching: ${this.gexWatchlist.join(', ')}`);
+    }
+
     console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
   }
 
@@ -236,6 +254,82 @@ class AutonomousBehaviorEngine {
     }
 
     return null;
+  }
+
+  // ── GEX Flip Monitor ─────────────────────────────────────────────────
+
+  /**
+   * Scan watchlist tickers for gamma flip breaches.
+   * Alerts the trading channel when spot price crosses the gamma flip level
+   * (regime change from long→short gamma or vice versa).
+   */
+  async _runGEXMonitor() {
+    const cooldown = 2 * 60 * 60 * 1000; // 2h cooldown per ticker between alerts
+
+    for (const ticker of this.gexWatchlist) {
+      try {
+        const result = await gamma.analyze(ticker);
+        const { spotPrice, flip } = result;
+
+        if (!flip.flipStrike) continue;
+
+        const prev = this.gexState.get(ticker);
+        const now = Date.now();
+
+        // First run — just record state, don't alert
+        if (!prev) {
+          this.gexState.set(ticker, {
+            flipStrike: flip.flipStrike,
+            regime: flip.regime,
+            spotPrice,
+            lastAlertTime: 0,
+          });
+          continue;
+        }
+
+        // Check for regime change
+        const regimeChanged = prev.regime !== flip.regime;
+        const flipMoved = Math.abs(prev.flipStrike - flip.flipStrike) / prev.flipStrike > 0.02; // >2% shift
+
+        if ((regimeChanged || flipMoved) && (now - prev.lastAlertTime) > cooldown) {
+          // Build alert
+          const emoji = flip.regime === 'long_gamma' ? '🟢' : '🔴';
+          const regimeLabel = flip.regime === 'long_gamma'
+            ? 'LONG GAMMA (dealers suppress moves — chop/reversion likely)'
+            : 'SHORT GAMMA (dealers amplify moves — trend/breakout likely)';
+
+          const alert = [
+            `⚡ **GEX ALERT — ${ticker}**`,
+            ``,
+            `${emoji} **Regime: ${regimeLabel}**`,
+            `Spot: \`$${spotPrice}\` | Gamma Flip: \`$${flip.flipStrike}\``,
+            regimeChanged
+              ? `📢 Regime changed from **${prev.regime.replace('_', ' ')}** → **${flip.regime.replace('_', ' ')}**`
+              : `📢 Gamma flip shifted: \`$${prev.flipStrike}\` → \`$${flip.flipStrike}\``,
+            ``,
+            `_Use /gex ${ticker} for full chart & breakdown_`,
+          ].join('\n');
+
+          await this.postToChannel(config.tradingChannelName, alert);
+          console.log(`[Sprocket] GEX alert sent for ${ticker}: ${flip.regime}`);
+
+          this.gexState.set(ticker, {
+            flipStrike: flip.flipStrike,
+            regime: flip.regime,
+            spotPrice,
+            lastAlertTime: now,
+          });
+        } else {
+          // Update state without alerting
+          this.gexState.set(ticker, { ...prev, flipStrike: flip.flipStrike, regime: flip.regime, spotPrice });
+        }
+      } catch (err) {
+        // Don't spam logs for tickers without options data
+        if (!err.message?.includes('No options data')) {
+          console.warn(`[Sprocket] GEX monitor error for ${ticker}:`, err.message);
+        }
+      }
+    }
   }
 
   /**

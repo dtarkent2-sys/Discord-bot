@@ -7,6 +7,8 @@ const sentiment = require('../services/sentiment');
 const yahoo = require('../services/yahoo');
 const tradingAgents = require('../services/trading-agents');
 const agentSwarm = require('../services/agent-swarm');
+const gamma = require('../services/gamma');
+const { AttachmentBuilder } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 
 async function handleCommand(interaction) {
@@ -42,6 +44,8 @@ async function handleCommand(interaction) {
       return handleDeepAnalysis(interaction);
     case 'research':
       return handleResearch(interaction);
+    case 'gex':
+      return handleGEX(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   }
@@ -521,6 +525,38 @@ async function handleResearch(interaction) {
   } catch (err) {
     console.error(`[Research] Error:`, err);
     await interaction.editReply(`**Agent Swarm Research**\n❌ Research failed: ${err.message}`);
+  }
+}
+
+// ── /gex — Gamma Exposure analysis with chart ─────────────────────────
+async function handleGEX(interaction) {
+  await interaction.deferReply();
+
+  const ticker = interaction.options.getString('ticker').toUpperCase();
+
+  if (!gamma.enabled) {
+    return interaction.editReply('GEX analysis requires FMP_API_KEY to be configured.');
+  }
+
+  try {
+    await interaction.editReply(`**${ticker} — Gamma Exposure**\n⏳ Fetching options chain & calculating GEX...`);
+
+    const result = await gamma.analyze(ticker);
+
+    // Build the text summary
+    const summary = gamma.formatForDiscord(result);
+
+    // Attach the chart image
+    const attachment = new AttachmentBuilder(result.chartBuffer, { name: `${ticker}-gex.png` });
+
+    await interaction.editReply({
+      content: summary,
+      files: [attachment],
+    });
+  } catch (err) {
+    console.error(`[GEX] Error for ${ticker}:`, err);
+    const msg = err.message || 'Unknown error';
+    await interaction.editReply(`**${ticker} — Gamma Exposure**\n❌ ${msg}`);
   }
 }
 
