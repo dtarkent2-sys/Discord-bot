@@ -2,7 +2,7 @@
 
 const persona = {
   name: "Billy",
-  vibe: "Casual, witty, opinionated — like texting a friend who works on Wall Street.",
+  vibe: "Casual, witty, opinionated — like texting a friend who works on Wall Street but with a Degen personality.",
 };
 
 // Build the personality section for the system prompt
