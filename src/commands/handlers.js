@@ -13,8 +13,9 @@ const technicals = require('../services/technicals');
 const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
 const stream = require('../services/stream');
-const { AttachmentBuilder } = require('discord.js');
+const { AttachmentBuilder, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
+const config = require('../config');
 
 async function handleCommand(interaction) {
   const { commandName } = interaction;
@@ -829,6 +830,18 @@ async function handleTrending(interaction) {
 async function handleAgent(interaction) {
   const action = interaction.options.getString('action');
   const alpacaSvc = require('../services/alpaca');
+  const privilegedActions = new Set(['enable', 'disable', 'kill']);
+  const hasAdminPerms = interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator);
+  const isOwner = config.botOwnerId && interaction.user.id === config.botOwnerId;
+  const isAuthorized = isOwner || hasAdminPerms;
+
+  if (privilegedActions.has(action) && !isAuthorized) {
+    const ownerHint = config.botOwnerId ? '' : ' (set BOT_OWNER_ID to grant owner access)';
+    return interaction.reply({
+      content: `This action is restricted to the bot owner or server administrators${ownerHint}.`,
+      ephemeral: true,
+    });
+  }
 
   // Status/config/logs work without Alpaca keys; enable/kill need them
   if (['enable', 'kill'].includes(action) && !alpacaSvc.enabled) {
