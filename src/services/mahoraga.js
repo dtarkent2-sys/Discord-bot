@@ -2,9 +2,14 @@
  * SHARK — Autonomous Trading Engine
  *
  * Runs directly inside the Discord bot on Railway.
- * Core loop: Signal Ingestion → Fundamentals → Technical Analysis → LLM Decision → Trade Execution
+ * Druckenmiller top-down framework:
+ *   "50% of a stock's move is the overall market, 30% is the industry, 20% is stock picking."
+ *
+ * Pipeline: Macro Regime → Sector Rotation → Signal Scan → Fundamentals → Technicals → AI Decision → Trade
  *
  * Data sources:
+ *   - Macro engine (SPY trend, sector breadth, risk regime)
+ *   - Sector rotation (11 SPDR ETFs, multi-timeframe relative strength)
  *   - StockTwits (social sentiment / trending)
  *   - Validea (guru fundamental analysis — Buffett, Lynch, Graham, etc.)
  *   - Alpaca (market data + trade execution)
@@ -19,6 +24,8 @@ const alpaca = require('./alpaca');
 const stocktwits = require('./stocktwits');
 const technicals = require('./technicals');
 const validea = require('./validea');
+const macro = require('./macro');
+const sectors = require('./sectors');
 const policy = require('./policy');
 const ai = require('./ai');
 const config = require('../config');
@@ -134,18 +141,34 @@ class SharkEngine {
   // ── Core Trading Loop (called on schedule) ────────────────────────
 
   /**
-   * Main autonomous cycle. Called on configurable interval during market hours.
+   * Main autonomous cycle — Druckenmiller top-down framework.
    *
-   * 1. Check account + reset daily P/L
-   * 2. Monitor existing positions (stop loss / take profit)
-   * 3. Scan for new signals (StockTwits trending → technicals → LLM)
-   * 4. Execute approved trades
+   * 1. MACRO (50%) — Check market regime before doing anything
+   * 2. Account check + daily P/L reset
+   * 3. Monitor existing positions (stop loss / take profit)
+   * 4. SECTOR (30%) — Identify leading sectors for stock selection
+   * 5. STOCK PICKING (20%) — Scan candidates with full pipeline
+   * 6. Execute approved trades with regime-adjusted sizing
    */
   async runCycle() {
     if (!this.enabled) return;
 
     try {
-      // ── 1. Account check + daily reset ──
+      // ── 1. MACRO CHECK (Druckenmiller: 50% of a stock's move) ──
+      let macroRegime = { regime: 'CAUTIOUS', score: 0, positionMultiplier: 1.0, topSectors: [], bottomSectors: [] };
+      try {
+        macroRegime = await macro.getRegime();
+        this._log('macro', `Market regime: ${macroRegime.regime} (score: ${macroRegime.score}, sizing: ${macroRegime.positionMultiplier}x)`);
+
+        // In RISK_OFF, skip scanning for new positions entirely (just monitor exits)
+        if (macroRegime.regime === 'RISK_OFF') {
+          this._log('macro', 'RISK_OFF — skipping new position scan, monitoring exits only');
+        }
+      } catch (err) {
+        this._log('macro', `Macro analysis unavailable: ${err.message}`);
+      }
+
+      // ── 2. Account check + daily reset ──
       const account = await alpaca.getAccount();
       const equity = Number(account.equity || 0);
       policy.resetDaily(equity);
@@ -160,11 +183,13 @@ class SharkEngine {
 
       this._log('cycle', `Cycle started — equity: $${equity.toFixed(0)}, buying power: $${Number(account.buying_power || 0).toFixed(0)}`);
 
-      // ── 2. Monitor existing positions ──
+      // ── 3. Monitor existing positions (always run, even in RISK_OFF) ──
       await this._checkPositions();
 
-      // ── 3. Scan for new signals ──
-      await this._scanSignals(account);
+      // ── 4-5. Scan for new signals (skip if RISK_OFF macro) ──
+      if (macroRegime.regime !== 'RISK_OFF') {
+        await this._scanSignals(account, macroRegime);
+      }
 
     } catch (err) {
       console.error('[SHARK] Cycle error:', err.message);
@@ -204,7 +229,7 @@ class SharkEngine {
 
   // ── Signal Scanning ───────────────────────────────────────────────
 
-  async _scanSignals(account) {
+  async _scanSignals(account, macroRegime = {}) {
     try {
       // Get trending tickers from StockTwits
       const trending = await stocktwits.getTrending();
@@ -230,7 +255,7 @@ class SharkEngine {
         if (cfg.symbol_allowlist.length > 0 && !cfg.symbol_allowlist.includes(symbol)) continue;
 
         try {
-          await this._evaluateSignal(symbol, account, positions.length);
+          await this._evaluateSignal(symbol, account, positions.length, macroRegime);
         } catch (err) {
           if (!err.message?.includes('Not enough') && !err.message?.includes('No data')) {
             this._log('scan', `${symbol}: eval error — ${err.message}`);
@@ -245,8 +270,27 @@ class SharkEngine {
 
   // ── Evaluate a Single Signal ──────────────────────────────────────
 
-  async _evaluateSignal(symbol, account, currentPositions) {
+  async _evaluateSignal(symbol, account, currentPositions, macroRegime = {}) {
     const cfg = policy.getConfig();
+
+    // ── SECTOR CHECK (Druckenmiller: 30% of a stock's move) ──
+    let sectorAlignment = null;
+    try {
+      sectorAlignment = await sectors.checkAlignment(symbol);
+      if (sectorAlignment.sector) {
+        const alignLabel = sectorAlignment.aligned ? 'ALIGNED' : 'MISALIGNED';
+        const rankStr = sectorAlignment.sectorRank ? ` (rank ${sectorAlignment.sectorRank}/11)` : '';
+        this._log('sector', `${symbol}: ${sectorAlignment.sector} — ${alignLabel}${rankStr}`);
+      }
+
+      // In CAUTIOUS macro, skip stocks in bottom 3 sectors
+      if (macroRegime.regime === 'CAUTIOUS' && sectorAlignment.sectorRank && sectorAlignment.sectorRank >= 9) {
+        this._log('sector', `${symbol}: skipped — sector rank ${sectorAlignment.sectorRank}/11, too weak for CAUTIOUS regime`);
+        return;
+      }
+    } catch (err) {
+      this._log('sector', `${symbol}: sector check failed — ${err.message}`);
+    }
 
     // 1. Get social sentiment
     const sentiment = await stocktwits.analyzeSymbol(symbol);
@@ -302,8 +346,8 @@ class SharkEngine {
       this._log('scan', `${symbol}: Validea error — ${err.message}`);
     }
 
-    // 4. Ask AI for a decision (now with fundamentals)
-    const decision = await this._askAI(symbol, sentiment, tech, signals, netSignal, fundamentals);
+    // 4. Ask AI for a decision (full Druckenmiller context: macro + sector + fundamentals + technicals)
+    const decision = await this._askAI(symbol, sentiment, tech, signals, netSignal, fundamentals, macroRegime, sectorAlignment);
     if (!decision) {
       this._log('scan', `${symbol}: skipped — AI returned no decision`);
       return;
@@ -315,11 +359,13 @@ class SharkEngine {
 
     this._log('scan', `${symbol}: AI says BUY — confidence ${((decision.confidence || 0) * 100).toFixed(0)}%`);
 
-    // 5. Pre-trade risk check
-    const notional = Math.min(
+    // 5. Pre-trade risk check — regime-adjusted position sizing
+    const regimeMultiplier = macroRegime.positionMultiplier || 1.0;
+    const baseNotional = Math.min(
       cfg.max_notional_per_trade,
       Number(account.buying_power || 0) * cfg.position_size_pct
     );
+    const notional = baseNotional * regimeMultiplier;
 
     if (notional < 100) {
       this._log('blocked', `${symbol}: order too small ($${notional.toFixed(0)}) — need at least $100`);
@@ -361,9 +407,11 @@ class SharkEngine {
         const warnings = riskCheck.warnings.length > 0
           ? `\n⚠️ ${riskCheck.warnings.join('\n⚠️ ')}`
           : '';
+        const regimeLabel = macroRegime.regime ? ` | Macro: ${macroRegime.regime}` : '';
+        const sectorLabel = sectorAlignment?.sector ? ` | Sector: ${sectorAlignment.sector}` : '';
         await this._postToChannel(
           `💰 **SHARK Trade: BUY ${symbol}**\n` +
-          `Amount: \`$${notional.toFixed(0)}\` | Confidence: \`${((decision.confidence || 0) * 100).toFixed(0)}%\`\n` +
+          `Amount: \`$${notional.toFixed(0)}\` | Confidence: \`${((decision.confidence || 0) * 100).toFixed(0)}%\`${regimeLabel}${sectorLabel}\n` +
           `Sentiment: \`${sentiment.label} (${(sentiment.score * 100).toFixed(0)}%)\`\n` +
           `Signals: ${signals.filter(s => s.direction === 'bullish').map(s => s.description).join(', ') || 'none'}\n` +
           `Reason: ${decision.reason || 'AI recommendation'}` +
@@ -379,10 +427,30 @@ class SharkEngine {
 
   // ── AI Decision ───────────────────────────────────────────────────
 
-  async _askAI(symbol, sentiment, tech, signals, netSignal, fundamentals = null) {
+  async _askAI(symbol, sentiment, tech, signals, netSignal, fundamentals = null, macroRegime = {}, sectorAlignment = null) {
     const prompt = [
-      `You are an autonomous trading analyst. Evaluate this signal using BOTH technical and fundamental data, then decide whether to BUY or PASS.`,
+      `You are an autonomous trading analyst using Stanley Druckenmiller's top-down framework:`,
+      `"50% of a stock's move is the overall market, 30% is the industry, and 20% is stock picking."`,
       ``,
+      `Evaluate this opportunity top-down: MACRO → SECTOR → STOCK, then decide BUY or PASS.`,
+      `Be risk-averse: prefer waiting for revenue validation over chasing hype. Look for Peter Lynch-style "fast growers" — sound financials, tangible revenue growth path, attractive valuations.`,
+      ``,
+      `═══ MACRO ENVIRONMENT (50% weight) ═══`,
+      macroRegime.regime ? `  Regime: ${macroRegime.regime} (score: ${macroRegime.score})` : `  Regime: unknown`,
+      macroRegime.regime === 'RISK_ON' ? `  → Bullish macro: broad participation, positive momentum` : null,
+      macroRegime.regime === 'CAUTIOUS' ? `  → Mixed signals: be selective, favor quality` : null,
+      macroRegime.regime === 'RISK_OFF' ? `  → Bearish macro: defensive, avoid new longs` : null,
+      macroRegime.topSectors?.length > 0 ? `  Leading sectors: ${macroRegime.topSectors.join(', ')}` : null,
+      macroRegime.bottomSectors?.length > 0 ? `  Lagging sectors: ${macroRegime.bottomSectors.join(', ')}` : null,
+      ``,
+      `═══ SECTOR / INDUSTRY (30% weight) ═══`,
+      sectorAlignment?.sector ? `  Sector: ${sectorAlignment.sector} | Industry: ${sectorAlignment.industry || 'unknown'}` : `  Sector: unknown`,
+      sectorAlignment?.sectorEtf ? `  Sector ETF: ${sectorAlignment.sectorEtf} (rank ${sectorAlignment.sectorRank || '?'}/11)` : null,
+      sectorAlignment?.sectorPerf ? `  Sector returns — Day: ${sectorAlignment.sectorPerf.daily}% | Week: ${sectorAlignment.sectorPerf.weekly}% | Month: ${sectorAlignment.sectorPerf.monthly}% | Qtr: ${sectorAlignment.sectorPerf.quarterly}%` : null,
+      sectorAlignment?.aligned === false ? `  ⚠ SECTOR MISALIGNED — lagging sector, higher risk` : null,
+      sectorAlignment?.aligned === true && sectorAlignment?.sectorRank ? `  ✓ Sector aligned — top-half performer` : null,
+      ``,
+      `═══ STOCK ANALYSIS (20% weight) ═══`,
       `Symbol: ${symbol}`,
       `Price: $${tech.price?.toFixed(2)}`,
       ``,
@@ -397,7 +465,7 @@ class SharkEngine {
       tech.atr_14 !== null ? `  ATR(14): $${tech.atr_14.toFixed(2)}` : null,
       tech.relative_volume !== null ? `  Volume: ${tech.relative_volume.toFixed(1)}x average` : null,
       ``,
-      `Detected Technical Signals:`,
+      `Technical Signals:`,
       ...signals.map(s => `  [${s.direction.toUpperCase()}] ${s.description} (strength: ${(s.strength * 100).toFixed(0)}%)`),
       `  Net bullish score: ${netSignal.toFixed(2)}`,
       ``,
@@ -406,16 +474,20 @@ class SharkEngine {
         `Fundamental Analysis (Validea Guru Scores):`,
         `  Overall: ${fundamentals.label} (${(fundamentals.score * 100).toFixed(0)}% avg across ${fundamentals.strategies} strategies)`,
         fundamentals.topGuru ? `  Top Guru: ${fundamentals.topGuru}` : null,
-        `  (Scores based on Buffett, Lynch, Graham, Greenblatt & 18+ other guru models)`,
-        `  A score above 80% = "Some Interest", above 90% = "Strong Interest" from that guru's criteria`,
+        `  (Buffett, Lynch, Graham, Greenblatt & 18+ guru models — 90%+ = Strong Interest)`,
         ``,
       ] : [
         `Fundamental Analysis: unavailable`,
         ``,
       ]),
-      `Consider fundamentals alongside technicals. Strong fundamentals (high guru scores) should increase confidence. Weak fundamentals should decrease confidence even if technicals look good.`,
+      `═══ DECISION FRAMEWORK ═══`,
+      `1. If macro is RISK_OFF, default to PASS unless exceptional setup`,
+      `2. If sector is lagging (rank 8+ of 11), require very strong stock-level conviction`,
+      `3. Favor stocks with both strong technicals AND strong fundamentals`,
+      `4. Avoid chasing social hype without fundamental backing`,
+      `5. Look for revenue validation — not just momentum or social buzz`,
       ``,
-      `Respond with ONLY valid JSON: {"action": "buy" or "pass", "confidence": 0.0-1.0, "reason": "brief explanation referencing both technical and fundamental factors"}`,
+      `Respond with ONLY valid JSON: {"action": "buy" or "pass", "confidence": 0.0-1.0, "reason": "brief explanation referencing macro, sector, and stock-level factors"}`,
     ].filter(Boolean).join('\n');
 
     try {

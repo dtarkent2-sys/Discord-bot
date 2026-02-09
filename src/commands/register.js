@@ -180,6 +180,14 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName('macro')
+    .setDescription('Macro environment — market regime, benchmarks, breadth, risk signals'),
+
+  new SlashCommandBuilder()
+    .setName('sectors')
+    .setDescription('Sector rotation heatmap — leading/lagging sectors with multi-timeframe returns'),
+
+  new SlashCommandBuilder()
     .setName('agent')
     .setDescription('Control the SHARK autonomous trading agent')
     .addStringOption(opt =>

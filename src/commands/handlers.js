@@ -14,6 +14,8 @@ const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
 const stream = require('../services/stream');
 const validea = require('../services/validea');
+const macro = require('../services/macro');
+const sectors = require('../services/sectors');
 const { AttachmentBuilder, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -63,6 +65,10 @@ async function handleCommand(interaction) {
       return handleTrending(interaction);
     case 'validea':
       return handleValidea(interaction);
+    case 'macro':
+      return handleMacro(interaction);
+    case 'sectors':
+      return handleSectors(interaction);
     case 'agent':
       return handleAgent(interaction);
     case 'stream':
@@ -272,7 +278,8 @@ async function handleHelp(interaction) {
   const lines = [
     '**Commands**',
     '`/ask` — Chat with AI | `/analyze` `/deepanalysis` — Stock analysis',
-    '`/price` — Quick quote | `/technicals` — RSI, MACD, Bollinger | `/validea` — Guru fundamentals',
+    '`/price` — Quick quote | `/technicals` — RSI, MACD, Bollinger',
+    '`/macro` — Market regime | `/sectors` — Sector rotation | `/validea` — Guru scores',
     '`/gex` — Gamma exposure | `/news` — Market news',
     '`/research` — Agent Swarm research | `/screen` — Stock screener',
     '`/social` `/trending` — StockTwits sentiment',
@@ -810,6 +817,49 @@ async function handleTrending(interaction) {
   } catch (err) {
     console.error(`[Trending] Error:`, err);
     await interaction.editReply(`**Trending Tickers**\n❌ ${err.message}`);
+  }
+}
+
+// ── /macro — Macro environment analysis ───────────────────────────
+async function handleMacro(interaction) {
+  await interaction.deferReply();
+
+  try {
+    await interaction.editReply('**Macro Environment**\n⏳ Analyzing market regime, benchmarks, sector breadth...');
+
+    const result = await macro.analyze();
+    const formatted = macro.formatForDiscord(result);
+
+    // Check length — macro output can be long
+    if (formatted.length <= 2000) {
+      await interaction.editReply(formatted);
+    } else {
+      await interaction.editReply(formatted.slice(0, 1990) + '...');
+    }
+  } catch (err) {
+    console.error('[Macro] Error:', err);
+    await interaction.editReply(`**Macro Environment**\n❌ ${err.message}`);
+  }
+}
+
+// ── /sectors — Sector rotation heatmap ────────────────────────────
+async function handleSectors(interaction) {
+  await interaction.deferReply();
+
+  try {
+    await interaction.editReply('**Sector Rotation**\n⏳ Fetching sector ETF performance data...');
+
+    const performance = await sectors.getSectorPerformance();
+    const formatted = sectors.formatForDiscord(performance);
+
+    if (formatted.length <= 2000) {
+      await interaction.editReply(formatted);
+    } else {
+      await interaction.editReply(formatted.slice(0, 1990) + '...');
+    }
+  } catch (err) {
+    console.error('[Sectors] Error:', err);
+    await interaction.editReply(`**Sector Rotation**\n❌ ${err.message}`);
   }
 }
 
