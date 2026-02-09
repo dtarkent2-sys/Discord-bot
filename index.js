@@ -1,10 +1,12 @@
 // ── Process-level error handlers (before any other imports) ─────────
-// Prevent unhandled errors from silently crashing the process.
+// Log the error for diagnostics, then exit so Railway can restart the process.
 process.on('uncaughtException', (err) => {
   console.error('[FATAL] Uncaught exception:', err);
+  process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
   console.error('[FATAL] Unhandled rejection:', reason);
+  process.exit(1);
 });
 
 // ── Start health server IMMEDIATELY ─────────────────────────────────
@@ -208,4 +210,7 @@ if (!config.token) {
   process.exit(1);
 }
 
-client.login(config.token);
+client.login(config.token).catch((err) => {
+  console.error('[FATAL] Discord login failed:', err.message);
+  process.exit(1);
+});
