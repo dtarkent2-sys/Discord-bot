@@ -171,6 +171,15 @@ const commands = [
     .setDescription('See what tickers are trending on StockTwits right now'),
 
   new SlashCommandBuilder()
+    .setName('reddit')
+    .setDescription('Reddit social sentiment — trending tickers and per-symbol discussion from 4 subreddits')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock symbol (e.g. AAPL) — omit to see trending tickers')
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
     .setName('validea')
     .setDescription('Validea guru fundamental analysis — scores from Buffett, Lynch, Graham & more')
     .addStringOption(opt =>

@@ -11,10 +11,13 @@
  *   - Macro engine (SPY trend, sector breadth, risk regime)
  *   - Sector rotation (11 SPDR ETFs, multi-timeframe relative strength)
  *   - StockTwits (social sentiment / trending)
+ *   - Reddit (r/wallstreetbets, r/stocks, r/investing, r/options)
  *   - Validea (guru fundamental analysis — Buffett, Lynch, Graham, etc.)
  *   - Alpaca (market data + trade execution)
  *   - Technicals engine (RSI, MACD, Bollinger, etc.)
  *
+ * Signal cache: persistent cache to avoid re-evaluating same tickers
+ * Order flow: two-step preview → approval token → submit (MAHORAGA reference)
  * Risk management via policy.js (kill switch, position limits, stop losses, etc.)
  *
  * Based on https://github.com/ygwyg/SHARK (MIT license)
@@ -22,11 +25,13 @@
 
 const alpaca = require('./alpaca');
 const stocktwits = require('./stocktwits');
+const reddit = require('./reddit');
 const technicals = require('./technicals');
 const validea = require('./validea');
 const macro = require('./macro');
 const sectors = require('./sectors');
 const policy = require('./policy');
+const signalCache = require('./signal-cache');
 const ai = require('./ai');
 const config = require('../config');
 const Storage = require('./storage');
@@ -231,19 +236,34 @@ class SharkEngine {
 
   async _scanSignals(account, macroRegime = {}) {
     try {
-      // Get trending tickers from StockTwits
-      const trending = await stocktwits.getTrending();
-      if (!trending || trending.length === 0) {
-        this._log('scan', 'No trending tickers from StockTwits — nothing to scan');
+      // Get trending tickers from StockTwits + Reddit (dual social signal sources)
+      const [stTrending, redditTrending] = await Promise.allSettled([
+        stocktwits.getTrending(),
+        reddit.getTrendingTickers(),
+      ]);
+
+      const stSymbols = (stTrending.status === 'fulfilled' && stTrending.value || []).slice(0, 5).map(t => t.symbol);
+      const rdSymbols = (redditTrending.status === 'fulfilled' && redditTrending.value || []).slice(0, 5).map(t => t.symbol);
+
+      // Merge and deduplicate — StockTwits first, then Reddit extras
+      const seen = new Set();
+      const candidates = [];
+      for (const sym of [...stSymbols, ...rdSymbols]) {
+        if (!seen.has(sym)) {
+          seen.add(sym);
+          candidates.push(sym);
+        }
+      }
+
+      if (candidates.length === 0) {
+        this._log('scan', 'No trending tickers from StockTwits or Reddit — nothing to scan');
         return;
       }
 
-      // Pick top 5 trending symbols to evaluate
-      const candidates = trending.slice(0, 5).map(t => t.symbol);
       const positions = await alpaca.getPositions();
       const positionSymbols = new Set(positions.map(p => p.symbol));
 
-      this._log('scan', `Scanning ${candidates.length} candidates: ${candidates.join(', ')} (${positions.length} positions open)`);
+      this._log('scan', `Scanning ${candidates.length} candidates: ${candidates.join(', ')} (ST: ${stSymbols.length}, Reddit: ${rdSymbols.length}, ${positions.length} positions open)`);
 
       for (const symbol of candidates) {
         // Skip if we already hold this
@@ -273,6 +293,13 @@ class SharkEngine {
   async _evaluateSignal(symbol, account, currentPositions, macroRegime = {}) {
     const cfg = policy.getConfig();
 
+    // ── SIGNAL CACHE CHECK — skip if recently evaluated ──
+    const cached = signalCache.get(symbol);
+    if (cached.cached) {
+      this._log('cache', `${symbol}: cached ${cached.signal.decision} (${Math.round((Date.now() - cached.signal.evaluatedAt) / 60000)}m ago) — skipping`);
+      return;
+    }
+
     // ── SECTOR CHECK (Druckenmiller: 30% of a stock's move) ──
     let sectorAlignment = null;
     try {
@@ -286,18 +313,31 @@ class SharkEngine {
       // In CAUTIOUS macro, skip stocks in bottom 3 sectors
       if (macroRegime.regime === 'CAUTIOUS' && sectorAlignment.sectorRank && sectorAlignment.sectorRank >= 9) {
         this._log('sector', `${symbol}: skipped — sector rank ${sectorAlignment.sectorRank}/11, too weak for CAUTIOUS regime`);
+        signalCache.skip(symbol, `sector rank ${sectorAlignment.sectorRank}/11 in CAUTIOUS`);
         return;
       }
     } catch (err) {
       this._log('sector', `${symbol}: sector check failed — ${err.message}`);
     }
 
-    // 1. Get social sentiment
-    const sentiment = await stocktwits.analyzeSymbol(symbol);
+    // 1. Get social sentiment — StockTwits + Reddit (parallel)
+    const [stResult, rdResult] = await Promise.allSettled([
+      stocktwits.analyzeSymbol(symbol),
+      reddit.analyzeSymbol(symbol),
+    ]);
 
-    // Quick filter: skip if sentiment is too weak
-    if (Math.abs(sentiment.score) < cfg.min_sentiment_score) {
-      this._log('scan', `${symbol}: skipped — sentiment ${(sentiment.score * 100).toFixed(0)}% below threshold ${(cfg.min_sentiment_score * 100).toFixed(0)}%`);
+    const stSentiment = stResult.status === 'fulfilled' ? stResult.value : { score: 0, label: 'unknown', bullish: 0, bearish: 0, neutral: 0, messages: 0 };
+    const rdSentiment = rdResult.status === 'fulfilled' ? rdResult.value : { score: 0, sentiment: 'none', mentions: 0 };
+
+    // Combined social score: weight StockTwits (60%) + Reddit (40%)
+    const combinedSocialScore = rdSentiment.mentions > 0
+      ? (stSentiment.score * 0.6) + (rdSentiment.score * 0.4)
+      : stSentiment.score;
+
+    // Quick filter: skip if combined sentiment is too weak
+    if (Math.abs(combinedSocialScore) < cfg.min_sentiment_score) {
+      this._log('scan', `${symbol}: skipped — social ${(combinedSocialScore * 100).toFixed(0)}% below threshold ${(cfg.min_sentiment_score * 100).toFixed(0)}% (ST: ${(stSentiment.score * 100).toFixed(0)}%, Reddit: ${(rdSentiment.score * 100).toFixed(0)}%)`);
+      signalCache.skip(symbol, `weak social sentiment ${(combinedSocialScore * 100).toFixed(0)}%`);
       return;
     }
 
@@ -307,12 +347,14 @@ class SharkEngine {
       techResult = await technicals.analyze(symbol);
     } catch (err) {
       this._log('scan', `${symbol}: skipped — technicals unavailable (${err.message})`);
+      signalCache.skip(symbol, `technicals unavailable`);
       return;
     }
 
     const { technicals: tech, signals } = techResult;
     if (!tech || !tech.price) {
       this._log('scan', `${symbol}: skipped — no price data from technicals`);
+      signalCache.skip(symbol, `no price data`);
       return;
     }
 
@@ -328,10 +370,11 @@ class SharkEngine {
     // Skip if signals are mixed / weak — but use a lower threshold (0.3 instead of 0.5)
     if (netSignal < 0.3) {
       this._log('scan', `${symbol}: skipped — net signal ${netSignal.toFixed(2)} too weak (need 0.3+, bull: ${bullishScore.toFixed(2)}, bear: ${bearishScore.toFixed(2)})`);
+      signalCache.skip(symbol, `weak net signal ${netSignal.toFixed(2)}`);
       return;
     }
 
-    this._log('scan', `${symbol}: passed filters — sentiment ${(sentiment.score * 100).toFixed(0)}%, net signal ${netSignal.toFixed(2)}, price $${tech.price.toFixed(2)}`);
+    this._log('scan', `${symbol}: passed filters — social ${(combinedSocialScore * 100).toFixed(0)}% (ST: ${(stSentiment.score * 100).toFixed(0)}%, Reddit: ${rdSentiment.mentions} mentions), net signal ${netSignal.toFixed(2)}, price $${tech.price.toFixed(2)}`);
 
     // 3b. Get fundamental analysis from Validea (non-blocking — don't fail if unavailable)
     let fundamentals = null;
@@ -346,14 +389,24 @@ class SharkEngine {
       this._log('scan', `${symbol}: Validea error — ${err.message}`);
     }
 
-    // 4. Ask AI for a decision (full Druckenmiller context: macro + sector + fundamentals + technicals)
-    const decision = await this._askAI(symbol, sentiment, tech, signals, netSignal, fundamentals, macroRegime, sectorAlignment);
+    // 4. Ask AI for a decision (full Druckenmiller context: macro + sector + fundamentals + technicals + social)
+    const decision = await this._askAI(symbol, stSentiment, tech, signals, netSignal, fundamentals, macroRegime, sectorAlignment, rdSentiment);
     if (!decision) {
       this._log('scan', `${symbol}: skipped — AI returned no decision`);
+      signalCache.error(symbol, 'AI returned no decision');
       return;
     }
     if (decision.action !== 'buy') {
       this._log('scan', `${symbol}: AI says PASS — confidence ${((decision.confidence || 0) * 100).toFixed(0)}%, reason: ${decision.reason || 'none'}`);
+      signalCache.set(symbol, {
+        decision: 'pass',
+        confidence: decision.confidence,
+        reason: decision.reason,
+        sentimentScore: combinedSocialScore,
+        netSignal,
+        macroRegime,
+        sectorAlignment,
+      });
       return;
     }
 
@@ -372,24 +425,32 @@ class SharkEngine {
       return;
     }
 
-    const riskCheck = policy.evaluate({
+    // 6. Two-step order flow: Preview → Approval Token → Submit
+    //    (matches MAHORAGA reference architecture)
+    const preview = policy.preview({
       symbol,
       side: 'buy',
       notional,
       currentPositions,
       currentEquity: Number(account.equity || 0),
       buyingPower: Number(account.buying_power || 0),
-      sentimentScore: sentiment.score,
+      sentimentScore: combinedSocialScore,
       confidence: decision.confidence || 0,
     });
 
-    if (!riskCheck.allowed) {
-      this._log('blocked', `${symbol}: ${riskCheck.violations.join('; ')}`);
+    if (!preview.approved) {
+      this._log('blocked', `${symbol}: ${preview.violations.join('; ')}`);
       return;
     }
 
-    // 6. Execute the trade
+    // 7. Validate token and execute the trade
     try {
+      const tokenCheck = policy.validateToken(preview.token, { symbol });
+      if (!tokenCheck.valid) {
+        this._log('blocked', `${symbol}: approval token invalid — ${tokenCheck.error}`);
+        return;
+      }
+
       const order = await alpaca.createOrder({
         symbol,
         notional: notional.toFixed(2),
@@ -399,20 +460,31 @@ class SharkEngine {
       });
 
       policy.recordTrade(symbol);
+      signalCache.set(symbol, {
+        decision: 'buy',
+        confidence: decision.confidence,
+        reason: decision.reason,
+        sentimentScore: combinedSocialScore,
+        netSignal,
+        macroRegime,
+        sectorAlignment,
+      });
+
       this._log('trade', `BUY ${symbol} — $${notional.toFixed(0)} (confidence: ${((decision.confidence || 0) * 100).toFixed(0)}%)`);
       console.log(`[SHARK] BUY ${symbol} — $${notional.toFixed(0)}`);
 
       // Alert Discord
       if (this._postToChannel) {
-        const warnings = riskCheck.warnings.length > 0
-          ? `\n⚠️ ${riskCheck.warnings.join('\n⚠️ ')}`
+        const warnings = preview.warnings?.length > 0
+          ? `\n⚠️ ${preview.warnings.join('\n⚠️ ')}`
           : '';
         const regimeLabel = macroRegime.regime ? ` | Macro: ${macroRegime.regime}` : '';
         const sectorLabel = sectorAlignment?.sector ? ` | Sector: ${sectorAlignment.sector}` : '';
+        const redditLabel = rdSentiment.mentions > 0 ? ` | Reddit: ${rdSentiment.mentions} mentions` : '';
         await this._postToChannel(
           `💰 **SHARK Trade: BUY ${symbol}**\n` +
           `Amount: \`$${notional.toFixed(0)}\` | Confidence: \`${((decision.confidence || 0) * 100).toFixed(0)}%\`${regimeLabel}${sectorLabel}\n` +
-          `Sentiment: \`${sentiment.label} (${(sentiment.score * 100).toFixed(0)}%)\`\n` +
+          `Social: \`ST ${stSentiment.label} (${(stSentiment.score * 100).toFixed(0)}%)\`${redditLabel}\n` +
           `Signals: ${signals.filter(s => s.direction === 'bullish').map(s => s.description).join(', ') || 'none'}\n` +
           `Reason: ${decision.reason || 'AI recommendation'}` +
           warnings +
@@ -427,7 +499,7 @@ class SharkEngine {
 
   // ── AI Decision ───────────────────────────────────────────────────
 
-  async _askAI(symbol, sentiment, tech, signals, netSignal, fundamentals = null, macroRegime = {}, sectorAlignment = null) {
+  async _askAI(symbol, sentiment, tech, signals, netSignal, fundamentals = null, macroRegime = {}, sectorAlignment = null, redditData = null) {
     const prompt = [
       `You are an autonomous trading analyst using Stanley Druckenmiller's top-down framework:`,
       `"50% of a stock's move is the overall market, 30% is the industry, and 20% is stock picking."`,
@@ -457,6 +529,17 @@ class SharkEngine {
       `Social Sentiment (StockTwits):`,
       `  Score: ${(sentiment.score * 100).toFixed(0)}% | ${sentiment.bullish} bullish / ${sentiment.bearish} bearish / ${sentiment.neutral} neutral (${sentiment.messages} posts)`,
       ``,
+      // Reddit social data
+      ...(redditData && redditData.mentions > 0 ? [
+        `Social Sentiment (Reddit):`,
+        `  ${redditData.sentiment} — ${redditData.mentions} mentions across ${redditData.subreddits?.join(', ') || 'Reddit'}`,
+        `  Score: ${(redditData.score * 100).toFixed(0)}% | Upvote ratio: ${((redditData.avgUpvoteRatio || 0) * 100).toFixed(0)}%`,
+        ...(redditData.posts?.slice(0, 2).map(p => `  Recent: [r/${p.subreddit}] ${p.title}`) || []),
+        ``,
+      ] : [
+        `Social Sentiment (Reddit): no mentions found`,
+        ``,
+      ]),
       `Technical Indicators:`,
       tech.rsi_14 !== null ? `  RSI(14): ${tech.rsi_14.toFixed(1)}` : null,
       tech.macd ? `  MACD: ${tech.macd.macd.toFixed(3)} | Signal: ${tech.macd.signal.toFixed(3)} | Histogram: ${tech.macd.histogram.toFixed(3)}` : null,
@@ -566,13 +649,28 @@ class SharkEngine {
       steps.push(`Already holding ${symbol}`);
     }
 
-    // 3. Sentiment (optional — don't block on failure)
+    // 3. Social sentiment — StockTwits + Reddit in parallel
     let sentimentResult = { score: 0, label: 'unknown', bullish: 0, bearish: 0, neutral: 0, messages: 0 };
+    let redditResult = { score: 0, sentiment: 'none', mentions: 0 };
     try {
-      sentimentResult = await stocktwits.analyzeSymbol(symbol);
-      steps.push(`Sentiment: ${sentimentResult.label} (${(sentimentResult.score * 100).toFixed(0)}%)`);
+      const [stResult, rdResult] = await Promise.allSettled([
+        stocktwits.analyzeSymbol(symbol),
+        reddit.analyzeSymbol(symbol),
+      ]);
+      if (stResult.status === 'fulfilled') {
+        sentimentResult = stResult.value;
+        steps.push(`StockTwits: ${sentimentResult.label} (${(sentimentResult.score * 100).toFixed(0)}%)`);
+      } else {
+        steps.push(`StockTwits: unavailable`);
+      }
+      if (rdResult.status === 'fulfilled') {
+        redditResult = rdResult.value;
+        steps.push(`Reddit: ${redditResult.sentiment} (${redditResult.mentions} mentions, ${(redditResult.score * 100).toFixed(0)}%)`);
+      } else {
+        steps.push(`Reddit: unavailable`);
+      }
     } catch (err) {
-      steps.push(`Sentiment: unavailable (${err.message})`);
+      steps.push(`Social: unavailable (${err.message})`);
     }
 
     // 4. Technical analysis (optional — don't block on failure)
@@ -611,7 +709,7 @@ class SharkEngine {
         return { success: false, message: 'Cannot evaluate — no price data available.', details: { steps } };
       }
       try {
-        decision = await this._askAI(symbol, sentimentResult, tech, signals, netSignal, fundamentals);
+        decision = await this._askAI(symbol, sentimentResult, tech, signals, netSignal, fundamentals, {}, null, redditResult);
         if (!decision) {
           steps.push('AI: no response');
           return { success: false, message: `AI returned no decision for ${symbol}.`, details: { steps } };
@@ -638,8 +736,8 @@ class SharkEngine {
     }
     steps.push(`Order size: $${notional.toFixed(0)}`);
 
-    // 7. Risk check (always runs, even for force)
-    const riskCheck = policy.evaluate({
+    // 7. Two-step order flow: Preview → Approval Token → Submit
+    const preview = policy.preview({
       symbol,
       side: 'buy',
       notional,
@@ -650,17 +748,23 @@ class SharkEngine {
       confidence: decision.confidence || 0,
     });
 
-    if (!riskCheck.allowed) {
-      steps.push(`Risk: BLOCKED — ${riskCheck.violations.join('; ')}`);
-      return { success: false, message: `Risk check failed: ${riskCheck.violations.join('; ')}`, details: { steps } };
+    if (!preview.approved) {
+      steps.push(`Risk: BLOCKED — ${preview.violations.join('; ')}`);
+      return { success: false, message: `Risk check failed: ${preview.violations.join('; ')}`, details: { steps } };
     }
-    if (riskCheck.warnings.length > 0) {
-      steps.push(`Risk warnings: ${riskCheck.warnings.join('; ')}`);
+    if (preview.warnings?.length > 0) {
+      steps.push(`Risk warnings: ${preview.warnings.join('; ')}`);
     }
-    steps.push('Risk: PASSED');
+    steps.push(`Risk: PASSED (approval token issued, expires in 5 min)`);
 
-    // 8. Execute
+    // 8. Validate token and execute
     try {
+      const tokenCheck = policy.validateToken(preview.token, { symbol });
+      if (!tokenCheck.valid) {
+        steps.push(`Token: INVALID — ${tokenCheck.error}`);
+        return { success: false, message: `Approval token failed: ${tokenCheck.error}`, details: { steps } };
+      }
+
       const order = await alpaca.createOrder({
         symbol,
         notional: notional.toFixed(2),
@@ -670,6 +774,14 @@ class SharkEngine {
       });
 
       policy.recordTrade(symbol);
+      signalCache.set(symbol, {
+        decision: 'buy',
+        confidence: decision.confidence,
+        reason: decision.reason,
+        sentimentScore: sentimentResult.score,
+        netSignal,
+      });
+
       this._log('trade', `MANUAL BUY ${symbol} — $${notional.toFixed(0)}${force ? ' (force)' : ''} (confidence: ${((decision.confidence || 0) * 100).toFixed(0)}%)`);
       console.log(`[SHARK] MANUAL BUY ${symbol} — $${notional.toFixed(0)}`);
       steps.push(`ORDER PLACED: market buy $${notional.toFixed(0)} of ${symbol}`);
