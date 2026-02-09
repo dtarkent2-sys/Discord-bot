@@ -1,9 +1,12 @@
 /**
  * Gamma Exposure (GEX) Engine
  *
- * Pulls options chain data from FMP, calculates per-strike gamma exposure
- * using Black-Scholes, finds the gamma flip point (where net GEX crosses
- * zero), and generates bar-chart PNGs for Discord.
+ * Pulls options chain data from Yahoo Finance (free, no API key needed),
+ * calculates per-strike gamma exposure using Black-Scholes, finds the
+ * gamma flip point, and generates bar-chart PNGs for Discord.
+ *
+ * Data source: Yahoo Finance options endpoint (OI, IV, strikes, expirations)
+ * Spot price: FMP quote (already configured) with Yahoo fallback
  *
  * Key concepts:
  *   - GEX per strike = (CallOI × CallGamma − PutOI × PutGamma) × 100 × Spot
@@ -15,91 +18,158 @@
 const config = require('../config');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 
+const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
-const RISK_FREE_RATE = 0.045; // approximate 10Y yield — tweak as needed
+const RISK_FREE_RATE = 0.045; // approximate 10Y yield
 
-// Reusable chart renderer (600×400, dark theme)
+// Reusable chart renderer (dark theme)
 const chartRenderer = new ChartJSNodeCanvas({ width: 700, height: 420, backgroundColour: '#1e1e2e' });
+
+// Yahoo expects browser-like headers
+const YAHOO_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'application/json',
+};
 
 class GammaService {
   get enabled() {
-    return !!config.fmpApiKey;
+    // Works with or without FMP — Yahoo Finance provides options data for free
+    return true;
   }
 
-  // ── FMP fetch helper (mirrors yahoo.js pattern) ──────────────────────
+  // ── Yahoo Finance options chain ──────────────────────────────────────
 
-  async _fmpFetch(endpoint, params = {}) {
-    if (!config.fmpApiKey) throw new Error('FMP_API_KEY not set');
+  /**
+   * Fetch options chain from Yahoo Finance.
+   * Returns { calls: [...], puts: [...], spotPrice, expirations: [epoch, ...] }
+   *
+   * @param {string} ticker - stock symbol
+   * @param {number} [expirationEpoch] - specific expiration as unix timestamp (seconds)
+   */
+  async _yahooFetch(ticker, expirationEpoch) {
+    let url = `${YAHOO_OPTIONS_BASE}/${encodeURIComponent(ticker)}`;
+    if (expirationEpoch) url += `?date=${expirationEpoch}`;
 
-    const url = new URL(`${FMP_BASE}${endpoint}`);
-    url.searchParams.set('apikey', config.fmpApiKey);
-    for (const [k, v] of Object.entries(params)) {
-      url.searchParams.set(k, String(v));
-    }
-
-    console.log(`[Gamma] Fetching: ${endpoint} ${JSON.stringify(params)}`);
-    const res = await fetch(url.toString(), {
-      headers: { Accept: 'application/json' },
-      signal: AbortSignal.timeout(20000),
+    console.log(`[Gamma] Yahoo options: ${ticker}${expirationEpoch ? ` exp=${expirationEpoch}` : ''}`);
+    const res = await fetch(url, {
+      headers: YAHOO_HEADERS,
+      signal: AbortSignal.timeout(15000),
     });
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`FMP ${res.status}: ${text.slice(0, 200)}`);
+      throw new Error(`Yahoo Finance ${res.status}: ${text.slice(0, 200)}`);
     }
 
-    return res.json();
-  }
+    const data = await res.json();
+    const result = data?.optionChain?.result?.[0];
+    if (!result) throw new Error(`No options data found for ${ticker}`);
 
-  // ── Options chain from FMP ───────────────────────────────────────────
+    return result;
+  }
 
   /**
    * Fetch the full options chain for a ticker.
-   * Returns an array of { strike, expiration, type, openInterest, impliedVolatility, ... }
+   * First call gets available expirations + first expiration's chain.
+   * Returns a unified array of { strike, expiration, type, openInterest, impliedVolatility }
    */
   async fetchOptionsChain(ticker) {
     const upper = ticker.toUpperCase();
 
-    const data = await this._fmpFetch('/options/chain', { symbol: upper });
-    const chain = Array.isArray(data) ? data : [];
+    // First fetch — gets list of all expirations + data for the nearest one
+    const initial = await this._yahooFetch(upper);
+    const spotPrice = initial.quote?.regularMarketPrice;
+    const expirations = initial.expirationDates || [];
+
+    if (expirations.length === 0) {
+      throw new Error(`No options expirations found for ${upper}. This ticker may not have listed options.`);
+    }
+
+    // Pick the best expiration: 14-45 days out, or nearest if none in that range
+    const now = Date.now() / 1000;
+    const targetExps = expirations.filter(e => {
+      const days = (e - now) / 86400;
+      return days >= 7 && days <= 50;
+    });
+
+    // Pick the one closest to 30 days out
+    let bestExp;
+    if (targetExps.length > 0) {
+      bestExp = targetExps.reduce((best, e) =>
+        Math.abs((e - now) / 86400 - 30) < Math.abs((best - now) / 86400 - 30) ? e : best
+      );
+    } else {
+      // Fallback: nearest future expiration
+      bestExp = expirations.find(e => e > now) || expirations[0];
+    }
+
+    // Fetch that specific expiration's chain
+    const chainData = bestExp === expirations[0]
+      ? initial // Already have it from the initial fetch
+      : await this._yahooFetch(upper, bestExp);
+
+    const options = chainData.options?.[0];
+    if (!options) throw new Error(`No options contracts returned for ${upper}`);
+
+    // Unify calls and puts into a single array
+    const chain = [];
+    const expDate = new Date(bestExp * 1000).toISOString().slice(0, 10);
+
+    for (const c of (options.calls || [])) {
+      chain.push({
+        strike: c.strike,
+        expiration: expDate,
+        expirationEpoch: bestExp,
+        type: 'call',
+        openInterest: c.openInterest || 0,
+        impliedVolatility: c.impliedVolatility || 0,
+        volume: c.volume || 0,
+        lastPrice: c.lastPrice || 0,
+        bid: c.bid || 0,
+        ask: c.ask || 0,
+      });
+    }
+    for (const p of (options.puts || [])) {
+      chain.push({
+        strike: p.strike,
+        expiration: expDate,
+        expirationEpoch: bestExp,
+        type: 'put',
+        openInterest: p.openInterest || 0,
+        impliedVolatility: p.impliedVolatility || 0,
+        volume: p.volume || 0,
+        lastPrice: p.lastPrice || 0,
+        bid: p.bid || 0,
+        ask: p.ask || 0,
+      });
+    }
 
     if (chain.length === 0) {
-      throw new Error(`No options data returned for ${upper}. The ticker may not have listed options or your FMP plan may not include options data.`);
+      throw new Error(`Options chain for ${upper} is empty — no contracts with data.`);
     }
 
-    return chain;
+    return { chain, spotPrice, expiration: expDate, expirationEpoch: bestExp };
   }
 
-  /**
-   * Get the nearest monthly expiration from a chain.
-   * Picks the expiration with the most open interest that's 14-45 days out
-   * (the "front month" where gamma is most concentrated).
-   */
-  pickFrontExpiration(chain) {
-    const now = Date.now();
-    const minDays = 7;
-    const maxDays = 50;
+  // ── FMP spot price (fallback) ────────────────────────────────────────
 
-    // Group OI by expiration
-    const oiByExp = {};
-    for (const opt of chain) {
-      const exp = opt.expiration || opt.expirationDate;
-      if (!exp) continue;
-      const daysOut = (new Date(exp) - now) / 86400000;
-      if (daysOut < minDays || daysOut > maxDays) continue;
-      oiByExp[exp] = (oiByExp[exp] || 0) + (opt.openInterest || 0);
+  async _fmpSpotPrice(ticker) {
+    if (!config.fmpApiKey) return null;
+    try {
+      const url = new URL(`${FMP_BASE}/quote`);
+      url.searchParams.set('symbol', ticker);
+      url.searchParams.set('apikey', config.fmpApiKey);
+      const res = await fetch(url.toString(), {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const q = Array.isArray(data) ? data[0] : data;
+      return q?.price || null;
+    } catch {
+      return null;
     }
-
-    const exps = Object.entries(oiByExp);
-    if (exps.length === 0) {
-      // Fallback: nearest expiration overall
-      const allExps = [...new Set(chain.map(o => o.expiration || o.expirationDate).filter(Boolean))].sort();
-      return allExps[0] || null;
-    }
-
-    // Pick the one with max OI
-    exps.sort((a, b) => b[1] - a[1]);
-    return exps[0][0];
   }
 
   // ── Black-Scholes gamma ──────────────────────────────────────────────
@@ -131,36 +201,30 @@ class GammaService {
   /**
    * Calculate net Gamma Exposure (GEX) per strike.
    *
-   * For each strike:
-   *   callGEX = callOI × bsGamma(call) × 100 × spotPrice
-   *   putGEX  = putOI  × bsGamma(put)  × 100 × spotPrice
-   *   netGEX  = callGEX − putGEX
-   *
    * Dealer positioning: dealers are opposite side of retail,
    * so calls sold by dealers = positive gamma, puts sold = negative gamma.
    *
-   * @param {Array} chain - full options chain from FMP
+   * @param {Array} chain - unified options array
    * @param {number} spotPrice - current underlying price
-   * @param {string} [expiration] - filter to a specific expiration (optional)
    * @returns {{ strikes: number[], gex: number[], totalGEX: number, maxGEX: {strike,value}, minGEX: {strike,value} }}
    */
-  calculateGEX(chain, spotPrice, expiration) {
+  calculateGEX(chain, spotPrice) {
     const now = Date.now();
     const gexMap = new Map(); // strike → net GEX
 
     for (const opt of chain) {
-      const exp = opt.expiration || opt.expirationDate;
-      if (expiration && exp !== expiration) continue;
-
       const strike = opt.strike;
       const oi = opt.openInterest || 0;
       const iv = opt.impliedVolatility || 0;
-      const type = (opt.type || opt.optionType || '').toLowerCase();
+      const type = opt.type;
 
       if (!strike || oi === 0 || iv === 0) continue;
 
       // Time to expiry in years
-      const T = Math.max((new Date(exp) - now) / (365.25 * 86400000), 1 / 365);
+      const expMs = opt.expirationEpoch
+        ? opt.expirationEpoch * 1000
+        : new Date(opt.expiration).getTime();
+      const T = Math.max((expMs - now) / (365.25 * 86400000), 1 / 365);
 
       const gamma = this._bsGamma(spotPrice, strike, iv, T);
       // GEX = OI × gamma × 100 (contract multiplier) × spot
@@ -168,10 +232,8 @@ class GammaService {
 
       const current = gexMap.get(strike) || 0;
       if (type === 'call') {
-        // Dealers short calls → long gamma when calls are bought
         gexMap.set(strike, current + gexValue);
       } else if (type === 'put') {
-        // Dealers short puts → short gamma when puts are bought
         gexMap.set(strike, current - gexValue);
       }
     }
@@ -205,8 +267,6 @@ class GammaService {
    * Find the gamma flip point — the strike where cumulative GEX crosses zero.
    * This is the "magnet" level. Above it, dealers hedge by selling into rallies
    * (suppresses volatility). Below it, dealers amplify moves (increases vol).
-   *
-   * @returns {{ flipStrike: number|null, regime: 'long_gamma'|'short_gamma', nearestStrikes: [number,number] }}
    */
   findGammaFlip(gexData, spotPrice) {
     const { strikes, gex } = gexData;
@@ -222,8 +282,7 @@ class GammaService {
       cumulative += gex[i];
 
       // Zero crossing — interpolate between adjacent strikes
-      if (prev !== 0 && Math.sign(prev) !== Math.sign(cumulative)) {
-        // Linear interpolation for more precise flip level
+      if (i > 0 && prev !== 0 && Math.sign(prev) !== Math.sign(cumulative)) {
         const ratio = Math.abs(prev) / (Math.abs(prev) + Math.abs(gex[i]));
         flipStrike = strikes[i - 1] + ratio * (strikes[i] - strikes[i - 1]);
         nearestStrikes = [strikes[i - 1], strikes[i]];
@@ -231,7 +290,6 @@ class GammaService {
       }
     }
 
-    // If no crossing found, determine regime from total
     const regime = spotPrice > (flipStrike || 0) ? 'long_gamma' : 'short_gamma';
 
     return {
@@ -310,14 +368,13 @@ class GammaService {
         },
       },
       plugins: [{
-        // Custom plugin: draw spot price line + gamma flip line
         id: 'annotations',
         afterDraw(chart) {
           const ctx = chart.ctx;
           const xAxis = chart.scales.x;
           const yAxis = chart.scales.y;
 
-          // Spot price vertical line
+          // Spot price vertical line (solid blue)
           const spotX = xAxis.getPixelForValue(spotIdx);
           ctx.save();
           ctx.strokeStyle = 'rgba(59, 130, 246, 0.9)';
@@ -334,7 +391,7 @@ class GammaService {
           ctx.textAlign = 'center';
           ctx.fillText(`SPOT $${spotPrice}`, spotX, yAxis.top - 5);
 
-          // Gamma flip dashed line
+          // Gamma flip dashed line (yellow)
           if (flipStrike) {
             const flipIdx = strikes.reduce((best, s, i) =>
               Math.abs(s - flipStrike) < Math.abs(strikes[best] - flipStrike) ? i : best, 0);
@@ -366,34 +423,29 @@ class GammaService {
 
   /**
    * Run full GEX analysis for a ticker:
-   *   1. Fetch options chain
-   *   2. Get spot price from first option's underlying or fall back to FMP quote
-   *   3. Pick front-month expiration
-   *   4. Calculate GEX per strike
-   *   5. Find gamma flip
-   *   6. Render chart
+   *   1. Fetch options chain from Yahoo Finance
+   *   2. Get spot price (from Yahoo quote, FMP fallback)
+   *   3. Calculate GEX per strike
+   *   4. Find gamma flip
+   *   5. Render chart
    *
    * @returns {{ gexData, flip, spotPrice, expiration, chartBuffer, ticker }}
    */
   async analyze(ticker) {
     const upper = ticker.toUpperCase();
 
-    // Fetch chain + spot price in parallel
-    const [chain, quoteData] = await Promise.all([
-      this.fetchOptionsChain(upper),
-      this._fmpFetch('/quote', { symbol: upper }).catch(() => null),
-    ]);
+    // Fetch options chain (includes spot price from Yahoo)
+    const { chain, spotPrice: yahooSpot, expiration } = await this.fetchOptionsChain(upper);
 
-    const quote = Array.isArray(quoteData) ? quoteData?.[0] : quoteData;
-    const spotPrice = quote?.price || chain[0]?.underlyingPrice || chain[0]?.lastPrice;
+    // Use Yahoo spot price, fall back to FMP
+    let spotPrice = yahooSpot;
+    if (!spotPrice) {
+      spotPrice = await this._fmpSpotPrice(upper);
+    }
     if (!spotPrice) throw new Error(`Could not determine spot price for ${upper}`);
 
-    // Pick best expiration
-    const expiration = this.pickFrontExpiration(chain);
-    if (!expiration) throw new Error(`No valid expirations found for ${upper}`);
-
     // Calculate GEX
-    const gexData = this.calculateGEX(chain, spotPrice, expiration);
+    const gexData = this.calculateGEX(chain, spotPrice);
     if (gexData.strikes.length === 0) {
       throw new Error(`Not enough options data at strikes near the current price for ${upper}`);
     }
