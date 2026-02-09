@@ -194,7 +194,8 @@ class GammaService {
   /**
    * Fetch the full options chain for a ticker.
    * First call gets available expirations + first expiration's chain.
-   * Returns a unified array of { strike, expiration, type, openInterest, impliedVolatility }
+   * Prefers the nearest monthly OPEX (3rd Friday) since that's where
+   * gamma exposure is most concentrated and meaningful.
    */
   async fetchOptionsChain(ticker) {
     const upper = ticker.toUpperCase();
@@ -208,22 +209,25 @@ class GammaService {
       throw new Error(`No options expirations found for ${upper}. This ticker may not have listed options.`);
     }
 
-    // Pick the best expiration: 14-45 days out, or nearest if none in that range
     const now = Date.now() / 1000;
-    const targetExps = expirations.filter(e => {
-      const days = (e - now) / 86400;
-      return days >= 7 && days <= 50;
+
+    // Find monthly OPEX dates (3rd Friday of each month = day 15-21 and Friday)
+    const monthlyExps = expirations.filter(epoch => {
+      const d = new Date(epoch * 1000);
+      const dayOfWeek = d.getUTCDay(); // 5 = Friday
+      const dayOfMonth = d.getUTCDate();
+      return dayOfWeek === 5 && dayOfMonth >= 15 && dayOfMonth <= 21;
     });
 
-    // Pick the one closest to 30 days out
+    // Pick the nearest upcoming monthly OPEX (at least 2 days out)
     let bestExp;
-    if (targetExps.length > 0) {
-      bestExp = targetExps.reduce((best, e) =>
-        Math.abs((e - now) / 86400 - 30) < Math.abs((best - now) / 86400 - 30) ? e : best
-      );
+    const upcomingMonthly = monthlyExps.filter(e => (e - now) / 86400 >= 2);
+    if (upcomingMonthly.length > 0) {
+      bestExp = upcomingMonthly[0]; // nearest monthly
     } else {
-      // Fallback: nearest future expiration
-      bestExp = expirations.find(e => e > now) || expirations[0];
+      // No monthly OPEX found — fall back to nearest future expiration with decent time
+      const fallbacks = expirations.filter(e => (e - now) / 86400 >= 2);
+      bestExp = fallbacks[0] || expirations[0];
     }
 
     // Fetch that specific expiration's chain
