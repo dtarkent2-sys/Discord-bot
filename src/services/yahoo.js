@@ -7,7 +7,7 @@
 
 const config = require('../config');
 
-const FMP_BASE = 'https://financialmodelingprep.com/api/v3';
+const FMP_BASE = 'https://financialmodelingprep.com/stable';
 
 // Common crypto symbols → FMP format (BTCUSD, not BTC-USD)
 const CRYPTO_MAP = {
@@ -111,7 +111,7 @@ class MarketDataClient {
   async getQuote(ticker) {
     const upper = ticker.toUpperCase();
     const data = await this._retry(
-      () => this._fmpFetch(`/quote/${encodeURIComponent(upper)}`),
+      () => this._fmpFetch('/quote', { symbol: upper }),
       `quote(${upper})`
     );
 
@@ -142,11 +142,11 @@ class MarketDataClient {
   async getQuotes(tickers) {
     if (tickers.length === 0) return [];
 
-    // FMP supports comma-separated batch quotes in a single request
+    // FMP stable API has a dedicated batch-quote endpoint
     const symbols = tickers.map(t => t.toUpperCase()).join(',');
     try {
       const data = await this._retry(
-        () => this._fmpFetch(`/quote/${encodeURIComponent(symbols)}`),
+        () => this._fmpFetch('/batch-quote', { symbols }),
         `quotes(batch)`
       );
 
@@ -180,14 +180,18 @@ class MarketDataClient {
 
   async getHistory(ticker, days = 30) {
     const upper = ticker.toUpperCase();
+    // Calculate the "from" date
+    const fromDate = new Date();
+    fromDate.setDate(fromDate.getDate() - days);
+    const from = fromDate.toISOString().slice(0, 10); // YYYY-MM-DD
+
     const data = await this._retry(
-      () => this._fmpFetch(`/historical-price-full/${encodeURIComponent(upper)}`, {
-        timeseries: days,
-      }),
+      () => this._fmpFetch('/historical-price-eod/full', { symbol: upper, from }),
       `history(${upper})`
     );
 
-    const historical = data?.historical || [];
+    // Stable API may return array directly or wrapped in { historical: [...] }
+    const historical = Array.isArray(data) ? data : (data?.historical || []);
     if (historical.length === 0) {
       console.warn(`[FMP] No historical data for ${upper}`);
       return [];
@@ -214,7 +218,7 @@ class MarketDataClient {
     // Also fetch profile + ratios for stocks (extra fundamentals)
     const [quoteData, history, profileData, ratiosData] = await Promise.all([
       this._retry(
-        () => this._fmpFetch(`/quote/${encodeURIComponent(upper)}`),
+        () => this._fmpFetch('/quote', { symbol: upper }),
         `quote(${upper})`
       ).catch(err => { console.warn(`[FMP] Quote failed: ${err.message}`); return null; }),
 
@@ -226,14 +230,14 @@ class MarketDataClient {
       // Profile gives us beta, sector, description
       isCrypto ? Promise.resolve(null) :
         this._retry(
-          () => this._fmpFetch(`/profile/${encodeURIComponent(upper)}`),
+          () => this._fmpFetch('/profile', { symbol: upper }),
           `profile(${upper})`
         ).catch(err => { console.warn(`[FMP] Profile failed: ${err.message}`); return null; }),
 
       // Key metrics TTM gives us ROE, P/B, profit margin, etc.
       isCrypto ? Promise.resolve(null) :
         this._retry(
-          () => this._fmpFetch(`/key-metrics-ttm/${encodeURIComponent(upper)}`),
+          () => this._fmpFetch('/key-metrics-ttm', { symbol: upper }),
           `metrics(${upper})`
         ).catch(err => { console.warn(`[FMP] Key metrics failed: ${err.message}`); return null; }),
     ]);
@@ -300,7 +304,7 @@ class MarketDataClient {
 
   async search(query) {
     const data = await this._retry(
-      () => this._fmpFetch('/search', { query, limit: 10 }),
+      () => this._fmpFetch('/search-symbol', { query }),
       `search(${query})`
     );
     return (Array.isArray(data) ? data : []).map(r => ({
@@ -315,7 +319,7 @@ class MarketDataClient {
 
   async screenByGainers() {
     const data = await this._retry(
-      () => this._fmpFetch('/stock_market/gainers'),
+      () => this._fmpFetch('/biggest-gainers'),
       'gainers'
     );
 
