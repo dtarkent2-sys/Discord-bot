@@ -38,35 +38,45 @@ if (!process.env.FONTCONFIG_PATH) {
 }
 
 const config = require('../config');
-const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
-const { registerFont } = require('canvas');
 const alpaca = require('./alpaca');
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
 const RISK_FREE_RATE = 0.045; // approximate 10Y yield
 
-// Register bundled fonts so charts render text correctly on any server
-const FONT_DIR = path.join(__dirname, '..', '..', 'assets', 'fonts');
-try {
-  registerFont(path.join(FONT_DIR, 'Inter-Regular.ttf'), { family: 'Inter' });
-  registerFont(path.join(FONT_DIR, 'Inter-Bold.ttf'), { family: 'Inter', weight: 'bold' });
-  console.log('[Gamma] Fonts registered: Inter Regular + Bold');
-} catch (err) {
-  console.warn('[Gamma] Font registration failed (chart text may render as boxes):', err.message);
-}
-
 const FONT_FAMILY = 'Inter';
 
-// Reusable chart renderer (dark theme)
-const chartRenderer = new ChartJSNodeCanvas({
-  width: 700,
-  height: 420,
-  backgroundColour: '#1e1e2e',
-  chartCallback: (ChartJS) => {
-    ChartJS.defaults.font.family = FONT_FAMILY;
-  },
-});
+// Canvas/chartjs are native modules that may fail to load on some platforms.
+// If unavailable, GEX analysis still works but chart rendering is disabled.
+let chartRenderer = null;
+
+try {
+  const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
+  const { registerFont } = require('canvas');
+
+  // Register bundled fonts so charts render text correctly on any server
+  const FONT_DIR = path.join(__dirname, '..', '..', 'assets', 'fonts');
+  try {
+    registerFont(path.join(FONT_DIR, 'Inter-Regular.ttf'), { family: 'Inter' });
+    registerFont(path.join(FONT_DIR, 'Inter-Bold.ttf'), { family: 'Inter', weight: 'bold' });
+    console.log('[Gamma] Fonts registered: Inter Regular + Bold');
+  } catch (fontErr) {
+    console.warn('[Gamma] Font registration failed (chart text may render as boxes):', fontErr.message);
+  }
+
+  chartRenderer = new ChartJSNodeCanvas({
+    width: 700,
+    height: 420,
+    backgroundColour: '#1e1e2e',
+    chartCallback: (ChartJS) => {
+      ChartJS.defaults.font.family = FONT_FAMILY;
+    },
+  });
+
+  console.log('[Gamma] Canvas/chart renderer loaded successfully');
+} catch (err) {
+  console.warn('[Gamma] Canvas module failed to load — chart rendering disabled:', err.message);
+}
 
 // Yahoo expects browser-like headers
 const YAHOO_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -456,6 +466,8 @@ class GammaService {
    * Vertical line at spot price, dashed line at gamma flip.
    */
   async generateChart(gexData, spotPrice, ticker, flipStrike) {
+    if (!chartRenderer) return null;
+
     const { strikes, gex } = gexData;
 
     // Normalize GEX to millions for readable axis

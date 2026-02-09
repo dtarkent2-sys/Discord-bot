@@ -123,8 +123,12 @@ function startDashboard() {
 </html>`);
   });
 
-  app.listen(config.port, () => {
+  const server = app.listen(config.port, () => {
     console.log(`Dashboard running at http://localhost:${config.port}`);
+  });
+
+  server.on('error', (err) => {
+    console.error(`[Dashboard] Failed to bind port ${config.port}:`, err.message);
   });
 
   return app;
