@@ -40,9 +40,6 @@ client.once(Events.ClientReady, async (c) => {
   // Register slash commands
   await registerCommands();
 
-  // Start web dashboard
-  startDashboard();
-
   // Start autonomous scheduled behaviors
   const autonomousEngine = new AutonomousBehaviorEngine(client);
   autonomousEngine.startAllSchedules();
@@ -186,6 +183,10 @@ client.on(Events.GuildDelete, () => {
 });
 
 // ── Start Bot ────────────────────────────────────────────────────────
+// Start web dashboard + health endpoint immediately (before Discord login)
+// so Railway healthcheck can pass while Discord is still connecting.
+startDashboard();
+
 if (!config.token) {
   console.error('ERROR: DISCORD_TOKEN is not set.');
   console.error('Create a .env file with your bot token. See .env.example for reference.');
