@@ -108,7 +108,7 @@ class MoodEngine {
 
   // Build mood context string for the AI system prompt
   buildMoodContext() {
-    return `Current mood: ${this.state.currentMood} (internal score: ${this.state.score.toFixed(1)}/10). Last P&L: ${this.state.lastPortfolioChange}%. Let this subtly color your tone — don't announce your mood, just embody it.`;
+    return `Your mood right now: ${this.state.currentMood}. The market's been ${this.state.lastPortfolioChange >= 0 ? 'treating you well' : 'rough'} lately (${this.state.lastPortfolioChange}%). Let this naturally affect your vibe — don't mention it directly, just let it come through.`;
   }
 
   getSummary() {
