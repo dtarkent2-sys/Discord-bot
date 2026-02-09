@@ -123,7 +123,7 @@ async function handleStats(interaction) {
     `**Errors:** ${summary.errors}`,
     `**AI Model:** ${ai.getModel()}`,
     `**Mood:** ${mood.getMood()} (${mood.getSummary().score}/10)`,
-    `**Market Data:** Yahoo Finance`,
+    `**Market Data:** FMP (Financial Modeling Prep)`,
     `\n**Memory Usage:**`,
     `  RSS: ${summary.memory.rss} MB`,
     `  Heap: ${summary.memory.heapUsed}/${summary.memory.heapTotal} MB`,
@@ -142,13 +142,13 @@ async function handleStats(interaction) {
   await interaction.reply(msg.join('\n'));
 }
 
-// ── /analyze — AI-powered analysis with live Yahoo Finance data ──────
+// ── /analyze — AI-powered analysis with live market data ─────────────
 async function handleAnalyze(interaction) {
   await interaction.deferReply();
 
   const ticker = yahoo.resolveTicker(interaction.options.getString('ticker'));
 
-  // Fetch real market data from Yahoo Finance
+  // Fetch real market data from FMP
   const context = await getMarketContext(ticker);
 
   if (context.error) {
@@ -210,7 +210,7 @@ async function handlePrice(interaction) {
       lines.push(`\n_Some data unavailable: ${context.missingFields.map(m => m.field).join(', ')}_`);
     }
 
-    lines.push(`\n_Data via Yahoo Finance | ${new Date().toLocaleString()}_`);
+    lines.push(`\n_Data via FMP | ${new Date().toLocaleString()}_`);
     await interaction.editReply(lines.join('\n'));
   } catch (err) {
     console.error(`[Price] Error for ${ticker}:`, err);
@@ -226,7 +226,7 @@ async function handleScreen(interaction) {
   const rulesStr = interaction.options.getString('rules');
 
   try {
-    // Use Yahoo Finance trending tickers as a screen
+    // Use FMP top gainers as a screen
     const quotes = await yahoo.screenByGainers();
 
     if (quotes.length === 0) {
@@ -235,7 +235,7 @@ async function handleScreen(interaction) {
     }
 
     const formatted = yahoo.formatScreenForDiscord(quotes);
-    await interaction.editReply(`**Screen: ${universe}**${rulesStr ? ` | Rules: ${rulesStr}` : ''}\n${formatted}\n\n_Trending stocks via Yahoo Finance_`);
+    await interaction.editReply(`**Screen: ${universe}**${rulesStr ? ` | Rules: ${rulesStr}` : ''}\n${formatted}\n\n_Top gainers via FMP_`);
   } catch (err) {
     console.error(`[Screen] Error:`, err);
     await interaction.editReply(`Screen failed: ${err.message}`);
@@ -344,7 +344,7 @@ async function handleWatchlist(interaction) {
     return;
   }
 
-  // Show watchlist with live Yahoo Finance prices
+  // Show watchlist with live prices
   const list = memory.getWatchlist(userId);
   if (list.length === 0) {
     await interaction.reply({ content: 'Your watchlist is empty. Use `/watchlist add <ticker>` to add stocks.', ephemeral: true });
@@ -371,12 +371,12 @@ async function handleWatchlist(interaction) {
       if (missed.length > 0) {
         lines.push(`\n_Could not fetch: ${missed.join(', ')}_`);
       }
-      lines.push(`\n_Data via Yahoo Finance (yfinance) | ${new Date().toLocaleString()}_`);
+      lines.push(`\n_Data via FMP | ${new Date().toLocaleString()}_`);
       await interaction.editReply(lines.join('\n'));
       return;
     }
   } catch (err) {
-    console.error('[Watchlist] Yahoo fetch error:', err.message);
+    console.error('[Watchlist] FMP fetch error:', err.message);
   }
   // Fallback if fetch fails
   await interaction.editReply(`**Your Watchlist (${list.length} stocks)**\n${list.join(', ')}\n\n_Live prices unavailable._`);
