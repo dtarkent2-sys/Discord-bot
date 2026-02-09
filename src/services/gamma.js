@@ -16,6 +16,27 @@
  */
 
 const path = require('path');
+
+// Ensure fontconfig can find a config file before canvas initialises.
+// On minimal deployment images (Railway/NIXPACKS) the default path may be missing.
+if (!process.env.FONTCONFIG_PATH) {
+  const candidates = ['/etc/fonts', '/usr/share/fontconfig'];
+  const fs = require('fs');
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, 'fonts.conf'))) {
+      process.env.FONTCONFIG_PATH = dir;
+      break;
+    }
+  }
+  // Last resort: point at our bundled minimal config
+  if (!process.env.FONTCONFIG_PATH) {
+    const bundledConf = path.join(__dirname, '..', '..', 'assets', 'fontconfig');
+    if (fs.existsSync(path.join(bundledConf, 'fonts.conf'))) {
+      process.env.FONTCONFIG_PATH = bundledConf;
+    }
+  }
+}
+
 const config = require('../config');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 const { registerFont } = require('canvas');
