@@ -26,6 +26,10 @@ class YahooFinanceClient {
   constructor() {
     this._yf = null;
     this._initFailed = false;
+    // Cookie/crumb cache for direct HTTP fallback
+    this._cookie = null;
+    this._crumb = null;
+    this._crumbExpiry = 0; // timestamp when crumb expires
   }
 
   // yahoo-finance2 v3: import class and instantiate
@@ -99,6 +103,7 @@ class YahooFinanceClient {
             console.warn(`[Yahoo] Resetting client after ${attempt + 1} failures...`);
             this._yf = null;
             this._initFailed = false;
+            this._invalidateCrumb(); // Also reset direct-fetch auth
           }
           continue;
         }
@@ -110,30 +115,139 @@ class YahooFinanceClient {
   // ── Direct HTTP fallback — bypasses yahoo-finance2 library entirely ──
 
   /**
-   * Fetch data directly from Yahoo's v8 chart API using native fetch.
-   * This works when the yahoo-finance2 library's cookie/crumb mechanism fails.
+   * Acquire a Yahoo session cookie + crumb token for authenticated API access.
+   * Yahoo requires these for ALL v8/v10 API endpoints.
+   * Flow: GET fc.yahoo.com (cookie) → GET v1/test/getcrumb (crumb)
    */
-  async _directChartFetch(ticker, range = '200d', interval = '1d') {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${range}&interval=${interval}&includePrePost=false`;
-    console.log(`[Yahoo] Direct fetch: ${url}`);
-
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-      },
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Yahoo HTTP ${res.status}: ${text.slice(0, 200)}`);
+  async _acquireCrumb() {
+    // Return cached values if still fresh (cache for 30 minutes)
+    if (this._cookie && this._crumb && Date.now() < this._crumbExpiry) {
+      return { cookie: this._cookie, crumb: this._crumb };
     }
 
-    const data = await res.json();
-    const result = data?.chart?.result?.[0];
-    if (!result) throw new Error('No chart data returned');
-    return result;
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+    // Step 1: Hit fc.yahoo.com to get a session cookie
+    console.log('[Yahoo] Acquiring session cookie...');
+    const cookieRes = await fetch('https://fc.yahoo.com/', {
+      headers: { 'User-Agent': UA },
+      redirect: 'manual', // Don't follow redirects — we just need the Set-Cookie
+      signal: AbortSignal.timeout(10000),
+    });
+
+    // Extract cookies from response headers (works even on 404/3xx)
+    const setCookies = cookieRes.headers.getSetCookie?.() || [];
+    let cookieJar = '';
+    if (setCookies.length > 0) {
+      // Collect all cookie name=value pairs
+      cookieJar = setCookies
+        .map(sc => sc.split(';')[0]) // Take just the name=value part
+        .join('; ');
+    }
+
+    if (!cookieJar) {
+      // Fallback: try raw header
+      const rawCookie = cookieRes.headers.get('set-cookie');
+      if (rawCookie) {
+        cookieJar = rawCookie.split(',')
+          .map(c => c.split(';')[0].trim())
+          .join('; ');
+      }
+    }
+
+    if (!cookieJar) {
+      throw new Error('Failed to acquire Yahoo session cookie');
+    }
+
+    console.log('[Yahoo] Got cookie, fetching crumb...');
+
+    // Step 2: Use the cookie to fetch the crumb token
+    const crumbRes = await fetch('https://query2.finance.yahoo.com/v1/test/getcrumb', {
+      headers: {
+        'User-Agent': UA,
+        'Cookie': cookieJar,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!crumbRes.ok) {
+      const errText = await crumbRes.text().catch(() => '');
+      throw new Error(`Crumb fetch failed: HTTP ${crumbRes.status} ${errText.slice(0, 100)}`);
+    }
+
+    const crumb = (await crumbRes.text()).trim();
+    if (!crumb || crumb.length > 50) {
+      throw new Error(`Invalid crumb received: "${crumb.slice(0, 30)}"`);
+    }
+
+    // Cache for 30 minutes
+    this._cookie = cookieJar;
+    this._crumb = crumb;
+    this._crumbExpiry = Date.now() + 30 * 60 * 1000;
+
+    console.log('[Yahoo] Cookie + crumb acquired successfully.');
+    return { cookie: this._cookie, crumb: this._crumb };
+  }
+
+  /**
+   * Invalidate cached crumb (call on 401/403 to force re-auth).
+   */
+  _invalidateCrumb() {
+    this._cookie = null;
+    this._crumb = null;
+    this._crumbExpiry = 0;
+  }
+
+  /**
+   * Fetch data directly from Yahoo's v8 chart API using native fetch.
+   * Includes cookie/crumb authentication required by Yahoo.
+   */
+  async _directChartFetch(ticker, range = '200d', interval = '1d') {
+    const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+    // Try up to 2 times — first with cached crumb, then with fresh crumb
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let cookie, crumb;
+      try {
+        ({ cookie, crumb } = await this._acquireCrumb());
+      } catch (err) {
+        console.error(`[Yahoo] Crumb acquisition failed: ${err.message}`);
+        // On second attempt, propagate the error
+        if (attempt > 0) throw err;
+        this._invalidateCrumb();
+        continue;
+      }
+
+      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=${range}&interval=${interval}&includePrePost=false&crumb=${encodeURIComponent(crumb)}`;
+      console.log(`[Yahoo] Direct fetch (attempt ${attempt + 1}): ${ticker} range=${range}`);
+
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': UA,
+          'Accept': 'application/json',
+          'Cookie': cookie,
+        },
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        console.warn(`[Yahoo] Got ${res.status} — crumb expired, refreshing...`);
+        this._invalidateCrumb();
+        continue; // Retry with fresh crumb
+      }
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Yahoo HTTP ${res.status}: ${text.slice(0, 200)}`);
+      }
+
+      const data = await res.json();
+      const result = data?.chart?.result?.[0];
+      if (!result) throw new Error('No chart data returned');
+      return result;
+    }
+
+    throw new Error('Direct fetch failed after crumb refresh');
   }
 
   /**
