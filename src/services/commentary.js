@@ -5,8 +5,7 @@
  * Falls back to persona speech patterns if AI is unavailable.
  */
 
-const { persona, pick } = require('../personality');
-const mood = require('./mood');
+const { persona } = require('../personality');
 
 class CommentaryGenerator {
   constructor() {
@@ -31,12 +30,11 @@ class CommentaryGenerator {
    */
   async generate(dataPoint, context) {
     try {
-      const prompt = `You are ${persona.name}, ${persona.tone} Your quirks: ${persona.quirks.join('. ')}.
-Your current mood: ${mood.getMood()}.
+      const prompt = `You are ${persona.name}. ${persona.vibe}
 Context: ${context}.
 Data: ${JSON.stringify(dataPoint)}.
 
-Generate a single concise line of commentary (under 100 words) in your voice. Stay in character. Do not invent data — only reference what's in "Data" above. If data is missing, say so. Include "Not financial advice." at the end.`;
+Generate a single concise line of commentary (under 100 words) in your voice. Keep it casual and natural. Do not invent data — only reference what's in "Data" above. If data is missing, say so. Include "Not financial advice." at the end.`;
 
       const result = await this.ai.complete(prompt);
       if (result && result.length > 5 && result.length < 500) {
@@ -81,16 +79,15 @@ Generate a single concise line of commentary (under 100 words) in your voice. St
   }
 
   _fallback(dataPoint, context) {
-    const moodLine = mood.getMoodLine();
     if (context.includes('briefing')) {
-      return `${pick(persona.speechPatterns.greetings)} ${moodLine} Not financial advice.`;
+      return `Here's what's happening in the market. Not financial advice.`;
     }
     if (dataPoint.changePercent) {
       const num = parseFloat(dataPoint.changePercent);
-      if (num > 0) return `${pick(persona.speechPatterns.marketUp)} Not financial advice.`;
-      if (num < 0) return `${pick(persona.speechPatterns.marketDown)} Not financial advice.`;
+      if (num > 0) return `${dataPoint.ticker || 'Market'} looking green — up ${dataPoint.changePercent}. Not financial advice.`;
+      if (num < 0) return `${dataPoint.ticker || 'Market'} in the red — ${dataPoint.changePercent}. Not financial advice.`;
     }
-    return `${moodLine} Not financial advice.`;
+    return `Not much to report right now. Not financial advice.`;
   }
 }
 

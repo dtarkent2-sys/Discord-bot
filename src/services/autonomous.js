@@ -12,7 +12,7 @@
  */
 
 const schedule = require('node-schedule');
-const { persona, pick } = require('../personality');
+const { persona } = require('../personality');
 const { getMarketContext } = require('../data/market');
 const mood = require('./mood');
 const commentary = require('./commentary');
@@ -48,7 +48,7 @@ class AutonomousBehaviorEngine {
           if (spyData.available) {
             body = await commentary.marketMove('SPY', spyData.change);
           } else {
-            body = `Pre-market data unavailable right now. ${pick(persona.speechPatterns.noData)}`;
+            body = `Pre-market data unavailable right now. I'll check back later.`;
           }
 
           const message = [
@@ -81,7 +81,7 @@ class AutonomousBehaviorEngine {
           const message = [
             `**Sector Pulse Update** *(${persona.name} is feeling ${mood.getMood()})*`,
             ``,
-            heatmap || `${pick(persona.speechPatterns.error)} Sector data is currently unavailable.`,
+            heatmap || `Sector data is currently unavailable. Data providers might be down.`,
             ``,
             `Not financial advice.`,
           ].join('\n');
@@ -122,7 +122,7 @@ class AutonomousBehaviorEngine {
           const message = [
             `**${persona.name}'s Weekly Review**`,
             ``,
-            reflection || `${pick(persona.speechPatterns.error)} Could not generate weekly review — data providers may be offline.`,
+            reflection || `Could not generate weekly review — data providers may be offline.`,
             ``,
             `Not financial advice.`,
           ].join('\n');
