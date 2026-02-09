@@ -5,6 +5,7 @@ const stats = require('../services/stats');
 const reactions = require('../services/reactions');
 const sentiment = require('../services/sentiment');
 const yahoo = require('../services/yahoo');
+const alpaca = require('../services/alpaca');
 const tradingAgents = require('../services/trading-agents');
 const agentSwarm = require('../services/agent-swarm');
 const gamma = require('../services/gamma');
@@ -127,7 +128,7 @@ async function handleStats(interaction) {
     `**Errors:** ${summary.errors}`,
     `**AI Model:** ${ai.getModel()}`,
     `**Mood:** ${mood.getMood()} (${mood.getSummary().score}/10)`,
-    `**Market Data:** FMP (Financial Modeling Prep)`,
+    `**Market Data:** ${buildMarketDataLabel()}`,
     `\n**Memory Usage:**`,
     `  RSS: ${summary.memory.rss} MB`,
     `  Heap: ${summary.memory.heapUsed}/${summary.memory.heapTotal} MB`,
@@ -152,7 +153,7 @@ async function handleAnalyze(interaction) {
 
   const ticker = yahoo.resolveTicker(interaction.options.getString('ticker'));
 
-  // Fetch real market data from FMP
+  // Fetch real market data from the preferred provider
   const context = await getMarketContext(ticker);
 
   if (context.error) {
@@ -214,7 +215,7 @@ async function handlePrice(interaction) {
       lines.push(`\n_Some data unavailable: ${context.missingFields.map(m => m.field).join(', ')}_`);
     }
 
-    lines.push(`\n_Data via FMP | ${new Date().toLocaleString()}_`);
+    lines.push(`\n_Data via ${context.source || 'FMP'} | ${new Date().toLocaleString()}_`);
     await interaction.editReply(lines.join('\n'));
   } catch (err) {
     console.error(`[Price] Error for ${ticker}:`, err);
@@ -357,30 +358,46 @@ async function handleWatchlist(interaction) {
 
   await interaction.deferReply();
   try {
-    const quotes = await yahoo.getQuotes(list);
-    const validQuotes = quotes.filter(q => !q.error);
+    const contexts = await Promise.all(
+      list.map(async (symbol) => {
+        try {
+          const context = await getMarketContext(symbol);
+          return { symbol, context };
+        } catch (err) {
+          return { symbol, context: { error: true, message: err.message } };
+        }
+      })
+    );
 
+    const validQuotes = contexts.filter(({ context }) => context && !context.error && context.quote?.price != null);
     if (validQuotes.length > 0) {
       const lines = [`**Your Watchlist (${list.length} stocks)**\n`];
-      for (const q of validQuotes) {
-        const sym = q.symbol;
-        const price = q.regularMarketPrice != null ? `$${q.regularMarketPrice.toFixed(2)}` : 'N/A';
-        const pct = q.regularMarketChangePercent;
+      const sources = new Set();
+
+      for (const { symbol, context } of validQuotes) {
+        const q = context.quote || {};
+        const s = context.snapshot || {};
+        const price = q.price != null ? `$${q.price.toFixed(2)}` : 'N/A';
+        const pct = q.changePercent;
         const changeStr = pct != null ? ` (${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
-        const name = q.shortName || '';
-        lines.push(`**${sym}** ${name ? `— ${name} ` : ''}— ${price}${changeStr}`);
+        const name = s.name || '';
+        lines.push(`**${symbol}** ${name ? `— ${name} ` : ''}— ${price}${changeStr}`);
+        if (context.source) sources.add(context.source);
       }
-      const fetched = new Set(validQuotes.map(q => q.symbol));
+
+      const fetched = new Set(validQuotes.map(({ symbol }) => symbol));
       const missed = list.filter(t => !fetched.has(t));
       if (missed.length > 0) {
         lines.push(`\n_Could not fetch: ${missed.join(', ')}_`);
       }
-      lines.push(`\n_Data via FMP | ${new Date().toLocaleString()}_`);
+
+      const sourceLabel = sources.size > 0 ? [...sources].join(' + ') : 'Market data';
+      lines.push(`\n_Data via ${sourceLabel} | ${new Date().toLocaleString()}_`);
       await interaction.editReply(lines.join('\n'));
       return;
     }
   } catch (err) {
-    console.error('[Watchlist] FMP fetch error:', err.message);
+    console.error('[Watchlist] Market data fetch error:', err.message);
   }
   // Fallback if fetch fails
   await interaction.editReply(`**Your Watchlist (${list.length} stocks)**\n${list.join(', ')}\n\n_Live prices unavailable._`);
@@ -535,7 +552,7 @@ async function handleGEX(interaction) {
   const ticker = interaction.options.getString('ticker').toUpperCase();
 
   if (!gamma.enabled) {
-    return interaction.editReply('GEX analysis requires FMP_API_KEY to be configured.');
+    return interaction.editReply('GEX analysis is currently unavailable.');
   }
 
   try {
@@ -558,6 +575,15 @@ async function handleGEX(interaction) {
     const msg = err.message || 'Unknown error';
     await interaction.editReply(`**${ticker} — Gamma Exposure**\n❌ ${msg}`);
   }
+}
+
+function buildMarketDataLabel() {
+  const sources = [];
+  if (alpaca.enabled) sources.push('Alpaca (IEX)');
+  if (yahoo.enabled) sources.push('FMP');
+  if (sources.length === 0) return 'Unavailable';
+  if (sources.length === 1) return sources[0];
+  return sources.join(' + ');
 }
 
 module.exports = { handleCommand };

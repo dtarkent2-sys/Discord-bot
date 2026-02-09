@@ -1,9 +1,10 @@
 /**
- * Market context provider — fetches data from FMP (Financial Modeling Prep).
+ * Market context provider — fetches data from Alpaca (preferred) or FMP.
  */
 
 const { assertFresh, FreshnessError } = require('./freshness');
 const yahoo = require('../services/yahoo');
+const alpaca = require('../services/alpaca');
 
 // Default freshness limits (in seconds)
 const FRESHNESS = {
@@ -12,7 +13,7 @@ const FRESHNESS = {
 };
 
 /**
- * Fetch market context for a ticker via FMP.
+ * Fetch market context for a ticker via Alpaca (preferred) or FMP.
  * Returns structured data for the AI, or { error: true, missing: [...] }.
  */
 async function getMarketContext(ticker) {
@@ -20,31 +21,104 @@ async function getMarketContext(ticker) {
   const resolvedTicker = yahoo.resolveTicker(ticker);
   const missing = [];
   const context = { ticker: resolvedTicker, fetchedAt: new Date().toISOString() };
+  const useAlpaca = alpaca.enabled && !yahoo.isCrypto(resolvedTicker);
+  context.source = useAlpaca ? 'Alpaca' : 'FMP';
 
   // ── Ticker Snapshot (fundamentals + technicals) ──
-  try {
-    const snapshot = await yahoo.getTickerSnapshot(resolvedTicker);
+  if (useAlpaca) {
+    try {
+      const [snapshot, history] = await Promise.all([
+        alpaca.getSnapshot(resolvedTicker),
+        alpaca.getHistory(resolvedTicker, 260).catch(() => []),
+      ]);
 
-    if (snapshot && snapshot.price != null) {
-      context.snapshot = snapshot;
-      context.quote = {
-        price: snapshot.price,
-        volume: snapshot.volume,
-        mktCap: snapshot.marketCap,
-        pe: snapshot.pe,
-        rsi14: snapshot.rsi14,
-        sma50: snapshot.sma50,
-        sma200: snapshot.sma200,
-        changePercent: snapshot.changePercent,
-        timestamp: snapshot.timestamp,
-      };
-      context.priceHistory = snapshot.priceHistory;
-    } else {
-      missing.push({ field: 'snapshot', reason: `No data returned for ${resolvedTicker}` });
+      if (snapshot && snapshot.price != null) {
+        const closes = history.map(d => d.close).filter(c => c != null);
+        const highs = history.map(d => d.high).filter(c => c != null);
+        const lows = history.map(d => d.low).filter(c => c != null);
+
+        const sma50 = closes.length >= 50 ? sma(closes, 50) : null;
+        const sma200 = closes.length >= 200 ? sma(closes, 200) : null;
+        const rsi14 = closes.length >= 15 ? rsi(closes, 14) : null;
+        const high52 = highs.length > 0 ? Math.max(...highs) : null;
+        const low52 = lows.length > 0 ? Math.min(...lows) : null;
+
+        const priceHistory = history.slice(-30);
+
+        context.snapshot = {
+          ticker: resolvedTicker,
+          name: resolvedTicker,
+          price: snapshot.price,
+          previousClose: snapshot.prevClose,
+          open: snapshot.open,
+          dayHigh: snapshot.high,
+          dayLow: snapshot.low,
+          volume: snapshot.volume,
+          marketCap: null,
+          change: snapshot.change,
+          changePercent: snapshot.changePercent,
+          pe: null,
+          forwardPE: null,
+          pb: null,
+          eps: null,
+          divYield: null,
+          roe: null,
+          profitMargin: null,
+          revenueGrowth: null,
+          beta: null,
+          fiftyTwoWeekHigh: high52,
+          fiftyTwoWeekLow: low52,
+          sma50,
+          sma200,
+          rsi14,
+          priceHistory,
+          timestamp: snapshot.timestamp || new Date().toISOString(),
+        };
+
+        context.quote = {
+          price: snapshot.price,
+          volume: snapshot.volume,
+          mktCap: null,
+          pe: null,
+          rsi14,
+          sma50,
+          sma200,
+          changePercent: snapshot.changePercent,
+          timestamp: snapshot.timestamp || new Date().toISOString(),
+        };
+        context.priceHistory = priceHistory;
+      } else {
+        missing.push({ field: 'snapshot', reason: `No data returned for ${resolvedTicker}` });
+      }
+    } catch (err) {
+      console.error(`[Market] Alpaca snapshot error for ${resolvedTicker}:`, err.message);
+      missing.push({ field: 'snapshot', reason: err.message });
     }
-  } catch (err) {
-    console.error(`[Market] FMP snapshot error for ${resolvedTicker}:`, err.message);
-    missing.push({ field: 'snapshot', reason: err.message });
+  } else {
+    try {
+      const snapshot = await yahoo.getTickerSnapshot(resolvedTicker);
+
+      if (snapshot && snapshot.price != null) {
+        context.snapshot = snapshot;
+        context.quote = {
+          price: snapshot.price,
+          volume: snapshot.volume,
+          mktCap: snapshot.marketCap,
+          pe: snapshot.pe,
+          rsi14: snapshot.rsi14,
+          sma50: snapshot.sma50,
+          sma200: snapshot.sma200,
+          changePercent: snapshot.changePercent,
+          timestamp: snapshot.timestamp,
+        };
+        context.priceHistory = snapshot.priceHistory;
+      } else {
+        missing.push({ field: 'snapshot', reason: `No data returned for ${resolvedTicker}` });
+      }
+    } catch (err) {
+      console.error(`[Market] FMP snapshot error for ${resolvedTicker}:`, err.message);
+      missing.push({ field: 'snapshot', reason: err.message });
+    }
   }
 
   // Apply freshness gate to quote data
@@ -84,7 +158,10 @@ function formatContextForAI(context) {
     return context?.message || 'No market data available.';
   }
 
-  const lines = [`Ticker: ${context.ticker} (as of ${context.fetchedAt})`];
+  const lines = [
+    `Ticker: ${context.ticker} (as of ${context.fetchedAt})`,
+    `Source: ${context.source || 'FMP'}`,
+  ];
 
   if (context.quote) {
     const q = context.quote;
@@ -127,6 +204,27 @@ function formatContextForAI(context) {
   }
 
   return lines.join('\n');
+}
+
+function sma(prices, period) {
+  const recent = prices.slice(-period);
+  return Math.round((recent.reduce((a, b) => a + b, 0) / recent.length) * 100) / 100;
+}
+
+function rsi(prices, period = 14) {
+  if (prices.length < period + 1) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = prices.length - period; i < prices.length; i++) {
+    const diff = prices[i] - prices[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return Math.round((100 - (100 / (1 + rs))) * 100) / 100;
 }
 
 module.exports = { getMarketContext, formatContextForAI, FRESHNESS };

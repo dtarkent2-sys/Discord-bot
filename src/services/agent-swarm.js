@@ -17,6 +17,8 @@ const { Ollama } = require('ollama');
 const config = require('../config');
 const { webSearch, formatResultsForAI } = require('../tools/web-search');
 const marketData = require('./yahoo');
+const alpaca = require('./alpaca');
+const { getMarketContext } = require('../data/market');
 
 const KIMI_TOOLS = [
   { type: 'builtin_function', function: { name: '$web_search' } },
@@ -44,7 +46,7 @@ class AgentSwarm {
   async research(query, onProgress) {
     const progress = onProgress || (() => {});
 
-    // Step 0: Gather real-time context (FMP market data + web search)
+    // Step 0: Gather real-time context (market data + web search)
     progress('Gathering real-time data...');
     const realTimeContext = await this._gatherRealTimeContext(query);
 
@@ -68,25 +70,26 @@ class AgentSwarm {
   async _gatherRealTimeContext(query) {
     const parts = [];
 
-    // Extract potential stock tickers from query and fetch live FMP data
+    // Extract potential stock tickers from query and fetch live market data
     const tickers = this._extractTickers(query);
-    if (tickers.length > 0 && marketData.enabled) {
-      const fmpResults = await Promise.all(
+    if (tickers.length > 0) {
+      const results = await Promise.all(
         tickers.slice(0, 5).map(async (ticker) => {
           try {
-            const snapshot = await marketData.getTickerSnapshot(ticker);
-            return this._formatSnapshot(snapshot);
+            const context = await getMarketContext(ticker);
+            if (context?.snapshot) return this._formatSnapshot(context.snapshot);
+            return null;
           } catch (err) {
-            console.warn(`[AgentSwarm] FMP data for ${ticker} failed:`, err.message);
+            console.warn(`[AgentSwarm] Market data for ${ticker} failed:`, err.message);
             return null;
           }
         })
       );
-      const validData = fmpResults.filter(Boolean);
+      const validData = results.filter(Boolean);
       if (validData.length > 0) {
-        parts.push(`LIVE MARKET DATA (real-time from FMP, use these numbers):\n${validData.join('\n\n')}`);
+        parts.push(`LIVE MARKET DATA (real-time, use these numbers):\n${validData.join('\n\n')}`);
       }
-    } else if (marketData.enabled) {
+    } else if (marketData.enabled || alpaca.enabled) {
       // No specific tickers found — fetch market overview so agents have real data
       // This covers open-ended queries like "top stocks to buy tomorrow"
       const overviewParts = [];
@@ -94,15 +97,27 @@ class AgentSwarm {
       // Fetch major indices/ETFs for broad market context
       const majorTickers = ['SPY', 'QQQ', 'DIA', 'IWM'];
       try {
-        const quotes = await marketData.getQuotes(majorTickers);
-        const valid = quotes.filter(q => q.regularMarketPrice != null);
-        if (valid.length > 0) {
-          const lines = valid.map(q => {
-            const pct = q.regularMarketChangePercent;
-            const dir = pct > 0 ? '+' : '';
-            return `${q.symbol}: $${q.regularMarketPrice.toFixed(2)} (${dir}${pct?.toFixed(2) || '?'}%)`;
-          });
-          overviewParts.push(`MARKET INDICES:\n${lines.join('\n')}`);
+        if (alpaca.enabled) {
+          const snapshots = await alpaca.getSnapshots(majorTickers);
+          if (snapshots.length > 0) {
+            const lines = snapshots.map(s => {
+              const pct = s.changePercent;
+              const dir = pct > 0 ? '+' : '';
+              return `${s.ticker}: $${s.price?.toFixed(2) || '?'} (${dir}${pct?.toFixed(2) || '?'}%)`;
+            });
+            overviewParts.push(`MARKET INDICES:\n${lines.join('\n')}`);
+          }
+        } else if (marketData.enabled) {
+          const quotes = await marketData.getQuotes(majorTickers);
+          const valid = quotes.filter(q => q.regularMarketPrice != null);
+          if (valid.length > 0) {
+            const lines = valid.map(q => {
+              const pct = q.regularMarketChangePercent;
+              const dir = pct > 0 ? '+' : '';
+              return `${q.symbol}: $${q.regularMarketPrice.toFixed(2)} (${dir}${pct?.toFixed(2) || '?'}%)`;
+            });
+            overviewParts.push(`MARKET INDICES:\n${lines.join('\n')}`);
+          }
         }
       } catch (err) {
         console.warn('[AgentSwarm] Market indices fetch failed:', err.message);
@@ -125,7 +140,7 @@ class AgentSwarm {
       }
 
       if (overviewParts.length > 0) {
-        parts.push(`LIVE MARKET OVERVIEW (real-time from FMP — use these numbers):\n${overviewParts.join('\n\n')}`);
+        parts.push(`LIVE MARKET OVERVIEW (real-time — use these numbers):\n${overviewParts.join('\n\n')}`);
       }
     }
 
@@ -243,7 +258,7 @@ ${subtask.task}`;
 ${realTimeContext}
 --- END REAL-TIME DATA ---
 
-IMPORTANT: Your training data cuts off around mid-2024. The date above and all data in this section are LIVE from FMP — treat them as your sole source of truth. Do NOT reference outdated prices or events from training data. Do NOT mention "knowledge cutoff" — just use the live data provided.`;
+IMPORTANT: Your training data cuts off around mid-2024. The date above and all data in this section are LIVE market data — treat them as your sole source of truth. Do NOT reference outdated prices or events from training data. Do NOT mention "knowledge cutoff" — just use the live data provided.`;
         }
 
         agentPrompt += `
