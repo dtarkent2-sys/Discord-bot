@@ -3,14 +3,8 @@ const natural = require('natural');
 const nlp = require('compromise');
 const { NeuralNetwork } = require('brain.js');
 
-const OLLAMA_BASE = process.env.OLLAMA_URL || 'https://ollama.com';
-const OLLAMA_MODEL_PREF = process.env.OLLAMA_MODEL || 'kimi-k2.5:cloud';
-const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || '';
-
-// Kimi K2.5 agent mode config (Moonshot AI — built-in web search)
-const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
-const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.moonshot.ai/v1';
-const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-k2.5-preview';
+const OLLAMA_BASE = process.env.OLLAMA_HOST || process.env.OLLAMA_URL || 'http://ollama.railway.internal:11434';
+const OLLAMA_MODEL_PREF = process.env.OLLAMA_MODEL || 'llama3.2:3b';
 
 class AIEngine {
   constructor(stocks) {
@@ -28,11 +22,6 @@ class AIEngine {
     this.trained = false;
     this.trainingData = [];
 
-    // Axios config for Ollama requests (adds auth header when API key is set)
-    this.axiosConfig = OLLAMA_API_KEY
-      ? { headers: { Authorization: `Bearer ${OLLAMA_API_KEY}` } }
-      : {};
-
     // Cache for frequently accessed data
     this.cache = new Map();
     this.cacheTimeout = 5 * 60 * 1000; // 5 minutes
@@ -43,12 +32,12 @@ class AIEngine {
   }
 
   async initialize() {
-    console.log(`[AI Engine] Initializing... (Ollama URL: ${OLLAMA_BASE}, model: ${OLLAMA_MODEL_PREF.substring(0, 20)}..., API key: ${OLLAMA_API_KEY ? 'configured' : 'NOT SET'})`);
+    console.log(`[AI Engine] Initializing... (Ollama URL: ${OLLAMA_BASE}, model: ${OLLAMA_MODEL_PREF})`);
 
     // Check if Ollama is reachable and resolve full model name
     try {
       const res = await this._retryRequest(async () => {
-        return axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 15000, ...this.axiosConfig });
+        return axios.get(`${OLLAMA_BASE}/api/tags`, { timeout: 15000,  });
       });
 
       if (!res.data || !Array.isArray(res.data.models)) {

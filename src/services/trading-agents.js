@@ -20,11 +20,7 @@ const { getMarketContext, formatContextForAI } = require('../data/market');
 
 class TradingAgents {
   constructor() {
-    const opts = { host: config.ollamaHost };
-    if (config.ollamaApiKey) {
-      opts.headers = { Authorization: `Bearer ${config.ollamaApiKey}` };
-    }
-    this.ollama = new Ollama(opts);
+    this.ollama = new Ollama({ host: config.ollamaHost });
     this.model = config.ollamaModel;
   }
 

@@ -1,3 +1,19 @@
+# Bot service — Discord bot (Node.js)
+# Connects to Ollama via Railway private networking (no external AI APIs)
+#
+# Multi-service setup:
+#   Service 1: "bot" — this service (Node.js, Nixpacks)
+#   Service 2: "ollama" — local LLM inference (see ollama/ directory)
+#
+# Railway project setup:
+#   1. Create project with this repo
+#   2. Bot service auto-detects from root (Nixpacks + node index.js)
+#   3. Add second service: point to ollama/ directory, use Dockerfile builder
+#   4. Add persistent volume to Ollama service: mount at /root/.ollama
+#   5. Enable private networking on both services
+#   6. Set OLLAMA_HOST=http://ollama.railway.internal:11434 on the bot service
+#   7. Set OLLAMA_MODELS=llama3.2:3b on the Ollama service
+
 [build]
 builder = "NIXPACKS"
 

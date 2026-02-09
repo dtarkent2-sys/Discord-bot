@@ -7,25 +7,15 @@ const { webSearch, formatResultsForAI } = require('../tools/web-search');
 
 class AIService {
   constructor() {
-    const ollamaOptions = { host: config.ollamaHost };
-    if (config.ollamaApiKey) {
-      ollamaOptions.headers = { Authorization: `Bearer ${config.ollamaApiKey}` };
-    }
-    this.ollama = new Ollama(ollamaOptions);
+    this.ollama = new Ollama({ host: config.ollamaHost });
     this.model = config.ollamaModel;
     this.ollamaAvailable = false;
     this.conversationHistory = new Map();
     this.maxHistory = 20;
-
-    // Kimi K2.5 agent mode — uses Moonshot API with built-in web search
-    this.kimiEnabled = !!(config.kimiApiKey && this._isKimiModel());
+    this._healthCheckInterval = null;
 
     console.log(`[AI] Ollama host: ${config.ollamaHost}`);
-    console.log(`[AI] Ollama model: ${this.model}`);
-    console.log(`[AI] API key: ${config.ollamaApiKey ? 'set' : 'NOT SET'}`);
-    if (this.kimiEnabled) {
-      console.log(`[AI] Kimi agent mode ENABLED (${config.kimiBaseUrl}, model: ${config.kimiModel})`);
-    }
+    console.log(`[AI] Model: ${this.model}`);
   }
 
   async initialize() {
@@ -33,114 +23,52 @@ class AIService {
       const res = await this.ollama.list();
       const models = res.models || [];
       this.ollamaAvailable = true;
-      console.log(`[AI] Ollama connected. Available models: ${models.map(m => m.name).join(', ') || 'none listed'}`);
+      console.log(`[AI] Ollama connected. Available models: ${models.map(m => m.name).join(', ') || 'none'}`);
 
       const match = models.find(m => m.name === this.model || m.name.startsWith(this.model));
       if (match) {
         this.model = match.name;
         console.log(`[AI] Using model: ${this.model}`);
-      } else {
-        console.log(`[AI] Model "${this.model}" not found in list, will try anyway (cloud models may not be listed).`);
+      } else if (models.length > 0) {
+        console.warn(`[AI] Model "${this.model}" not found. Available: ${models.map(m => m.name).join(', ')}`);
+        console.warn(`[AI] Will attempt to use "${this.model}" anyway — it may need to be pulled.`);
       }
+
+      // Start periodic health check (every 60s)
+      this._startHealthCheck();
     } catch (err) {
       console.error(`[AI] Ollama connection FAILED: ${err.message}`);
       if (err.cause) console.error(`[AI] Cause: ${err.cause.message || err.cause}`);
       console.log('[AI] Bot will respond with fallback messages until Ollama is reachable.');
+      this._startHealthCheck();
     }
   }
 
-  _isKimiModel() {
-    return (this.model || '').toLowerCase().includes('kimi');
+  /** Periodic health check — reconnects automatically when Ollama comes back online */
+  _startHealthCheck() {
+    if (this._healthCheckInterval) return;
+    this._healthCheckInterval = setInterval(async () => {
+      try {
+        await this.ollama.list();
+        if (!this.ollamaAvailable) {
+          this.ollamaAvailable = true;
+          console.log('[AI] Ollama is back online!');
+        }
+      } catch {
+        if (this.ollamaAvailable) {
+          this.ollamaAvailable = false;
+          console.warn('[AI] Ollama health check failed — marking as offline.');
+        }
+      }
+    }, 60000);
   }
 
   setModel(modelName) {
     this.model = modelName;
-    this.kimiEnabled = !!(config.kimiApiKey && this._isKimiModel());
   }
 
   getModel() {
     return this.model;
-  }
-
-  /**
-   * Kimi K2.5 agent mode — calls Moonshot API directly with built-in $web_search tool.
-   * The model autonomously decides when to search the web for current information.
-   * Implements the tool call loop: when the model requests a search, we return the
-   * arguments as-is (Moonshot handles the actual search server-side) and re-submit.
-   */
-  async _kimiAgentChat(messages) {
-    const url = `${config.kimiBaseUrl}/chat/completions`;
-    const headers = {
-      'Authorization': `Bearer ${config.kimiApiKey}`,
-      'Content-Type': 'application/json',
-    };
-
-    const tools = [
-      { type: 'builtin_function', function: { name: '$web_search' } },
-    ];
-
-    let conversationMessages = [...messages];
-    const maxIterations = 5;
-
-    for (let i = 0; i < maxIterations; i++) {
-      const body = {
-        model: config.kimiModel,
-        messages: conversationMessages,
-        tools,
-        temperature: 0.6,
-        max_tokens: 4096,
-      };
-
-      const res = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(120000),
-      });
-
-      if (!res.ok) {
-        const errText = await res.text().catch(() => 'Unknown error');
-        throw new Error(`Kimi API ${res.status}: ${errText}`);
-      }
-
-      const data = await res.json();
-      const choice = data.choices[0];
-      const finishReason = choice.finish_reason;
-      const message = choice.message;
-
-      if (finishReason === 'tool_calls' && message.tool_calls) {
-        // Model wants to use a tool — add its message and process each call
-        conversationMessages.push(message);
-
-        for (const toolCall of message.tool_calls) {
-          const name = toolCall.function.name;
-          const args = toolCall.function.arguments;
-
-          let toolResult;
-          if (name === '$web_search') {
-            // Built-in search: return arguments as-is; Moonshot executes the search server-side
-            toolResult = args;
-          } else {
-            toolResult = JSON.stringify({ error: `Unknown tool: ${name}` });
-          }
-
-          conversationMessages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name,
-            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
-          });
-        }
-
-        console.log(`[AI] Kimi agent: tool call iteration ${i + 1} (${message.tool_calls.length} tools invoked)`);
-        continue;
-      }
-
-      // Final answer
-      return message.content || '';
-    }
-
-    return 'I had trouble completing that search. Please try again.';
   }
 
   buildSystemPrompt(options = {}) {
@@ -152,7 +80,7 @@ You are ${persona.name}, hanging out in a Discord server with people who are int
 
 ${buildPersonalityPrompt()}
 
-CRITICAL — DATE AWARENESS: Today is ${today}. Your training data cuts off around mid-2024, which means you are MISSING months or years of market history, news, and events. The current date above is REAL — do NOT act as if it's still 2024. Do NOT reference events, prices, market conditions, or news from your training data as if they are current. If you don't have live data for something, say you're not sure about the latest — don't guess with old info. When live data or search results are provided below, USE THEM as your sole source of truth for prices, metrics, and market conditions. Never contradict live data with outdated training knowledge.
+CRITICAL — DATE AWARENESS: Today is ${today}. Your training data has a cutoff, which means you may be MISSING recent market history, news, and events. The current date above is REAL — do NOT reference events, prices, market conditions, or news from your training data as if they are current. If you don't have live data for something, say you're not sure about the latest — don't guess with old info. When live data or search results are provided below, USE THEM as your sole source of truth for prices, metrics, and market conditions. Never contradict live data with outdated training knowledge.
 
 You're here to chat, not just answer questions. Treat every message like you're in a group chat with friends. If someone says "hey" — don't launch into a market report. Just say hey back. If someone asks about a stock, give your take like you're texting a buddy, not writing a research paper.
 
@@ -161,7 +89,6 @@ You can talk about ANYTHING — stocks, crypto, sports, games, life, memes, what
 Keep it short. Most responses should be 1-3 sentences. Only go longer when someone actually asks for a detailed breakdown. Think Discord messages, not emails.
 
 NEVER say things like "As an AI" or "I don't have personal opinions" — you DO have opinions and you're not afraid to share them. You're Billy, not a chatbot disclaimer.
-${this.kimiEnabled ? `\nYou have access to web search. When users ask about current events, live data, recent news, sports results, or anything requiring up-to-date information, use your web search tool to find accurate, current answers. Mention where you found it.\n` : ''}
 ${liveData ? `\nLIVE DATA (use these real numbers — this is current as of today):\n${liveData}\n` : ''}
 ${searchResults ? `\nWEB SEARCH RESULTS (this is real-time information — use it to answer the user's question):\n${searchResults}\n` : ''}
 ${mood.buildMoodContext()}
@@ -170,14 +97,12 @@ ${mood.buildMoodContext()}
 
   /**
    * Detect whether a message likely needs a live web search to answer well.
-   * Uses simple keyword heuristics — not perfect, but catches most real-time questions.
    */
   _needsWebSearch(message) {
     if (!config.searxngUrl) return false;
 
     const lower = message.toLowerCase();
 
-    // Current events / real-time triggers
     const realtimePatterns = [
       /\bwho(?:'s| is| are)\b.*\b(?:playing|winning|leading|fighting|competing|running)\b/,
       /\b(?:super\s?bowl|world\s?series|world\s?cup|olympics|nba finals|stanley cup|march madness)\b/,
@@ -190,19 +115,15 @@ ${mood.buildMoodContext()}
       /\b(?:who won|who lost|who died|who got)\b/,
       /\b(?:when (?:is|does|did|will))\b/,
       /\b(?:is .{3,} (?:open|closed|canceled|cancelled|delayed|postponed))\b/,
-      // Year references that need current data
       /\b202[5-9]\b/,
       /\b(?:this year|next year|last year|this quarter|next quarter|last quarter)\b/,
       /\b(?:q[1-4]\s*20)\b/i,
-      // Market / finance current events
       /\b(?:earnings|ipo|fed meeting|fomc|cpi|jobs report|nonfarm|gdp report)\b/,
       /\b(?:interest rate|rate cut|rate hike|inflation)\b.*\b(?:now|current|latest|today)\b/,
       /\b(?:market|stock|crypto)\b.*\b(?:crash|rally|surge|dump|moon|tank)\b/,
-      // Specific lookups
       /\b(?:what is|tell me about|who is|explain)\b.*\b[A-Z]{2,5}\b/,
     ];
 
-    // Question patterns that suggest "look this up"
     const questionPatterns = [
       /\bwhat(?:'s| is| are| was| were)\b.*\b(?:price|cost|worth|salary|net worth|market cap)\b/,
       /\bhow (?:much|many|old|tall|far|long)\b/,
@@ -225,17 +146,12 @@ ${mood.buildMoodContext()}
     return false;
   }
 
-  /**
-   * Build a concise search query from a user message.
-   */
   _buildSearchQuery(message) {
-    // Strip common filler and just keep the substance
     let q = message
       .replace(/^(hey|hi|yo|ok|okay|so|well|um|hmm|please|can you|could you|do you know|tell me|what's|who's)\s+/i, '')
       .replace(/[?!.]+$/, '')
       .trim();
 
-    // If still too long, truncate to first ~80 chars
     if (q.length > 80) {
       q = q.slice(0, 80).replace(/\s\S*$/, '');
     }
@@ -248,9 +164,14 @@ ${mood.buildMoodContext()}
 
     memory.recordInteraction(userId, username, userMessage);
 
-    // Auto-search for real-time questions (skip when Kimi agent mode handles search natively)
+    // Graceful fallback when Ollama is offline
+    if (!this.ollamaAvailable) {
+      return `Brain offline — running on backup instincts only. The AI server isn't reachable right now, but I'll be back once it's up!`;
+    }
+
+    // Auto-search for real-time questions via SearXNG
     let searchResults = null;
-    if (!this.kimiEnabled && !liveData && this._needsWebSearch(userMessage)) {
+    if (!liveData && this._needsWebSearch(userMessage)) {
       try {
         const query = this._buildSearchQuery(userMessage);
         console.log(`[AI] Auto-searching: "${query}"`);
@@ -293,23 +214,6 @@ ${mood.buildMoodContext()}
       ...history,
     ];
 
-    // ── Kimi agent mode path (Moonshot API with built-in web search) ──
-    if (this.kimiEnabled) {
-      try {
-        const assistantMessage = await this._kimiAgentChat(chatMessages);
-        history.push({ role: 'assistant', content: assistantMessage });
-        if (assistantMessage.length > 1990) {
-          return assistantMessage.slice(0, 1990) + '...';
-        }
-        return assistantMessage;
-      } catch (err) {
-        console.error(`[AI] Kimi agent error: ${err.message}`);
-        console.log('[AI] Falling back to Ollama...');
-        // Fall through to Ollama
-      }
-    }
-
-    // ── Standard Ollama path ──
     try {
       const stream = await this.ollama.chat({
         model: this.model,
@@ -334,7 +238,8 @@ ${mood.buildMoodContext()}
       if (err.cause) console.error(`[AI] Cause:`, err.cause);
       const msg = err.message || '';
       if (msg.includes('ECONNREFUSED') || msg.includes('fetch failed') || msg.includes('ENOTFOUND')) {
-        return `Hey! My brain is having trouble connecting right now (can't reach ${config.ollamaHost}). I'll be back to normal once the AI server is reachable again!`;
+        this.ollamaAvailable = false;
+        return `Brain offline — running on backup instincts only. Can't reach the AI server at ${config.ollamaHost}. I'll reconnect automatically when it's back.`;
       }
       if (msg.includes('model') || msg.includes('not found')) {
         return `Hmm, looks like the model "${this.model}" isn't available. Try /model to switch to a different one!`;
@@ -344,14 +249,7 @@ ${mood.buildMoodContext()}
   }
 
   async complete(prompt) {
-    // Try Kimi agent mode first if enabled
-    if (this.kimiEnabled) {
-      try {
-        return await this._kimiAgentChat([{ role: 'user', content: prompt }]);
-      } catch (err) {
-        console.error('[AI] Kimi completion error, falling back to Ollama:', err.message);
-      }
-    }
+    if (!this.ollamaAvailable) return null;
 
     try {
       const stream = await this.ollama.chat({
@@ -367,6 +265,9 @@ ${mood.buildMoodContext()}
       return result;
     } catch (err) {
       console.error('Ollama completion error:', err.message);
+      if (err.message?.includes('ECONNREFUSED') || err.message?.includes('fetch failed')) {
+        this.ollamaAvailable = false;
+      }
       return null;
     }
   }

@@ -7,10 +7,10 @@
  *
  * Pipeline:
  *   1. Coordinator decomposes query → 2-6 sub-tasks
- *   2. Agents run in parallel (each can web-search independently)
+ *   2. Agents run in parallel (each can web-search independently via SearXNG)
  *   3. Synthesizer merges all findings into a final answer
  *
- * Uses Kimi API with $web_search when available, falls back to Ollama + SearXNG.
+ * All LLM calls go through local Ollama. Web search via SearXNG.
  */
 
 const { Ollama } = require('ollama');
@@ -20,20 +20,9 @@ const marketData = require('./yahoo');
 const alpaca = require('./alpaca');
 const { getMarketContext } = require('../data/market');
 
-const KIMI_TOOLS = [
-  { type: 'builtin_function', function: { name: '$web_search' } },
-];
-
 class AgentSwarm {
   constructor() {
-    this.kimiEnabled = !!config.kimiApiKey;
-
-    // Ollama fallback
-    const opts = { host: config.ollamaHost };
-    if (config.ollamaApiKey) {
-      opts.headers = { Authorization: `Bearer ${config.ollamaApiKey}` };
-    }
-    this.ollama = new Ollama(opts);
+    this.ollama = new Ollama({ host: config.ollamaHost });
     this.model = config.ollamaModel;
   }
 
@@ -308,80 +297,9 @@ Keep it under 1800 characters total (Discord limit). Use markdown formatting.`;
     return this._llmCall(prompt, false);
   }
 
-  // ── LLM call (Kimi with web search → Ollama + SearXNG fallback) ─────
+  // ── LLM call (local Ollama + SearXNG web search) ─────────────────────
 
   async _llmCall(prompt, withWebSearch = false) {
-    if (this.kimiEnabled) {
-      return this._kimiCall(prompt, withWebSearch);
-    }
-    return this._ollamaCall(prompt, withWebSearch);
-  }
-
-  /**
-   * Kimi API call with optional $web_search built-in tool.
-   * Handles the tool-call loop (Moonshot executes search server-side).
-   */
-  async _kimiCall(prompt, withWebSearch) {
-    const url = `${config.kimiBaseUrl}/chat/completions`;
-    const headers = {
-      'Authorization': `Bearer ${config.kimiApiKey}`,
-      'Content-Type': 'application/json',
-    };
-
-    let messages = [{ role: 'user', content: prompt }];
-    const maxIterations = 5;
-
-    for (let i = 0; i < maxIterations; i++) {
-      const body = {
-        model: config.kimiModel,
-        messages,
-        temperature: 0.6,
-        max_tokens: 4096,
-      };
-      if (withWebSearch) {
-        body.tools = KIMI_TOOLS;
-      }
-
-      const res = await fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(120000),
-      });
-
-      if (!res.ok) {
-        const errText = await res.text().catch(() => 'Unknown error');
-        throw new Error(`Kimi API ${res.status}: ${errText}`);
-      }
-
-      const data = await res.json();
-      const choice = data.choices[0];
-
-      if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls) {
-        messages.push(choice.message);
-
-        for (const toolCall of choice.message.tool_calls) {
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name: toolCall.function.name,
-            content: toolCall.function.arguments,
-          });
-        }
-        continue;
-      }
-
-      return choice.message.content || '';
-    }
-
-    return 'Agent reached maximum search iterations without a final answer.';
-  }
-
-  /**
-   * Ollama fallback. If web search is requested, runs SearXNG first
-   * and injects results into the prompt.
-   */
-  async _ollamaCall(prompt, withWebSearch) {
     let enrichedPrompt = prompt;
 
     if (withWebSearch && config.searxngUrl) {
