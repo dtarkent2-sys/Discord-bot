@@ -27,7 +27,7 @@ An autonomous, goal-driven Discord trading bot powered by [Ollama](https://ollam
 - **Self-Healing** — AI-powered auto-fix for critical bugs via GitHub + Anthropic
 
 ### Infrastructure
-- **Slash Commands** — 13 Discord slash commands: `/ask`, `/analyze`, `/deepanalysis`, `/price`, `/screen`, `/watchlist`, `/sentiment`, `/topic`, `/profile`, `/memory`, `/model`, `/stats`, `/help`
+- **Slash Commands** — 25 Discord slash commands: `/ask`, `/analyze`, `/deepanalysis`, `/price`, `/technicals`, `/gex`, `/screen`, `/macro`, `/sectors`, `/validea`, `/news`, `/social`, `/trending`, `/reddit`, `/research`, `/watchlist`, `/sentiment`, `/topic`, `/profile`, `/memory`, `/model`, `/stats`, `/stream`, `/agent`, `/help`
 - **Self-Editing** — Owner-only prefix commands to update, suggest, auto-edit, rollback, and self-heal code via GitHub + Anthropic AI
 - **Web Dashboard** — Real-time stats page at `/` with JSON API at `/api/stats` and health check at `/health`
 - **Monitoring** — Real-time log viewer, API usage graphs, goal achievement tracking, safety override alerts
@@ -36,7 +36,7 @@ An autonomous, goal-driven Discord trading bot powered by [Ollama](https://ollam
 
 ## Prerequisites
 
-- **Node.js** v18+ — [Download](https://nodejs.org/)
+- **Node.js** v22+ — [Download](https://nodejs.org/)
 - **A Discord Bot Token** — [Create one](https://discord.com/developers/applications)
 - **Ollama** — [Install](https://ollama.com/download) (local or cloud)
 
@@ -76,6 +76,14 @@ All settings are configured through environment variables. See `.env.example`.
 | `OLLAMA_HOST` | Ollama API endpoint | `https://ollama.com` |
 | `OLLAMA_MODEL` | Which Ollama model to use | `gemma4b` |
 | `OLLAMA_API_KEY` | API key for cloud Ollama | — |
+| `KIMI_API_KEY` | Moonshot Kimi K2.5 agent mode API key (enables built-in web search) | — |
+| `KIMI_BASE_URL` | Kimi API base URL | `https://api.moonshot.ai/v1` |
+| `KIMI_MODEL` | Kimi model name | `kimi-k2.5-preview` |
+| `FMP_API_KEY` | Financial Modeling Prep API key (market data for `/price`, `/analyze`, etc.) | — |
+| `ALPACA_API_KEY` | Alpaca Markets API key (real-time data, options, WebSocket, trading) | — |
+| `ALPACA_API_SECRET` | Alpaca Markets API secret | — |
+| `ALPACA_PAPER` | Use paper trading (`true`) or live trading (`false`) | `true` |
+| `ALPACA_FEED` | WebSocket feed: `iex` (free) or `sip` (paid) | `iex` |
 | `GITHUB_TOKEN` | GitHub PAT (for `!update`, `!suggest`, `!autoedit`, `!rollback`, `!selfheal`) | — |
 | `GITHUB_OWNER` | GitHub repo owner | `dtarkent2-sys` |
 | `GITHUB_REPO` | GitHub repo name | `Discord-bot` |
@@ -87,6 +95,7 @@ All settings are configured through environment variables. See `.env.example`.
 | `PORT` | Dashboard/health check port | `3000` |
 | `TRADING_CHANNEL` | Channel name for market updates | `trading-floor` |
 | `GENERAL_CHANNEL` | Channel name for general posts | `general` |
+| `SHARK_AUTO_ENABLE` | Auto-enable SHARK autonomous trading agent on startup | `false` |
 
 ---
 
@@ -97,11 +106,20 @@ All settings are configured through environment variables. See `.env.example`.
 | Command | Description |
 |---|---|
 | `/ask <question>` | Ask the AI anything — uses conversation context and memory |
-| `/analyze <ticker>` | AI-powered stock analysis with live Yahoo Finance market data |
+| `/analyze <ticker>` | AI-powered stock analysis with live market data |
 | `/deepanalysis <ticker>` | Multi-agent deep analysis — 4 analysts, debate, trader, risk → BUY/SELL/HOLD |
 | `/price <ticker>` | Quick price + key stats lookup (P/E, RSI, moving averages, etc.) |
+| `/technicals <ticker>` | Technical analysis — RSI, MACD, Bollinger Bands, SMA/EMA crossovers, ATR |
+| `/gex <ticker>` | Gamma Exposure analysis with chart (requires Alpaca) |
+| `/macro` | Macro environment analysis — market regime, benchmarks, sector breadth |
+| `/sectors` | Sector rotation heatmap — performance of 11 sector ETFs |
+| `/validea <ticker>` | Validea guru fundamental analysis scores |
 | `/news [symbols] [limit]` | Latest market news from Alpaca (optionally filtered by symbols) |
 | `/screen <universe> [rules]` | Run a stock screen (e.g. `/screen SP500 PE < 15, MktCap > 1e9`) |
+| `/research <query>` | Agent Swarm parallel research — multi-angle analysis with consensus |
+| `/social <ticker>` | StockTwits social sentiment + recent posts |
+| `/trending` | StockTwits trending tickers |
+| `/reddit [ticker]` | Reddit sentiment from r/wallstreetbets, r/stocks, r/investing, r/options |
 | `/watchlist [action] [ticker]` | Manage your personal stock watchlist (show/add/remove) |
 | `/sentiment <text>` | Analyze text sentiment — score, positive/negative words |
 | `/topic` | Generate an AI-powered discussion topic for the server |
@@ -109,6 +127,8 @@ All settings are configured through environment variables. See `.env.example`.
 | `/memory` | See what the bot remembers about you (facts, tickers, sentiment) |
 | `/model <name>` | Switch the Ollama model at runtime |
 | `/stats` | View bot statistics, mood, memory usage, and reaction feedback |
+| `/agent <action>` | SHARK autonomous trading agent control (status/enable/disable/config/set/reset/trade/logs/kill) |
+| `/stream <action> [symbols]` | Real-time Alpaca WebSocket market data (start/stop/list/status) |
 | `/help` | Show all available commands |
 
 ### Prefix Commands (Owner Only)
@@ -334,50 +354,62 @@ Mood is updated by market P&L data and market signals, and decays toward neutral
 ```
 Discord-bot/
 ├── index.js                        # Entry point — Discord client, event routing, autonomy loop
-├── agent-core.js                   # Agent brain — goal evaluation, intent classification, action selection
-├── safety-system.js                # Safety guardrails — rate limits, action validation, emergency stop
+├── bot.js                          # Legacy entry point (simpler, prefix-only)
 ├── package.json                    # Dependencies and scripts
 ├── railway.toml                    # Railway deployment config
+├── nixpacks.toml                   # Nixpacks build config
 ├── Dockerfile                      # Container deployment (Railway/DigitalOcean)
 ├── docker-compose.yml              # Local dev with optional PostgreSQL + Redis
 ├── .env.example                    # Environment variable template
 ├── .gitignore
 ├── data/                           # Persistent JSON storage (git-ignored)
-├── scripts/
-│   └── backup-memory.js            # Daily memory database backup to JSON
 └── src/
     ├── config.js                   # Environment config loader
     ├── personality.js              # Bot identity, speech patterns, quirks
     ├── github-client.js            # GitHub API integration (file read/update/rollback)
     ├── ai-coder.js                 # Anthropic API wrapper for code generation
     ├── commands/
-    │   ├── register.js             # Slash command registration with Discord API
-    │   ├── handlers.js             # Slash command handlers (13 commands)
-    │   ├── prefix.js               # Prefix command handlers (!update, !suggest, !autoedit, !rollback, !selfheal, !help)
-    │   └── self-heal.js            # Self-healing command — AI auto-fix for critical bugs
+    │   ├── register.js             # Slash command registration (25 commands)
+    │   ├── handlers.js             # Slash command handlers
+    │   ├── prefix.js               # Owner prefix commands (!update, !suggest, !autoedit, !rollback, !selfheal)
+    │   └── self-heal.js            # Self-healing — AI auto-fix for critical bugs
     ├── tools/
-    │   └── web-search.js           # SearXNG web search with caching + Discord/AI formatting
+    │   └── web-search.js           # SearXNG web search with caching + formatting
     ├── dashboard/
-    │   ├── server.js               # Express web dashboard with /health, /api/stats, /
-    │   └── monitor.html            # Real-time monitoring UI (logs, API usage, goals, safety)
+    │   ├── server.js               # Express dashboard — /health, /api/stats, /api/safety, /api/audit
+    │   └── monitor.html            # Real-time monitoring UI
     ├── data/
     │   ├── freshness.js            # Data freshness gate (assertFresh)
-    │   └── market.js               # Market context provider (getMarketContext)
+    │   └── market.js               # Market context provider (Alpaca + FMP fallback)
     ├── services/
-    │   ├── ai.js                   # Core AI service — system prompt, chat/complete
-    │   ├── autonomous.js           # Goal-driven scheduled behaviors engine
+    │   ├── ai.js                   # Core AI — Ollama + Kimi K2.5 agent mode, web search
+    │   ├── autonomous.js           # Scheduled behaviors engine (briefings, alerts, GEX monitor)
     │   ├── commentary.js           # AI-powered personality inflection with fallbacks
     │   ├── images.js               # Image analysis via Ollama vision models
-    │   ├── memory.js               # Per-user memory — facts, tickers, topics, watchlist, context building
-    │   ├── mood.js                 # Mood engine — 7 states, P&L-driven, decay, market signals
-    │   ├── trading-agents.js       # TradingAgents multi-agent analysis pipeline (4 analysts, debate, trader, risk)
-    │   ├── yahoo.js                # Yahoo Finance client (quotes, history, technicals, screening)
+    │   ├── memory.js               # Per-user memory — facts, tickers, topics, watchlist
+    │   ├── mood.js                 # Mood engine — 7 states, P&L-driven, decay
+    │   ├── trading-agents.js       # Multi-agent analysis (4 analysts, debate, trader, risk committee)
+    │   ├── agent-swarm.js          # Parallel research agent swarm
+    │   ├── yahoo.js                # FMP market data client (stocks + crypto)
+    │   ├── alpaca.js               # Alpaca API (real-time quotes, options, news, trading)
+    │   ├── technicals.js           # Technical indicators (RSI, MACD, Bollinger, SMA/EMA, ATR)
+    │   ├── gamma.js                # Gamma Exposure (GEX) analysis with chart
+    │   ├── macro.js                # Macro environment analysis
+    │   ├── sectors.js              # Sector rotation heatmap
+    │   ├── stocktwits.js           # StockTwits sentiment API
+    │   ├── reddit.js               # Reddit sentiment scraping
+    │   ├── validea.js              # Validea guru fundamental analysis
+    │   ├── mahoraga.js             # SHARK autonomous trading agent
+    │   ├── policy.js               # Trading policy & risk management config
+    │   ├── stream.js               # Alpaca WebSocket real-time data
     │   ├── reactions.js            # Reaction-based learning and pattern tracking
     │   ├── sentiment.js            # Sentiment analysis with per-user trend tracking
-    │   ├── stats.js                # Uptime, message count, error tracking, memory usage
-    │   └── storage.js              # JSON file-based persistent storage
+    │   ├── stats.js                # Uptime, message count, error tracking
+    │   ├── storage.js              # JSON file-based persistent storage
+    │   ├── audit-log.js            # Event audit trail
+    │   └── circuit-breaker.js      # Safety circuit breaker
     └── trading/
-        ├── analyze.js              # Trade analysis orchestrator (fetch → prompt → AI → validate)
+        ├── analyze.js              # Trade analysis orchestrator
         ├── prompt.js               # Anti-hallucination trade analysis prompt builder
         ├── validator.js            # Trade plan JSON schema validator
         └── trade_plan.schema.json  # Trade plan JSON schema definition

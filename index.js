@@ -15,11 +15,11 @@ process.on('unhandledRejection', (reason) => {
 // so the /health endpoint is reachable even if later imports fail.
 const { startDashboard } = require('./src/dashboard/server');
 startDashboard();
-console.log('[Boot] Health server started');
 
 // ── Load remaining modules ──────────────────────────────────────────
 const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
 const config = require('./src/config');
+const log = require('./src/logger')('Bot');
 const ai = require('./src/services/ai');
 const memory = require('./src/services/memory');
 const sentiment = require('./src/services/sentiment');
@@ -32,7 +32,7 @@ const AutonomousBehaviorEngine = require('./src/services/autonomous');
 const { handlePrefixCommand } = require('./src/commands/prefix');
 const stream = require('./src/services/stream');
 
-console.log('[Boot] All modules loaded');
+log.info('Health server started, all modules loaded');
 
 // ── Discord Client Setup ─────────────────────────────────────────────
 const client = new Client({
@@ -52,7 +52,7 @@ const recentBotReplies = new Map(); // botMessageId -> { userMessage, botRespons
 
 // ── Ready Event ──────────────────────────────────────────────────────
 client.once(Events.ClientReady, async (c) => {
-  console.log(`Logged in as ${c.user.tag}`);
+  log.info(`Logged in as ${c.user.tag}`);
   stats.setGuildCount(c.guilds.cache.size);
 
   // Test Ollama connection
@@ -79,7 +79,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     await handleCommand(interaction);
   } catch (err) {
-    console.error('Command error:', err);
+    log.error('Command error:', err);
     stats.recordError();
     const reply = { content: 'Something went wrong running that command.', ephemeral: true };
     if (interaction.deferred || interaction.replied) {
@@ -159,7 +159,7 @@ client.on(Events.MessageCreate, async (message) => {
       }
     }
   } catch (err) {
-    console.error('Message handling error:', err);
+    log.error('Message handling error:', err);
     stats.recordError();
     await message.reply("Sorry, I ran into an error processing that.").catch(() => {});
   }
@@ -191,7 +191,7 @@ client.on(Events.MessageReactionAdd, async (reaction, user) => {
   const isPositive = emoji === '👍';
   reactions.recordFeedback(tracked.userId, tracked.userMessage, tracked.botResponse, isPositive);
 
-  console.log(`Reaction feedback: ${isPositive ? '👍' : '👎'} from ${user.username}`);
+  log.debug(`Reaction feedback: ${isPositive ? '+1' : '-1'} from ${user.username}`);
 });
 
 // ── Guild Join/Leave ─────────────────────────────────────────────────
@@ -205,12 +205,11 @@ client.on(Events.GuildDelete, () => {
 
 // ── Start Bot ────────────────────────────────────────────────────────
 if (!config.token) {
-  console.error('ERROR: DISCORD_TOKEN is not set.');
-  console.error('Create a .env file with your bot token. See .env.example for reference.');
+  log.error('DISCORD_TOKEN is not set. Create a .env file with your bot token. See .env.example for reference.');
   process.exit(1);
 }
 
 client.login(config.token).catch((err) => {
-  console.error('[FATAL] Discord login failed:', err.message);
+  log.error('Discord login failed:', err.message);
   process.exit(1);
 });

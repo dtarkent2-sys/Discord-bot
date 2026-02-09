@@ -32,11 +32,23 @@ class MarketDataClient {
   }
 
   /**
+   * Sanitize a user-provided ticker to prevent log injection and invalid lookups.
+   * Strips anything that isn't alphanumeric, dash, or dot (e.g. BRK.B, BTC-USD).
+   * Returns null if the result is empty or too long.
+   */
+  sanitizeTicker(ticker) {
+    if (!ticker || typeof ticker !== 'string') return null;
+    const cleaned = ticker.replace(/[^A-Za-z0-9.\-]/g, '').trim();
+    if (!cleaned || cleaned.length > 12) return null;
+    return cleaned.toUpperCase();
+  }
+
+  /**
    * Resolve a user-provided ticker to an FMP-compatible symbol.
    * Handles crypto shorthand: BTC → BTCUSD, ETH → ETHUSD, etc.
    */
   resolveTicker(ticker) {
-    const upper = ticker.toUpperCase().trim();
+    const upper = (this.sanitizeTicker(ticker) || ticker.toUpperCase().trim());
     // Already in FMP crypto format (BTCUSD)
     if (upper.endsWith('USD') && CRYPTO_MAP[upper.replace('USD', '')]) return upper;
     // Yahoo-style crypto (BTC-USD) → FMP format
