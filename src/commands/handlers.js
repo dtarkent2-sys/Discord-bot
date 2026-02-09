@@ -828,7 +828,7 @@ async function handleAgent(interaction) {
   }
 
   // Status/config/logs work without Alpaca keys; enable/kill need them
-  if (['enable', 'kill'].includes(action) && !alpacaSvc.enabled) {
+  if (['enable', 'kill', 'trade'].includes(action) && !alpacaSvc.enabled) {
     return interaction.reply({
       content: '**MAHORAGA requires Alpaca.** Set `ALPACA_API_KEY` and `ALPACA_API_SECRET` in your `.env` file.',
       ephemeral: true,
@@ -837,8 +837,8 @@ async function handleAgent(interaction) {
 
   const policy = require('../services/policy');
 
-  // 'set' and 'reset' are also privileged
-  if (['set', 'reset'].includes(action) && !isAuthorized) {
+  // 'set', 'reset', and 'trade' are also privileged
+  if (['set', 'reset', 'trade'].includes(action) && !isAuthorized) {
     const ownerHint = config.botOwnerId ? '' : ' (set BOT_OWNER_ID to grant owner access)';
     return interaction.reply({
       content: `This action is restricted to the bot owner or server administrators${ownerHint}.`,
@@ -908,6 +908,46 @@ async function handleAgent(interaction) {
       case 'reset': {
         policy.resetConfig();
         await interaction.editReply('**MAHORAGA Config Reset**\nAll settings restored to defaults.\n\n_Use `/agent config` to view current settings._');
+        break;
+      }
+      case 'trade': {
+        const ticker = interaction.options.getString('key');
+        if (!ticker) {
+          await interaction.editReply(
+            '**MAHORAGA Manual Trade**\n' +
+            'Specify a ticker to evaluate and trade.\n\n' +
+            '`/agent trade key:AAPL` — run full pipeline (sentiment + technicals + AI) then execute\n' +
+            '`/agent trade key:AAPL value:force` — skip AI, buy directly (risk checks still apply)'
+          );
+          break;
+        }
+
+        const forceVal = interaction.options.getString('value');
+        const force = forceVal?.toLowerCase() === 'force';
+
+        await interaction.editReply(`**MAHORAGA — Evaluating ${ticker.toUpperCase()}...**\n⏳ Running ${force ? 'forced trade' : 'full pipeline'}...`);
+
+        const result = await mahoraga.manualTrade(ticker, { force });
+
+        const lines = [];
+        if (result.success) {
+          lines.push(`**MAHORAGA Trade Executed**`);
+          lines.push(`${result.message}`);
+        } else {
+          lines.push(`**MAHORAGA Trade — ${ticker.toUpperCase()}**`);
+          lines.push(`❌ ${result.message}`);
+        }
+
+        if (result.details?.steps?.length > 0) {
+          lines.push('');
+          lines.push('__Pipeline Steps:__');
+          for (const step of result.details.steps) {
+            lines.push(`• ${step}`);
+          }
+        }
+
+        lines.push(`\n_${alpaca.isPaper ? 'Paper trading' : 'LIVE trading'} mode_`);
+        await interaction.editReply(lines.join('\n'));
         break;
       }
       case 'logs': {
