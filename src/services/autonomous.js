@@ -18,6 +18,7 @@ const mood = require('./mood');
 const commentary = require('./commentary');
 const stats = require('./stats');
 const gamma = require('./gamma');
+const mahoraga = require('./mahoraga');
 const config = require('../config');
 
 class AutonomousBehaviorEngine {
@@ -151,6 +152,18 @@ class AutonomousBehaviorEngine {
       );
       console.log(`[Sprocket] GEX monitor active — watching: ${this.gexWatchlist.join(', ')}`);
     }
+
+    // 6. MAHORAGA AUTONOMOUS TRADING (every 5 min during market hours, Mon-Fri)
+    // Signal ingestion → technical analysis → AI decision → trade execution
+    mahoraga.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
+    this.jobs.push(
+      schedule.scheduleJob({ rule: '*/5 9-16 * * 1-5', tz: 'America/New_York' }, async () => {
+        if (!mahoraga.enabled) return; // only runs when enabled via /agent enable
+        console.log('[MAHORAGA] Running autonomous trading cycle...');
+        await mahoraga.runCycle();
+      })
+    );
+    console.log(`[Sprocket] MAHORAGA trading schedule active (runs when enabled via /agent enable)`);
 
     console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
   }

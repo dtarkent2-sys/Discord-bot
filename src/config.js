@@ -36,8 +36,7 @@ module.exports = {
   alpacaApiKey: process.env.ALPACA_API_KEY || '',
   alpacaApiSecret: process.env.ALPACA_API_SECRET || '',
   alpacaDataUrl: process.env.ALPACA_DATA_URL || 'https://data.alpaca.markets',
-  mahoragaUrl: process.env.MAHORAGA_URL || '',
-  mahoragaToken: process.env.MAHORAGA_TOKEN || '',
+  alpacaPaper: process.env.ALPACA_PAPER || 'true', // 'true' = paper trading (default safe)
   searxngUrl: process.env.SEARXNG_URL || '',
   botOwnerId: process.env.BOT_OWNER_ID || '',
   botPrefix: process.env.BOT_PREFIX || '!',
