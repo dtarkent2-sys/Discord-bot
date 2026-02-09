@@ -35,7 +35,7 @@ class AlpacaService {
 
   // ── Generic fetch helper ─────────────────────────────────────────────
 
-  async _fetch(path, params = {}) {
+  async _fetch(path, params = {}, timeoutMs = 15000) {
     if (!this.enabled) throw new Error('Alpaca API keys not configured');
 
     const url = new URL(`${DATA_BASE}${path}`);
@@ -43,10 +43,10 @@ class AlpacaService {
       if (v != null) url.searchParams.set(k, String(v));
     }
 
-    console.log(`[Alpaca] ${path}`);
+    console.log(`[Alpaca] ${path}${params.expiration_date ? ` exp=${params.expiration_date}` : ''}`);
     const res = await fetch(url.toString(), {
       headers: this._getHeaders(),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     if (!res.ok) {
@@ -142,11 +142,13 @@ class AlpacaService {
 
     let allSnapshots = [];
     let pageToken = null;
+    const deadline = Date.now() + 45000; // 45s total time budget for all pages
+    let pages = 0;
 
-    // Paginate through all results
+    // Paginate through results (with time budget)
     do {
       if (pageToken) params.page_token = pageToken;
-      const data = await this._fetch(`/v1beta1/options/snapshots/${upper}`, params);
+      const data = await this._fetch(`/v1beta1/options/snapshots/${upper}`, params, 20000);
 
       const snapshots = data.snapshots || {};
       for (const [symbol, snap] of Object.entries(snapshots)) {
@@ -154,8 +156,20 @@ class AlpacaService {
       }
 
       pageToken = data.next_page_token || null;
+      pages++;
+
+      // Safety: stop if we've exceeded time budget or too many pages
+      if (Date.now() > deadline) {
+        console.warn(`[Alpaca] Options pagination time budget exceeded after ${pages} pages (${allSnapshots.length} contracts)`);
+        break;
+      }
+      if (pages >= 20) {
+        console.warn(`[Alpaca] Options pagination page limit reached (${allSnapshots.length} contracts)`);
+        break;
+      }
     } while (pageToken);
 
+    console.log(`[Alpaca] ${upper}: fetched ${allSnapshots.length} options in ${pages} page(s)`);
     return allSnapshots;
   }
 
