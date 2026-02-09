@@ -15,15 +15,36 @@
  *   - Below flip → dealers are short gamma (trend/volatility regime)
  */
 
+const path = require('path');
 const config = require('../config');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
+const { registerFont } = require('canvas');
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
 const RISK_FREE_RATE = 0.045; // approximate 10Y yield
 
+// Register bundled fonts so charts render text correctly on any server
+const FONT_DIR = path.join(__dirname, '..', '..', 'assets', 'fonts');
+try {
+  registerFont(path.join(FONT_DIR, 'Inter-Regular.ttf'), { family: 'Inter' });
+  registerFont(path.join(FONT_DIR, 'Inter-Bold.ttf'), { family: 'Inter', weight: 'bold' });
+  console.log('[Gamma] Fonts registered: Inter Regular + Bold');
+} catch (err) {
+  console.warn('[Gamma] Font registration failed (chart text may render as boxes):', err.message);
+}
+
+const FONT_FAMILY = 'Inter';
+
 // Reusable chart renderer (dark theme)
-const chartRenderer = new ChartJSNodeCanvas({ width: 700, height: 420, backgroundColour: '#1e1e2e' });
+const chartRenderer = new ChartJSNodeCanvas({
+  width: 700,
+  height: 420,
+  backgroundColour: '#1e1e2e',
+  chartCallback: (ChartJS) => {
+    ChartJS.defaults.font.family = FONT_FAMILY;
+  },
+});
 
 // Yahoo expects browser-like headers
 const YAHOO_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -444,7 +465,7 @@ class GammaService {
             display: true,
             text: `${ticker.toUpperCase()} — Gamma Exposure by Strike`,
             color: '#e0e0e0',
-            font: { size: 16, weight: 'bold' },
+            font: { size: 16, weight: 'bold', family: FONT_FAMILY },
           },
           legend: { display: false },
         },
@@ -452,6 +473,7 @@ class GammaService {
           x: {
             ticks: {
               color: '#a0a0a0',
+              font: { family: FONT_FAMILY },
               maxRotation: 45,
               autoSkip: true,
               maxTicksLimit: 25,
@@ -459,12 +481,13 @@ class GammaService {
             grid: { color: 'rgba(255,255,255,0.05)' },
           },
           y: {
-            ticks: { color: '#a0a0a0' },
+            ticks: { color: '#a0a0a0', font: { family: FONT_FAMILY } },
             grid: { color: 'rgba(255,255,255,0.1)' },
             title: {
               display: true,
               text: `GEX ($${unit})`,
               color: '#a0a0a0',
+              font: { family: FONT_FAMILY },
             },
           },
         },
@@ -489,7 +512,7 @@ class GammaService {
 
           // Spot label
           ctx.fillStyle = 'rgba(59, 130, 246, 1)';
-          ctx.font = 'bold 11px sans-serif';
+          ctx.font = `bold 11px ${FONT_FAMILY}, sans-serif`;
           ctx.textAlign = 'center';
           ctx.fillText(`SPOT $${spotPrice}`, spotX, yAxis.top - 5);
 
@@ -508,7 +531,7 @@ class GammaService {
             ctx.stroke();
 
             ctx.fillStyle = 'rgba(250, 204, 21, 1)';
-            ctx.font = 'bold 11px sans-serif';
+            ctx.font = `bold 11px ${FONT_FAMILY}, sans-serif`;
             ctx.textAlign = 'center';
             ctx.fillText(`FLIP $${flipStrike}`, flipX, yAxis.top - 5);
           }
