@@ -17,9 +17,15 @@ class AIService {
     this.conversationHistory = new Map();
     this.maxHistory = 20;
 
+    // Kimi K2.5 agent mode — uses Moonshot API with built-in web search
+    this.kimiEnabled = !!(config.kimiApiKey && this._isKimiModel());
+
     console.log(`[AI] Ollama host: ${config.ollamaHost}`);
     console.log(`[AI] Ollama model: ${this.model}`);
     console.log(`[AI] API key: ${config.ollamaApiKey ? 'set' : 'NOT SET'}`);
+    if (this.kimiEnabled) {
+      console.log(`[AI] Kimi agent mode ENABLED (${config.kimiBaseUrl}, model: ${config.kimiModel})`);
+    }
   }
 
   async initialize() {
@@ -43,12 +49,98 @@ class AIService {
     }
   }
 
+  _isKimiModel() {
+    return (this.model || '').toLowerCase().includes('kimi');
+  }
+
   setModel(modelName) {
     this.model = modelName;
+    this.kimiEnabled = !!(config.kimiApiKey && this._isKimiModel());
   }
 
   getModel() {
     return this.model;
+  }
+
+  /**
+   * Kimi K2.5 agent mode — calls Moonshot API directly with built-in $web_search tool.
+   * The model autonomously decides when to search the web for current information.
+   * Implements the tool call loop: when the model requests a search, we return the
+   * arguments as-is (Moonshot handles the actual search server-side) and re-submit.
+   */
+  async _kimiAgentChat(messages) {
+    const url = `${config.kimiBaseUrl}/chat/completions`;
+    const headers = {
+      'Authorization': `Bearer ${config.kimiApiKey}`,
+      'Content-Type': 'application/json',
+    };
+
+    const tools = [
+      { type: 'builtin_function', function: { name: '$web_search' } },
+    ];
+
+    let conversationMessages = [...messages];
+    const maxIterations = 5;
+
+    for (let i = 0; i < maxIterations; i++) {
+      const body = {
+        model: config.kimiModel,
+        messages: conversationMessages,
+        tools,
+        temperature: 0.6,
+        max_tokens: 4096,
+      };
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(120000),
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => 'Unknown error');
+        throw new Error(`Kimi API ${res.status}: ${errText}`);
+      }
+
+      const data = await res.json();
+      const choice = data.choices[0];
+      const finishReason = choice.finish_reason;
+      const message = choice.message;
+
+      if (finishReason === 'tool_calls' && message.tool_calls) {
+        // Model wants to use a tool — add its message and process each call
+        conversationMessages.push(message);
+
+        for (const toolCall of message.tool_calls) {
+          const name = toolCall.function.name;
+          const args = toolCall.function.arguments;
+
+          let toolResult;
+          if (name === '$web_search') {
+            // Built-in search: return arguments as-is; Moonshot executes the search server-side
+            toolResult = args;
+          } else {
+            toolResult = JSON.stringify({ error: `Unknown tool: ${name}` });
+          }
+
+          conversationMessages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            name,
+            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+          });
+        }
+
+        console.log(`[AI] Kimi agent: tool call iteration ${i + 1} (${message.tool_calls.length} tools invoked)`);
+        continue;
+      }
+
+      // Final answer
+      return message.content || '';
+    }
+
+    return 'I had trouble completing that search. Please try again.';
   }
 
   buildSystemPrompt(options = {}) {
@@ -65,6 +157,7 @@ Be conversational, engaging, and helpful. Chat about anything — stocks, market
 Keep responses concise (under 300 words) and natural. No corporate speak.
 
 You are knowledgeable about financial markets, trading, investing, and the economy. Answer questions using your knowledge. Discuss prices, trends, analysis, opinions — whatever the user asks about. Just be helpful.
+${this.kimiEnabled ? `\nYou have access to web search. When users ask about current events, live data, recent news, sports results, or anything requiring up-to-date information, use your web search tool to find accurate, current answers. Always cite your sources.\n` : ''}
 ${liveData ? `\nLIVE DATA (use these real numbers when available):\n${liveData}\n` : ''}
 ${searchResults ? `\nWEB SEARCH RESULTS (use this real-time information to answer the user's question — cite sources when possible):\n${searchResults}\n` : ''}
 ${mood.buildMoodContext()}
@@ -139,9 +232,9 @@ ${mood.buildMoodContext()}
 
     memory.recordInteraction(userId, username, userMessage);
 
-    // Auto-search for real-time questions
+    // Auto-search for real-time questions (skip when Kimi agent mode handles search natively)
     let searchResults = null;
-    if (!liveData && this._needsWebSearch(userMessage)) {
+    if (!this.kimiEnabled && !liveData && this._needsWebSearch(userMessage)) {
       try {
         const query = this._buildSearchQuery(userMessage);
         console.log(`[AI] Auto-searching: "${query}"`);
@@ -179,13 +272,32 @@ ${mood.buildMoodContext()}
       history.splice(0, history.length - this.maxHistory);
     }
 
+    const chatMessages = [
+      { role: 'system', content: fullSystemPrompt },
+      ...history,
+    ];
+
+    // ── Kimi agent mode path (Moonshot API with built-in web search) ──
+    if (this.kimiEnabled) {
+      try {
+        const assistantMessage = await this._kimiAgentChat(chatMessages);
+        history.push({ role: 'assistant', content: assistantMessage });
+        if (assistantMessage.length > 1990) {
+          return assistantMessage.slice(0, 1990) + '...';
+        }
+        return assistantMessage;
+      } catch (err) {
+        console.error(`[AI] Kimi agent error: ${err.message}`);
+        console.log('[AI] Falling back to Ollama...');
+        // Fall through to Ollama
+      }
+    }
+
+    // ── Standard Ollama path ──
     try {
       const stream = await this.ollama.chat({
         model: this.model,
-        messages: [
-          { role: 'system', content: fullSystemPrompt },
-          ...history,
-        ],
+        messages: chatMessages,
         stream: true,
       });
 
@@ -216,6 +328,15 @@ ${mood.buildMoodContext()}
   }
 
   async complete(prompt) {
+    // Try Kimi agent mode first if enabled
+    if (this.kimiEnabled) {
+      try {
+        return await this._kimiAgentChat([{ role: 'user', content: prompt }]);
+      } catch (err) {
+        console.error('[AI] Kimi completion error, falling back to Ollama:', err.message);
+      }
+    }
+
     try {
       const stream = await this.ollama.chat({
         model: this.model,
