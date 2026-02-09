@@ -12,6 +12,7 @@ const gamma = require('../services/gamma');
 const technicals = require('../services/technicals');
 const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
+const stream = require('../services/stream');
 const { AttachmentBuilder } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 
@@ -60,6 +61,8 @@ async function handleCommand(interaction) {
       return handleTrending(interaction);
     case 'agent':
       return handleAgent(interaction);
+    case 'stream':
+      return handleStream(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   }
@@ -277,6 +280,10 @@ async function handleHelp(interaction) {
     '`/profile [@user]` — View user profile and activity',
     '`/memory` — See what the bot remembers about you',
     '`/model <name>` — Switch the AI model',
+    '`/stream start <symbols>` — Subscribe to real-time price stream (Alpaca WebSocket)',
+    '`/stream stop <symbols>` — Unsubscribe from live stream',
+    '`/stream list` — Show active stream subscriptions',
+    '`/stream status` — WebSocket connection status',
     '`/stats` — View bot statistics',
     '`/gex <ticker>` — Gamma exposure analysis with chart',
     '`/technicals <ticker>` — Technical analysis (RSI, MACD, Bollinger, SMA/EMA, ATR)',
@@ -643,6 +650,118 @@ async function handleGEX(interaction) {
     console.error(`[GEX] Error for ${ticker}:`, err);
     const msg = err.message || 'Unknown error';
     await interaction.editReply(`**${ticker} — Gamma Exposure**\n❌ ${msg}`);
+  }
+}
+
+// ── /stream — Real-time Alpaca WebSocket market data ──────────────────
+async function handleStream(interaction) {
+  const action = interaction.options.getString('action');
+  const symbolsInput = interaction.options.getString('symbols');
+  const instance = stream.getInstance();
+
+  if (!instance || !instance.enabled) {
+    await interaction.reply({
+      content: 'Real-time streaming requires `ALPACA_API_KEY` and `ALPACA_API_SECRET` in .env.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  // ── status ──
+  if (action === 'status') {
+    const s = instance.getStatus();
+    const lines = [
+      '**WebSocket Stream Status**',
+      `**Connected:** ${s.connected ? 'Yes' : 'No'}`,
+      `**Feed:** ${s.feed.toUpperCase()}`,
+      `**Symbols streaming:** ${s.symbols}`,
+      `**Channels subscribed:** ${s.channels}`,
+    ];
+    await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+    return;
+  }
+
+  // ── list ──
+  if (action === 'list') {
+    const subs = instance.getSubscriptions(interaction.channelId);
+    if (subs.length === 0) {
+      await interaction.reply({
+        content: 'No active stream subscriptions in this channel. Use `/stream start AAPL,TSLA` to begin.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const priceLines = subs.map(sym => {
+      const latest = instance.getLatestPrice(sym);
+      const bar = instance.getLatestBar(sym);
+      if (latest) {
+        const barInfo = bar ? ` | O:$${bar.open.toFixed(2)} H:$${bar.high.toFixed(2)} L:$${bar.low.toFixed(2)}` : '';
+        return `**${sym}** — $${latest.price.toFixed(2)}${barInfo}`;
+      }
+      return `**${sym}** — awaiting data...`;
+    });
+
+    const lines = [
+      `**Live Stream — ${subs.length} symbol(s)**`,
+      ...priceLines,
+      `\n_Real-time via Alpaca WebSocket (${instance.getStatus().feed.toUpperCase()})_`,
+    ];
+    await interaction.reply(lines.join('\n'));
+    return;
+  }
+
+  // ── start / stop require symbols ──
+  if (!symbolsInput) {
+    await interaction.reply({
+      content: `Please provide symbols. Example: \`/stream ${action} AAPL,TSLA,SPY\``,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const symbols = symbolsInput.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  if (symbols.length === 0) {
+    await interaction.reply({ content: 'No valid symbols provided.', ephemeral: true });
+    return;
+  }
+
+  // ── start ──
+  if (action === 'start') {
+    const result = instance.subscribe(interaction.channelId, symbols);
+
+    if (result.error) {
+      await interaction.reply({ content: `Stream error: ${result.error}`, ephemeral: true });
+      return;
+    }
+
+    const parts = [];
+    if (result.added.length > 0) parts.push(`Subscribed: **${result.added.join(', ')}**`);
+    if (result.already.length > 0) parts.push(`Already streaming: ${result.already.join(', ')}`);
+    parts.push(`\nBig-move alerts (>1.5% per minute bar) will be posted to this channel.`);
+    parts.push(`_Use \`/stream list\` to see live prices._`);
+
+    await interaction.reply(parts.join('\n'));
+    return;
+  }
+
+  // ── stop ──
+  if (action === 'stop') {
+    const result = instance.unsubscribe(interaction.channelId, symbols);
+
+    const parts = [];
+    if (result.removed.length > 0) parts.push(`Unsubscribed: **${result.removed.join(', ')}**`);
+    if (result.notFound.length > 0) parts.push(`Not found: ${result.notFound.join(', ')}`);
+
+    const remaining = instance.getSubscriptions(interaction.channelId);
+    if (remaining.length > 0) {
+      parts.push(`Still streaming: ${remaining.join(', ')}`);
+    } else {
+      parts.push('No active subscriptions in this channel.');
+    }
+
+    await interaction.reply(parts.join('\n'));
+    return;
   }
 }
 

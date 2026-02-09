@@ -185,6 +185,23 @@ const commands = [
           { name: 'logs', value: 'logs' },
           { name: 'kill', value: 'kill' },
         )
+    .setName('stream')
+    .setDescription('Real-time Alpaca WebSocket market data stream')
+    .addStringOption(opt =>
+      opt.setName('action')
+        .setDescription('What to do')
+        .setRequired(true)
+        .addChoices(
+          { name: 'start — Subscribe to live data', value: 'start' },
+          { name: 'stop — Unsubscribe symbols', value: 'stop' },
+          { name: 'list — Show active subscriptions', value: 'list' },
+          { name: 'status — Connection status', value: 'status' },
+        )
+    )
+    .addStringOption(opt =>
+      opt.setName('symbols')
+        .setDescription('Comma-separated tickers (e.g. AAPL,TSLA,SPY)')
+        .setRequired(false)
     ),
 ];
 
