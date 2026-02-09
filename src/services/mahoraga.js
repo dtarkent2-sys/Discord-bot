@@ -247,9 +247,10 @@ class MahoragaEngine {
     if (!decision || decision.action !== 'buy') return;
 
     // 5. Pre-trade risk check
+    const cfg = policy.getConfig();
     const notional = Math.min(
-      policy.getConfig().max_notional_per_trade,
-      Number(account.buying_power || 0) * 0.1 // max 10% of buying power per trade
+      cfg.max_notional_per_trade,
+      Number(account.buying_power || 0) * cfg.position_size_pct
     );
 
     if (notional < 100) return; // don't bother with tiny orders
@@ -410,19 +411,19 @@ class MahoragaEngine {
     if (!cfg) return '_Could not fetch config._';
 
     const lines = [`**MAHORAGA Configuration**`, ``];
-    const keys = [
+
+    // Trading limits
+    lines.push(`__Trading Limits__`);
+    const tradingKeys = [
       ['max_positions', 'Max Positions'],
       ['max_notional_per_trade', 'Max $ Per Trade'],
+      ['position_size_pct', 'Position Size (% of cash)'],
       ['max_daily_loss_pct', 'Max Daily Loss'],
       ['stop_loss_pct', 'Stop Loss'],
       ['take_profit_pct', 'Take Profit'],
       ['cooldown_minutes', 'Trade Cooldown (min)'],
-      ['min_sentiment_score', 'Min Sentiment'],
-      ['min_analyst_confidence', 'Min AI Confidence'],
-      ['allow_shorting', 'Allow Shorting'],
     ];
-
-    for (const [key, label] of keys) {
+    for (const [key, label] of tradingKeys) {
       if (cfg[key] !== undefined) {
         let val = cfg[key];
         if (typeof val === 'number' && key.includes('pct')) val = `${(val * 100).toFixed(1)}%`;
@@ -431,8 +432,40 @@ class MahoragaEngine {
       }
     }
 
+    // Signal thresholds
+    lines.push(``);
+    lines.push(`__Signal Thresholds__`);
+    const signalKeys = [
+      ['min_sentiment_score', 'Min Sentiment'],
+      ['min_analyst_confidence', 'Min AI Confidence'],
+    ];
+    for (const [key, label] of signalKeys) {
+      if (cfg[key] !== undefined) {
+        lines.push(`**${label}:** \`${cfg[key]}\``);
+      }
+    }
+
+    // Feature toggles
+    lines.push(``);
+    lines.push(`__Features__`);
+    lines.push(`**Allow Shorting:** ${cfg.allow_shorting ? '`yes`' : '`no`'}`);
+    lines.push(`**Crypto Trading:** ${cfg.crypto_enabled ? '`enabled`' : '`disabled`'}`);
+    lines.push(`**Options Trading:** ${cfg.options_enabled ? '`enabled`' : '`disabled`'}`);
+    lines.push(`**Scan Interval:** \`${cfg.scan_interval_minutes} min\``);
+
+    // Symbol lists
+    if (cfg.symbol_allowlist?.length > 0) {
+      lines.push(`**Allowlist:** \`${cfg.symbol_allowlist.join(', ')}\``);
+    }
+    if (cfg.symbol_denylist?.length > 0) {
+      lines.push(`**Denylist:** \`${cfg.symbol_denylist.join(', ')}\``);
+    }
+
     lines.push(``);
     lines.push(`Kill Switch: ${cfg.killSwitch ? '🛑 **ACTIVE**' : '🟢 OK'}`);
+    lines.push(``);
+    lines.push(`_Use \`/agent set key:<name> value:<val>\` to change a setting_`);
+    lines.push(`_Use \`/agent reset\` to restore defaults_`);
     return lines.join('\n');
   }
 

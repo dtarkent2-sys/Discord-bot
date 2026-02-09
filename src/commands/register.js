@@ -181,10 +181,22 @@ const commands = [
           { name: 'status', value: 'status' },
           { name: 'enable', value: 'enable' },
           { name: 'disable', value: 'disable' },
-          { name: 'config', value: 'config' },
+          { name: 'config — view current settings', value: 'config' },
+          { name: 'set — change a config value', value: 'set' },
+          { name: 'reset — restore default settings', value: 'reset' },
           { name: 'logs', value: 'logs' },
           { name: 'kill', value: 'kill' },
         )
+    )
+    .addStringOption(opt =>
+      opt.setName('key')
+        .setDescription('Config key to set (e.g. max_positions, stop_loss_pct, crypto_enabled)')
+        .setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('value')
+        .setDescription('New value for the config key')
+        .setRequired(false)
     ),
 
   new SlashCommandBuilder()

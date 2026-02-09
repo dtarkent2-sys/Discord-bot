@@ -290,7 +290,11 @@ async function handleHelp(interaction) {
     '`/technicals <ticker>` — Technical analysis (RSI, MACD, Bollinger, SMA/EMA, ATR)',
     '`/social <ticker>` — Social sentiment from StockTwits',
     '`/trending` — See trending tickers on StockTwits',
-    '`/agent <action>` — Control MAHORAGA autonomous trading agent',
+    '`/agent status` — MAHORAGA agent status, positions, risk',
+    '`/agent config` — View all trading configuration',
+    '`/agent set key:<name> value:<val>` — Change a config value (e.g. stop_loss_pct, max_positions)',
+    '`/agent reset` — Restore default configuration',
+    '`/agent enable|disable|kill` — Control the autonomous trading agent',
     '`/help` — Show this message',
     '',
     '**Prefix Commands (owner only):**',
@@ -854,6 +858,17 @@ async function handleAgent(interaction) {
     });
   }
 
+  const policy = require('../services/policy');
+
+  // 'set' and 'reset' are also privileged
+  if (['set', 'reset'].includes(action) && !isAuthorized) {
+    const ownerHint = config.botOwnerId ? '' : ' (set BOT_OWNER_ID to grant owner access)';
+    return interaction.reply({
+      content: `This action is restricted to the bot owner or server administrators${ownerHint}.`,
+      ephemeral: true,
+    });
+  }
+
   await interaction.deferReply();
 
   try {
@@ -876,6 +891,46 @@ async function handleAgent(interaction) {
       case 'config': {
         const cfg = mahoraga.getConfig();
         await interaction.editReply(mahoraga.formatConfigForDiscord(cfg));
+        break;
+      }
+      case 'set': {
+        const key = interaction.options.getString('key');
+        const value = interaction.options.getString('value');
+
+        if (!key || !value) {
+          const defaults = policy.getDefaultConfig();
+          const { NUMERIC_KEYS, BOOLEAN_KEYS, LIST_KEYS } = policy.getConfigKeyInfo();
+          const lines = [
+            '**MAHORAGA — Available Config Keys**\n',
+            '**Numeric (use decimal for %):**',
+            ...[...NUMERIC_KEYS].map(k => `  \`${k}\` — current: \`${defaults[k]}\``),
+            '',
+            '**Boolean (true/false):**',
+            ...[...BOOLEAN_KEYS].map(k => `  \`${k}\` — current: \`${defaults[k]}\``),
+            '',
+            '**Lists (comma-separated tickers):**',
+            ...[...LIST_KEYS].map(k => `  \`${k}\``),
+            '',
+            '_Example: `/agent set key:stop_loss_pct value:0.03`_',
+          ];
+          await interaction.editReply(lines.join('\n'));
+          break;
+        }
+
+        const result = policy.setConfigKey(key, value);
+        if (result.success) {
+          const displayVal = Array.isArray(result.value)
+            ? result.value.join(', ') || '(empty)'
+            : String(result.value);
+          await interaction.editReply(`**MAHORAGA Config Updated**\n\`${result.key}\` → \`${displayVal}\`\n\n_Changes are saved and persist across restarts._`);
+        } else {
+          await interaction.editReply(`**Config Error**\n${result.error}`);
+        }
+        break;
+      }
+      case 'reset': {
+        policy.resetConfig();
+        await interaction.editReply('**MAHORAGA Config Reset**\nAll settings restored to defaults.\n\n_Use `/agent config` to view current settings._');
         break;
       }
       case 'logs': {
