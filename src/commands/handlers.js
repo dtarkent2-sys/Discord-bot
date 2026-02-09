@@ -17,7 +17,8 @@ const reddit = require('../services/reddit');
 const validea = require('../services/validea');
 const macro = require('../services/macro');
 const sectors = require('../services/sectors');
-const { AttachmentBuilder, PermissionsBitField } = require('discord.js');
+const policy = require('../services/policy');
+const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
 
@@ -77,7 +78,7 @@ async function handleCommand(interaction) {
     case 'stream':
       return handleStream(interaction);
     default:
-      await interaction.reply({ content: 'Unknown command.', ephemeral: true });
+      await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -133,7 +134,7 @@ async function handleMemory(interaction) {
     parts.push(`**Preferences:** ${prefs}`);
   }
 
-  await interaction.reply({ content: parts.join('\n'), ephemeral: true });
+  await interaction.reply({ content: parts.join('\n'), flags: MessageFlags.Ephemeral });
 }
 
 async function handleModel(interaction) {
@@ -299,7 +300,7 @@ async function handleHelp(interaction) {
     'Mention me or DM me to chat! React 👍/👎 on replies so I learn.',
   ];
 
-  await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+  await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
 }
 
 // ── /news — Alpaca news ──────────────────────────────────────────────
@@ -400,7 +401,7 @@ async function handleWatchlist(interaction) {
 
   if (action === 'add') {
     if (!ticker) {
-      await interaction.reply({ content: 'Please provide a ticker to add. Example: `/watchlist add AAPL` or `/watchlist add BTC`', ephemeral: true });
+      await interaction.reply({ content: 'Please provide a ticker to add. Example: `/watchlist add AAPL` or `/watchlist add BTC`', flags: MessageFlags.Ephemeral });
       return;
     }
     const resolved = yahoo.resolveTicker(ticker);
@@ -411,7 +412,7 @@ async function handleWatchlist(interaction) {
 
   if (action === 'remove') {
     if (!ticker) {
-      await interaction.reply({ content: 'Please provide a ticker to remove. Example: `/watchlist remove AAPL`', ephemeral: true });
+      await interaction.reply({ content: 'Please provide a ticker to remove. Example: `/watchlist remove AAPL`', flags: MessageFlags.Ephemeral });
       return;
     }
     const resolved = yahoo.resolveTicker(ticker);
@@ -423,7 +424,7 @@ async function handleWatchlist(interaction) {
   // Show watchlist with live prices
   const list = memory.getWatchlist(userId);
   if (list.length === 0) {
-    await interaction.reply({ content: 'Your watchlist is empty. Use `/watchlist add <ticker>` to add stocks.', ephemeral: true });
+    await interaction.reply({ content: 'Your watchlist is empty. Use `/watchlist add <ticker>` to add stocks.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -483,7 +484,7 @@ async function handleProfile(interaction) {
   const reactionStats = reactions.getUserStats(userId);
 
   if (userData.interactionCount === 0) {
-    await interaction.reply({ content: `No data on **${targetUser.username}** yet.`, ephemeral: true });
+    await interaction.reply({ content: `No data on **${targetUser.username}** yet.`, flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -549,7 +550,7 @@ async function handleDeepAnalysis(interaction) {
     // Send detailed report as a follow-up if it fits
     const detailed = tradingAgents.formatDetailedReport(result);
     if (detailed.length <= 1950) {
-      await interaction.followUp({ content: `\`\`\`md\n${detailed}\n\`\`\``, ephemeral: true });
+      await interaction.followUp({ content: `\`\`\`md\n${detailed}\n\`\`\``, flags: MessageFlags.Ephemeral });
     } else {
       // Chunk it for the user as an ephemeral message
       const chunks = [];
@@ -561,7 +562,7 @@ async function handleDeepAnalysis(interaction) {
       for (let i = 0; i < Math.min(chunks.length, 3); i++) {
         await interaction.followUp({
           content: `\`\`\`md\n${chunks[i]}\n\`\`\``,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     }
@@ -595,7 +596,7 @@ async function handleResearch(interaction) {
     // Detailed report as ephemeral follow-up
     const detailed = agentSwarm.formatDetailedReport(result);
     if (detailed.length <= 1950) {
-      await interaction.followUp({ content: `\`\`\`md\n${detailed}\n\`\`\``, ephemeral: true });
+      await interaction.followUp({ content: `\`\`\`md\n${detailed}\n\`\`\``, flags: MessageFlags.Ephemeral });
     } else {
       const chunks = [];
       let remaining = detailed;
@@ -606,7 +607,7 @@ async function handleResearch(interaction) {
       for (let i = 0; i < Math.min(chunks.length, 5); i++) {
         await interaction.followUp({
           content: `\`\`\`md\n${chunks[i]}\n\`\`\``,
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     }
@@ -660,7 +661,7 @@ async function handleStream(interaction) {
   if (!instance || !instance.enabled) {
     await interaction.reply({
       content: 'Real-time streaming requires `ALPACA_API_KEY` and `ALPACA_API_SECRET` in .env.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -675,7 +676,7 @@ async function handleStream(interaction) {
       `**Symbols streaming:** ${s.symbols}`,
       `**Channels subscribed:** ${s.channels}`,
     ];
-    await interaction.reply({ content: lines.join('\n'), ephemeral: true });
+    await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -685,7 +686,7 @@ async function handleStream(interaction) {
     if (subs.length === 0) {
       await interaction.reply({
         content: 'No active stream subscriptions in this channel. Use `/stream start AAPL,TSLA` to begin.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       return;
     }
@@ -713,14 +714,14 @@ async function handleStream(interaction) {
   if (!symbolsInput) {
     await interaction.reply({
       content: `Please provide symbols. Example: \`/stream ${action} AAPL,TSLA,SPY\``,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
 
   const symbols = symbolsInput.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
   if (symbols.length === 0) {
-    await interaction.reply({ content: 'No valid symbols provided.', ephemeral: true });
+    await interaction.reply({ content: 'No valid symbols provided.', flags: MessageFlags.Ephemeral });
     return;
   }
 
@@ -729,7 +730,7 @@ async function handleStream(interaction) {
     const result = instance.subscribe(interaction.channelId, symbols);
 
     if (result.error) {
-      await interaction.reply({ content: `Stream error: ${result.error}`, ephemeral: true });
+      await interaction.reply({ content: `Stream error: ${result.error}`, flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -922,39 +923,28 @@ async function handleValidea(interaction) {
 // ── /agent — SHARK autonomous trading agent control ───────────────
 async function handleAgent(interaction) {
   const action = interaction.options.getString('action');
-  const alpacaSvc = require('../services/alpaca');
-  const privilegedActions = new Set(['enable', 'disable', 'kill']);
   const hasAdminPerms = interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator);
   const isOwner = config.botOwnerId && interaction.user.id === config.botOwnerId;
   const isAuthorized = isOwner || hasAdminPerms;
 
+  // Fast permission + config checks BEFORE deferring (these are synchronous / instant)
+  const privilegedActions = new Set(['enable', 'disable', 'kill', 'set', 'reset', 'trade']);
   if (privilegedActions.has(action) && !isAuthorized) {
     const ownerHint = config.botOwnerId ? '' : ' (set BOT_OWNER_ID to grant owner access)';
     return interaction.reply({
       content: `This action is restricted to the bot owner or server administrators${ownerHint}.`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
-  // Status/config/logs work without Alpaca keys; enable/kill need them
-  if (['enable', 'kill', 'trade'].includes(action) && !alpacaSvc.enabled) {
+  if (['enable', 'kill', 'trade'].includes(action) && !alpaca.enabled) {
     return interaction.reply({
       content: '**SHARK requires Alpaca.** Set `ALPACA_API_KEY` and `ALPACA_API_SECRET` in your `.env` file.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
-  const policy = require('../services/policy');
-
-  // 'set', 'reset', and 'trade' are also privileged
-  if (['set', 'reset', 'trade'].includes(action) && !isAuthorized) {
-    const ownerHint = config.botOwnerId ? '' : ' (set BOT_OWNER_ID to grant owner access)';
-    return interaction.reply({
-      content: `This action is restricted to the bot owner or server administrators${ownerHint}.`,
-      ephemeral: true,
-    });
-  }
-
+  // Defer IMMEDIATELY after fast checks — Discord gives only 3 seconds
   await interaction.deferReply();
 
   try {
@@ -966,7 +956,7 @@ async function handleAgent(interaction) {
       }
       case 'enable': {
         mahoraga.enable();
-        await interaction.editReply(`🟢 **SHARK agent enabled.** Autonomous trading is now active.\nMode: ${alpacaSvc.isPaper ? '📄 Paper Trading' : '💵 LIVE Trading'}`);
+        await interaction.editReply(`🟢 **SHARK agent enabled.** Autonomous trading is now active.\nMode: ${alpaca.isPaper ? '📄 Paper Trading' : '💵 LIVE Trading'}`);
         break;
       }
       case 'disable': {
