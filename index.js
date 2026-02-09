@@ -19,8 +19,10 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.DirectMessageReactions,
   ],
-  partials: [Partials.Message, Partials.Reaction],
+  partials: [Partials.Message, Partials.Reaction, Partials.Channel],
 });
 
 // Track recent bot replies so we can link reactions to original messages
