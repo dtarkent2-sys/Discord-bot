@@ -2,10 +2,11 @@
  * SHARK — Autonomous Trading Engine
  *
  * Runs directly inside the Discord bot on Railway.
- * Core loop: Signal Ingestion → Technical Analysis → LLM Decision → Trade Execution
+ * Core loop: Signal Ingestion → Fundamentals → Technical Analysis → LLM Decision → Trade Execution
  *
  * Data sources:
  *   - StockTwits (social sentiment / trending)
+ *   - Validea (guru fundamental analysis — Buffett, Lynch, Graham, etc.)
  *   - Alpaca (market data + trade execution)
  *   - Technicals engine (RSI, MACD, Bollinger, etc.)
  *
@@ -17,6 +18,7 @@
 const alpaca = require('./alpaca');
 const stocktwits = require('./stocktwits');
 const technicals = require('./technicals');
+const validea = require('./validea');
 const policy = require('./policy');
 const ai = require('./ai');
 const config = require('../config');
@@ -287,8 +289,21 @@ class SharkEngine {
 
     this._log('scan', `${symbol}: passed filters — sentiment ${(sentiment.score * 100).toFixed(0)}%, net signal ${netSignal.toFixed(2)}, price $${tech.price.toFixed(2)}`);
 
-    // 4. Ask AI for a decision
-    const decision = await this._askAI(symbol, sentiment, tech, signals, netSignal);
+    // 3b. Get fundamental analysis from Validea (non-blocking — don't fail if unavailable)
+    let fundamentals = null;
+    try {
+      fundamentals = await validea.getScore(symbol);
+      if (fundamentals.error) {
+        this._log('scan', `${symbol}: Validea fundamentals unavailable (${fundamentals.error})`);
+      } else {
+        this._log('scan', `${symbol}: Validea fundamentals — ${fundamentals.label} (${(fundamentals.score * 100).toFixed(0)}%), top: ${fundamentals.topGuru || 'n/a'}`);
+      }
+    } catch (err) {
+      this._log('scan', `${symbol}: Validea error — ${err.message}`);
+    }
+
+    // 4. Ask AI for a decision (now with fundamentals)
+    const decision = await this._askAI(symbol, sentiment, tech, signals, netSignal, fundamentals);
     if (!decision) {
       this._log('scan', `${symbol}: skipped — AI returned no decision`);
       return;
@@ -364,9 +379,9 @@ class SharkEngine {
 
   // ── AI Decision ───────────────────────────────────────────────────
 
-  async _askAI(symbol, sentiment, tech, signals, netSignal) {
+  async _askAI(symbol, sentiment, tech, signals, netSignal, fundamentals = null) {
     const prompt = [
-      `You are an autonomous trading analyst. Evaluate this signal and decide whether to BUY or PASS.`,
+      `You are an autonomous trading analyst. Evaluate this signal using BOTH technical and fundamental data, then decide whether to BUY or PASS.`,
       ``,
       `Symbol: ${symbol}`,
       `Price: $${tech.price?.toFixed(2)}`,
@@ -382,11 +397,25 @@ class SharkEngine {
       tech.atr_14 !== null ? `  ATR(14): $${tech.atr_14.toFixed(2)}` : null,
       tech.relative_volume !== null ? `  Volume: ${tech.relative_volume.toFixed(1)}x average` : null,
       ``,
-      `Detected Signals:`,
+      `Detected Technical Signals:`,
       ...signals.map(s => `  [${s.direction.toUpperCase()}] ${s.description} (strength: ${(s.strength * 100).toFixed(0)}%)`),
       `  Net bullish score: ${netSignal.toFixed(2)}`,
       ``,
-      `Respond with ONLY valid JSON: {"action": "buy" or "pass", "confidence": 0.0-1.0, "reason": "brief explanation"}`,
+      // Validea fundamental data
+      ...(fundamentals && !fundamentals.error ? [
+        `Fundamental Analysis (Validea Guru Scores):`,
+        `  Overall: ${fundamentals.label} (${(fundamentals.score * 100).toFixed(0)}% avg across ${fundamentals.strategies} strategies)`,
+        fundamentals.topGuru ? `  Top Guru: ${fundamentals.topGuru}` : null,
+        `  (Scores based on Buffett, Lynch, Graham, Greenblatt & 18+ other guru models)`,
+        `  A score above 80% = "Some Interest", above 90% = "Strong Interest" from that guru's criteria`,
+        ``,
+      ] : [
+        `Fundamental Analysis: unavailable`,
+        ``,
+      ]),
+      `Consider fundamentals alongside technicals. Strong fundamentals (high guru scores) should increase confidence. Weak fundamentals should decrease confidence even if technicals look good.`,
+      ``,
+      `Respond with ONLY valid JSON: {"action": "buy" or "pass", "confidence": 0.0-1.0, "reason": "brief explanation referencing both technical and fundamental factors"}`,
     ].filter(Boolean).join('\n');
 
     try {
@@ -490,6 +519,19 @@ class SharkEngine {
       steps.push(`Technicals: unavailable (${err.message})`);
     }
 
+    // 4b. Validea fundamental analysis (optional — don't block on failure)
+    let fundamentals = null;
+    try {
+      fundamentals = await validea.getScore(symbol);
+      if (fundamentals.error) {
+        steps.push(`Fundamentals: unavailable (${fundamentals.error})`);
+      } else {
+        steps.push(`Fundamentals: ${fundamentals.label} (${(fundamentals.score * 100).toFixed(0)}%), top: ${fundamentals.topGuru || 'n/a'}`);
+      }
+    } catch (err) {
+      steps.push(`Fundamentals: error (${err.message})`);
+    }
+
     // 5. AI decision (skip if force)
     let decision = { action: 'buy', confidence: 1.0, reason: 'Manual force trade' };
     if (!force) {
@@ -497,7 +539,7 @@ class SharkEngine {
         return { success: false, message: 'Cannot evaluate — no price data available.', details: { steps } };
       }
       try {
-        decision = await this._askAI(symbol, sentimentResult, tech, signals, netSignal);
+        decision = await this._askAI(symbol, sentimentResult, tech, signals, netSignal, fundamentals);
         if (!decision) {
           steps.push('AI: no response');
           return { success: false, message: `AI returned no decision for ${symbol}.`, details: { steps } };

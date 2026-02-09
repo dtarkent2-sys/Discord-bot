@@ -13,6 +13,7 @@ const technicals = require('../services/technicals');
 const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
 const stream = require('../services/stream');
+const validea = require('../services/validea');
 const { AttachmentBuilder, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -60,6 +61,8 @@ async function handleCommand(interaction) {
       return handleSocial(interaction);
     case 'trending':
       return handleTrending(interaction);
+    case 'validea':
+      return handleValidea(interaction);
     case 'agent':
       return handleAgent(interaction);
     case 'stream':
@@ -269,7 +272,7 @@ async function handleHelp(interaction) {
   const lines = [
     '**Commands**',
     '`/ask` — Chat with AI | `/analyze` `/deepanalysis` — Stock analysis',
-    '`/price` — Quick quote | `/technicals` — RSI, MACD, Bollinger',
+    '`/price` — Quick quote | `/technicals` — RSI, MACD, Bollinger | `/validea` — Guru fundamentals',
     '`/gex` — Gamma exposure | `/news` — Market news',
     '`/research` — Agent Swarm research | `/screen` — Stock screener',
     '`/social` `/trending` — StockTwits sentiment',
@@ -807,6 +810,25 @@ async function handleTrending(interaction) {
   } catch (err) {
     console.error(`[Trending] Error:`, err);
     await interaction.editReply(`**Trending Tickers**\n❌ ${err.message}`);
+  }
+}
+
+// ── /validea — Validea guru fundamental analysis ──────────────────
+async function handleValidea(interaction) {
+  await interaction.deferReply();
+
+  const ticker = interaction.options.getString('ticker').toUpperCase();
+
+  try {
+    await interaction.editReply(`**${ticker} — Validea Guru Analysis**\n⏳ Fetching fundamental scores from Validea...`);
+
+    const result = await validea.analyze(ticker);
+    const formatted = validea.formatForDiscord(result);
+
+    await interaction.editReply(formatted);
+  } catch (err) {
+    console.error(`[Validea] Error for ${ticker}:`, err);
+    await interaction.editReply(`**${ticker} — Validea Guru Analysis**\n❌ ${err.message}`);
   }
 }
 
