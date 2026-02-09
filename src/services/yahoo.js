@@ -70,7 +70,7 @@ class YahooFinanceClient {
   }
 
   // ── Retry helper — retries on transient network failures ────────────
-  async _retry(fn, label, maxRetries = 2) {
+  async _retry(fn, label, maxRetries = 3) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
         return await fn();
@@ -81,12 +81,22 @@ class YahooFinanceClient {
           msg.includes('ECONNRESET') ||
           msg.includes('ETIMEDOUT') ||
           msg.includes('socket hang up') ||
-          msg.includes('network');
+          msg.includes('network') ||
+          msg.includes('Timeout') ||
+          msg.includes('HTTP 429') ||
+          msg.includes('HTTP 5');
 
         if (isTransient && attempt < maxRetries) {
-          const delay = (attempt + 1) * 1500; // 1.5s, 3s
-          console.warn(`[Yahoo] ${label} attempt ${attempt + 1} failed (${msg}), retrying in ${delay}ms...`);
+          const delay = Math.pow(2, attempt + 1) * 1000; // 2s, 4s, 8s
+          console.warn(`[Yahoo] ${label} attempt ${attempt + 1}/${maxRetries} failed (${msg}), retrying in ${delay}ms...`);
           await new Promise(r => setTimeout(r, delay));
+
+          // Reset the client on repeated failures (stale session/cookies)
+          if (attempt >= 1) {
+            console.warn(`[Yahoo] Resetting client after ${attempt + 1} failures...`);
+            this._yf = null;
+            this._initFailed = false;
+          }
           continue;
         }
         throw err;
@@ -151,18 +161,52 @@ class YahooFinanceClient {
 
     // Fetch quote summary and price history in parallel
     // Both have independent error handling so one failure doesn't kill the other
-    const [summary, history] = await Promise.all([
-      this._retry(
-        () => yf.quoteSummary(upper, {
-          modules: ['price', 'summaryDetail', 'defaultKeyStatistics', 'financialData'],
+    let summary, history;
+    try {
+      [summary, history] = await Promise.all([
+        this._retry(
+          () => yf.quoteSummary(upper, {
+            modules: ['price', 'summaryDetail', 'defaultKeyStatistics', 'financialData'],
+          }),
+          `quoteSummary(${upper})`
+        ),
+        this.getHistory(upper, 200).catch(err => {
+          console.warn(`[Yahoo] History fetch failed for ${upper}, continuing without:`, err.message);
+          return [];
         }),
-        `quoteSummary(${upper})`
-      ),
-      this.getHistory(upper, 200).catch(err => {
-        console.warn(`[Yahoo] History fetch failed for ${upper}, continuing without:`, err.message);
-        return [];
-      }),
-    ]);
+      ]);
+    } catch (err) {
+      // quoteSummary failed — fall back to simpler quote() endpoint
+      console.warn(`[Yahoo] quoteSummary failed for ${upper} (${err.message}), trying quote() fallback...`);
+      const [quote, historyFallback] = await Promise.all([
+        this._retry(() => yf.quote(upper), `quote-fallback(${upper})`),
+        this.getHistory(upper, 200).catch(() => []),
+      ]);
+      // Build a minimal summary from the quote response
+      summary = {
+        price: {
+          shortName: quote.shortName || quote.longName,
+          regularMarketPrice: quote.regularMarketPrice,
+          regularMarketPreviousClose: quote.regularMarketPreviousClose,
+          regularMarketOpen: quote.regularMarketOpen,
+          regularMarketDayHigh: quote.regularMarketDayHigh,
+          regularMarketDayLow: quote.regularMarketDayLow,
+          regularMarketVolume: quote.regularMarketVolume,
+          marketCap: quote.marketCap,
+          regularMarketChange: quote.regularMarketChange,
+          regularMarketChangePercent: quote.regularMarketChangePercent,
+        },
+        summaryDetail: {
+          trailingPE: quote.trailingPE,
+          forwardPE: quote.forwardPE,
+          fiftyTwoWeekHigh: quote.fiftyTwoWeekHigh,
+          fiftyTwoWeekLow: quote.fiftyTwoWeekLow,
+        },
+        defaultKeyStatistics: {},
+        financialData: {},
+      };
+      history = historyFallback;
+    }
 
     const price = summary.price || {};
     const detail = summary.summaryDetail || {};
