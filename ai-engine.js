@@ -7,6 +7,11 @@ const OLLAMA_BASE = process.env.OLLAMA_URL || 'https://ollama.com';
 const OLLAMA_MODEL_PREF = process.env.OLLAMA_MODEL || 'kimi-k2.5:cloud';
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || '';
 
+// Kimi K2.5 agent mode config (Moonshot AI — built-in web search)
+const KIMI_API_KEY = process.env.KIMI_API_KEY || '';
+const KIMI_BASE_URL = process.env.KIMI_BASE_URL || 'https://api.moonshot.ai/v1';
+const KIMI_MODEL = process.env.KIMI_MODEL || 'kimi-k2.5-preview';
+
 class AIEngine {
   constructor(stocks) {
     this.stocks = stocks || null;
