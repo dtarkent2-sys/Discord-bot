@@ -45,4 +45,5 @@ module.exports = {
   dataDir: path.join(__dirname, '..', 'data'),
   tradingChannelName: process.env.TRADING_CHANNEL || 'trading-floor',
   generalChannelName: process.env.GENERAL_CHANNEL || 'general',
+  sharkAutoEnable: (process.env.SHARK_AUTO_ENABLE || '').toLowerCase() === 'true',
 };

@@ -2,7 +2,7 @@
  * Trading Policy / Risk Engine
  *
  * Pre-trade validation and risk management.
- * Ported from MAHORAGA's policy engine concept.
+ * Ported from SHARK's policy engine concept.
  *
  * Rules:
  *   - Kill switch: instant halt of all trading

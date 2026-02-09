@@ -1,7 +1,7 @@
 /**
  * StockTwits Social Sentiment Provider
  *
- * Ported from MAHORAGA (https://github.com/ygwyg/MAHORAGA)
+ * Ported from SHARK (https://github.com/ygwyg/SHARK)
  * Fetches trending tickers and social sentiment from StockTwits.
  * No API key required — uses the free public API.
  *

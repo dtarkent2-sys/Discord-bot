@@ -277,7 +277,7 @@ async function handleHelp(interaction) {
     '`/stream start|stop|list|status` — Live Alpaca WebSocket data',
     '`/memory` `/profile` `/stats` `/model` `/topic`',
     '',
-    '**MAHORAGA Agent**',
+    '**SHARK Agent**',
     '`/agent status` — Positions, risk, P/L',
     '`/agent config` — View settings | `/agent set` — Change settings',
     '`/agent enable|disable|kill|reset|logs`',
@@ -810,7 +810,7 @@ async function handleTrending(interaction) {
   }
 }
 
-// ── /agent — MAHORAGA autonomous trading agent control ───────────────
+// ── /agent — SHARK autonomous trading agent control ───────────────
 async function handleAgent(interaction) {
   const action = interaction.options.getString('action');
   const alpacaSvc = require('../services/alpaca');
@@ -830,7 +830,7 @@ async function handleAgent(interaction) {
   // Status/config/logs work without Alpaca keys; enable/kill need them
   if (['enable', 'kill', 'trade'].includes(action) && !alpacaSvc.enabled) {
     return interaction.reply({
-      content: '**MAHORAGA requires Alpaca.** Set `ALPACA_API_KEY` and `ALPACA_API_SECRET` in your `.env` file.',
+      content: '**SHARK requires Alpaca.** Set `ALPACA_API_KEY` and `ALPACA_API_SECRET` in your `.env` file.',
       ephemeral: true,
     });
   }
@@ -857,12 +857,12 @@ async function handleAgent(interaction) {
       }
       case 'enable': {
         mahoraga.enable();
-        await interaction.editReply(`🟢 **MAHORAGA agent enabled.** Autonomous trading is now active.\nMode: ${alpacaSvc.isPaper ? '📄 Paper Trading' : '💵 LIVE Trading'}`);
+        await interaction.editReply(`🟢 **SHARK agent enabled.** Autonomous trading is now active.\nMode: ${alpacaSvc.isPaper ? '📄 Paper Trading' : '💵 LIVE Trading'}`);
         break;
       }
       case 'disable': {
         mahoraga.disable();
-        await interaction.editReply('🔴 **MAHORAGA agent disabled.** Autonomous trading stopped.');
+        await interaction.editReply('🔴 **SHARK agent disabled.** Autonomous trading stopped.');
         break;
       }
       case 'config': {
@@ -878,7 +878,7 @@ async function handleAgent(interaction) {
           const defaults = policy.getDefaultConfig();
           const { NUMERIC_KEYS, BOOLEAN_KEYS, LIST_KEYS } = policy.getConfigKeyInfo();
           const lines = [
-            '**MAHORAGA — Available Config Keys**\n',
+            '**SHARK — Available Config Keys**\n',
             '**Numeric (use decimal for %):**',
             ...[...NUMERIC_KEYS].map(k => `  \`${k}\` — current: \`${defaults[k]}\``),
             '',
@@ -899,7 +899,7 @@ async function handleAgent(interaction) {
           const displayVal = Array.isArray(result.value)
             ? result.value.join(', ') || '(empty)'
             : String(result.value);
-          await interaction.editReply(`**MAHORAGA Config Updated**\n\`${result.key}\` → \`${displayVal}\`\n\n_Changes are saved and persist across restarts._`);
+          await interaction.editReply(`**SHARK Config Updated**\n\`${result.key}\` → \`${displayVal}\`\n\n_Changes are saved and persist across restarts._`);
         } else {
           await interaction.editReply(`**Config Error**\n${result.error}`);
         }
@@ -907,14 +907,14 @@ async function handleAgent(interaction) {
       }
       case 'reset': {
         policy.resetConfig();
-        await interaction.editReply('**MAHORAGA Config Reset**\nAll settings restored to defaults.\n\n_Use `/agent config` to view current settings._');
+        await interaction.editReply('**SHARK Config Reset**\nAll settings restored to defaults.\n\n_Use `/agent config` to view current settings._');
         break;
       }
       case 'trade': {
         const ticker = interaction.options.getString('key');
         if (!ticker) {
           await interaction.editReply(
-            '**MAHORAGA Manual Trade**\n' +
+            '**SHARK Manual Trade**\n' +
             'Specify a ticker to evaluate and trade.\n\n' +
             '`/agent trade key:AAPL` — run full pipeline (sentiment + technicals + AI) then execute\n' +
             '`/agent trade key:AAPL value:force` — skip AI, buy directly (risk checks still apply)'
@@ -925,16 +925,16 @@ async function handleAgent(interaction) {
         const forceVal = interaction.options.getString('value');
         const force = forceVal?.toLowerCase() === 'force';
 
-        await interaction.editReply(`**MAHORAGA — Evaluating ${ticker.toUpperCase()}...**\n⏳ Running ${force ? 'forced trade' : 'full pipeline'}...`);
+        await interaction.editReply(`**SHARK — Evaluating ${ticker.toUpperCase()}...**\n⏳ Running ${force ? 'forced trade' : 'full pipeline'}...`);
 
         const result = await mahoraga.manualTrade(ticker, { force });
 
         const lines = [];
         if (result.success) {
-          lines.push(`**MAHORAGA Trade Executed**`);
+          lines.push(`**SHARK Trade Executed**`);
           lines.push(`${result.message}`);
         } else {
-          lines.push(`**MAHORAGA Trade — ${ticker.toUpperCase()}**`);
+          lines.push(`**SHARK Trade — ${ticker.toUpperCase()}**`);
           lines.push(`❌ ${result.message}`);
         }
 
@@ -963,7 +963,7 @@ async function handleAgent(interaction) {
     }
   } catch (err) {
     console.error(`[Agent] Error (${action}):`, err);
-    await interaction.editReply(`**MAHORAGA — ${action}**\n❌ ${err.message}`);
+    await interaction.editReply(`**SHARK — ${action}**\n❌ ${err.message}`);
   }
 }
 

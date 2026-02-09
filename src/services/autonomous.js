@@ -154,7 +154,7 @@ class AutonomousBehaviorEngine {
       console.log(`[Sprocket] GEX monitor active — watching: ${this.gexWatchlist.join(', ')}`);
     }
 
-    // 6. MAHORAGA AUTONOMOUS TRADING (configurable interval during market hours)
+    // 6. SHARK AUTONOMOUS TRADING (configurable interval during market hours)
     // Signal ingestion → technical analysis → AI decision → trade execution
     mahoraga.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
     const scanMinutes = policy.getConfig().scan_interval_minutes || 5;
@@ -168,10 +168,10 @@ class AutonomousBehaviorEngine {
       const day = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' })).getDay();
       if (day === 0 || day === 6) return; // weekend
       if (etHour < 9 || etHour >= 16) return; // outside market hours
-      console.log('[MAHORAGA] Running autonomous trading cycle...');
+      console.log('[SHARK] Running autonomous trading cycle...');
       await mahoraga.runCycle();
     }, scanMinutes * 60 * 1000);
-    console.log(`[Sprocket] MAHORAGA trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
+    console.log(`[Sprocket] SHARK trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
 
     console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
   }

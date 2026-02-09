@@ -1,7 +1,7 @@
 /**
  * Technical Analysis Engine
  *
- * Ported from MAHORAGA (https://github.com/ygwyg/MAHORAGA)
+ * Ported from SHARK (https://github.com/ygwyg/SHARK)
  * Provides RSI, MACD, Bollinger Bands, SMA/EMA, ATR calculations
  * and automated signal detection (oversold/overbought, crossovers, etc.)
  *
