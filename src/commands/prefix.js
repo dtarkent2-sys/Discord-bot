@@ -2,6 +2,7 @@ const config = require('../config');
 const github = require('../github-client');
 const aicoder = require('../ai-coder');
 const selfHealModule = require('./self-heal');
+const circuitBreaker = require('../services/circuit-breaker');
 
 // Owner-only guard
 function isOwner(message) {
@@ -188,6 +189,56 @@ async function handleSelfheal(message, args) {
   await selfHealModule.execute(message, args);
 }
 
+// ── !emergency ──────────────────────────────────────────────────────
+// Kills the autonomous loop, activates kill switch, closes all positions,
+// and writes a post-mortem log. Owner-only.
+async function handleEmergency(message) {
+  if (!isOwner(message)) {
+    return message.reply('This command is restricted to the bot owner.');
+  }
+
+  const waitMsg = await message.channel.send('🚨 **INITIATING EMERGENCY STOP...**');
+
+  // The autonomous engine is stored on the client by index.js
+  const autonomousEngine = message.client._autonomousEngine;
+  if (!autonomousEngine) {
+    // Fallback: at least kill the trading engine directly
+    const mahoraga = require('../services/mahoraga');
+    await mahoraga.kill();
+    return waitMsg.edit('🚨 Emergency stop: Kill switch activated, but autonomous engine reference not found. Schedules may still be running — restart the bot to fully stop.');
+  }
+
+  try {
+    const result = await autonomousEngine.emergencyStop();
+    await waitMsg.edit([
+      '🚨 **EMERGENCY STOP COMPLETE**',
+      '',
+      result.message,
+      result.postMortemPath ? `Post-mortem: \`${result.postMortemPath}\`` : '',
+      '',
+      '_All autonomous behaviors halted. Use `/agent enable` after restart to resume._',
+    ].filter(Boolean).join('\n'));
+  } catch (err) {
+    await waitMsg.edit(`🚨 Emergency stop error: ${err.message}`).catch(() => {});
+  }
+}
+
+// ── !cbreset ────────────────────────────────────────────────────────
+// Manually reset the circuit breaker after operator review. Owner-only.
+async function handleCbReset(message) {
+  if (!isOwner(message)) {
+    return message.reply('This command is restricted to the bot owner.');
+  }
+
+  const status = circuitBreaker.getStatus();
+  if (!status.paused) {
+    return message.reply('Circuit breaker is not currently tripped.');
+  }
+
+  circuitBreaker.manualReset();
+  return message.reply('Circuit breaker reset. Trading can resume on next cycle.');
+}
+
 // ── !help ──────────────────────────────────────────────────────────
 async function handleHelp(message) {
   const prefix = config.botPrefix;
@@ -212,6 +263,8 @@ async function handleHelp(message) {
     `\`${prefix}autoedit <file> <instruction>\` — Auto-apply safe changes`,
     `\`${prefix}rollback <file>\` — Revert a file to its previous version`,
     `\`${prefix}selfheal <file>\` — AI auto-fix critical bugs`,
+    `\`${prefix}emergency\` — **EMERGENCY STOP** — kill all trading + schedules`,
+    `\`${prefix}cbreset\` — Reset circuit breaker after review`,
     `\`${prefix}help\` — Show this message`,
   ].join('\n'));
 }
@@ -240,6 +293,8 @@ const commands = {
   autoedit: handleAutoedit,
   rollback: handleRollback,
   selfheal: handleSelfheal,
+  emergency: handleEmergency,
+  cbreset: handleCbReset,
   help: handleHelp,
 };
 

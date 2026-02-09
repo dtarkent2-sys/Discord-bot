@@ -35,6 +35,11 @@ const signalCache = require('./signal-cache');
 const ai = require('./ai');
 const config = require('../config');
 const Storage = require('./storage');
+const auditLog = require('./audit-log');
+const circuitBreaker = require('./circuit-breaker');
+
+// Max ticker evaluations per scan cycle (prevents runaway loops)
+const MAX_EVALS_PER_CYCLE = 8;
 
 class SharkEngine {
   constructor() {
@@ -90,13 +95,39 @@ class SharkEngine {
     this._log('kill', 'EMERGENCY KILL SWITCH — closing all positions');
     console.log('[SHARK] KILL SWITCH ACTIVATED');
 
+    // Collect post-mortem state before closing positions
+    let postMortemState = {
+      killSwitch: true,
+      agent_enabled: false,
+      circuitBreaker: circuitBreaker.getStatus(),
+    };
+
+    try {
+      postMortemState.account = await alpaca.getAccount();
+    } catch (err) {
+      postMortemState.account_error = err.message;
+    }
+
+    try {
+      postMortemState.positions = await alpaca.getPositions();
+    } catch (err) {
+      postMortemState.positions_error = err.message;
+    }
+
     try {
       await alpaca.cancelAllOrders();
       await alpaca.closeAllPositions();
       this._log('kill', 'All orders cancelled and positions closed');
     } catch (err) {
       this._log('error', `Kill switch error: ${err.message}`);
+      postMortemState.closeError = err.message;
     }
+
+    postMortemState.recentLogs = this._logs.slice(-50);
+    const pmPath = auditLog.writePostMortem(postMortemState);
+    this._log('kill', `Post-mortem written: ${pmPath}`);
+
+    return pmPath;
   }
 
   // ── Status / Config / Logs ────────────────────────────────────────
@@ -127,6 +158,7 @@ class SharkEngine {
     };
 
     status.config = policy.getConfig();
+    status.circuitBreaker = circuitBreaker.getStatus();
     return status;
   }
 
@@ -140,6 +172,8 @@ class SharkEngine {
     const entry = { type, message, timestamp: new Date().toISOString() };
     this._logs.push(entry);
     if (this._logs.length > 200) this._logs.shift();
+    // Persist to audit log file
+    auditLog.log(type, `[SHARK] ${message}`);
     return entry;
   }
 
@@ -157,6 +191,13 @@ class SharkEngine {
    */
   async runCycle() {
     if (!this.enabled) return;
+
+    // Circuit breaker: pause trading after consecutive bad outcomes
+    if (circuitBreaker.isPaused()) {
+      const remaining = circuitBreaker.remainingPauseMinutes();
+      this._log('circuit_breaker', `Trading paused by circuit breaker — ${remaining} min remaining`);
+      return;
+    }
 
     try {
       // ── 1. MACRO CHECK (Druckenmiller: 50% of a stock's move) ──
@@ -196,9 +237,13 @@ class SharkEngine {
         await this._scanSignals(account, macroRegime);
       }
 
+      // Cycle completed successfully — reset error counter
+      circuitBreaker.recordSuccessfulCycle();
+
     } catch (err) {
       console.error('[SHARK] Cycle error:', err.message);
       this._log('error', `Cycle error: ${err.message}`);
+      circuitBreaker.recordError(err.message);
     }
   }
 
@@ -217,11 +262,16 @@ class SharkEngine {
           this._log('trade', `CLOSE ${exit.symbol}: ${exit.message}`);
           console.log(`[SHARK] ${exit.message}`);
 
+          // Record exit in circuit breaker (tracks consecutive stop-losses)
+          const cbResult = circuitBreaker.recordExit(exit.symbol, exit.reason, exit.pnlPct);
+
           if (this._postToChannel) {
             const emoji = exit.reason === 'take_profit' ? '🟢' : '🔴';
-            await this._postToChannel(
-              `${emoji} **SHARK Auto-Exit: ${exit.symbol}**\n${exit.message}\n_Position closed automatically._`
-            );
+            let exitMsg = `${emoji} **SHARK Auto-Exit: ${exit.symbol}**\n${exit.message}\n_Position closed automatically._`;
+            if (cbResult.tripped) {
+              exitMsg += `\n\n🛑 **CIRCUIT BREAKER TRIPPED** — ${cbResult.message}`;
+            }
+            await this._postToChannel(exitMsg);
           }
         } catch (err) {
           this._log('error', `Failed to close ${exit.symbol}: ${err.message}`);
@@ -265,7 +315,14 @@ class SharkEngine {
 
       this._log('scan', `Scanning ${candidates.length} candidates: ${candidates.join(', ')} (ST: ${stSymbols.length}, Reddit: ${rdSymbols.length}, ${positions.length} positions open)`);
 
+      let evalCount = 0;
       for (const symbol of candidates) {
+        // Per-cycle cap: prevent runaway evaluation loops
+        if (evalCount >= MAX_EVALS_PER_CYCLE) {
+          this._log('scan', `Cycle eval cap reached (${MAX_EVALS_PER_CYCLE}) — deferring remaining candidates`);
+          break;
+        }
+
         // Skip if we already hold this
         if (positionSymbols.has(symbol)) continue;
 
@@ -274,6 +331,7 @@ class SharkEngine {
         if (cfg.symbol_denylist.length > 0 && cfg.symbol_denylist.includes(symbol)) continue;
         if (cfg.symbol_allowlist.length > 0 && !cfg.symbol_allowlist.includes(symbol)) continue;
 
+        evalCount++;
         try {
           await this._evaluateSignal(symbol, account, positions.length, macroRegime);
         } catch (err) {
@@ -574,7 +632,13 @@ class SharkEngine {
     ].filter(Boolean).join('\n');
 
     try {
+      const startTime = Date.now();
       const response = await ai.complete(prompt);
+      const durationMs = Date.now() - startTime;
+
+      // Log full prompt/response to audit file for debugging
+      auditLog.logOllama(symbol, prompt, response, durationMs);
+
       if (!response) return null;
 
       // Parse JSON from response

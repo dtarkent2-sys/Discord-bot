@@ -9,6 +9,11 @@
  *
  * All data comes from provider methods — never invented.
  * If a data fetch fails, Sprocket says so honestly.
+ *
+ * HARDENED:
+ * - Rate-limited Discord posting (min 2s between messages per channel)
+ * - Emergency stop kills autonomous loop + writes post-mortem
+ * - All scheduled actions logged to audit trail
  */
 
 const schedule = require('node-schedule');
@@ -21,11 +26,20 @@ const gamma = require('./gamma');
 const mahoraga = require('./mahoraga');
 const policy = require('./policy');
 const config = require('../config');
+const auditLog = require('./audit-log');
+const circuitBreaker = require('./circuit-breaker');
+
+// Rate limit: minimum ms between Discord posts per channel
+const RATE_LIMIT_MS = 2000;
 
 class AutonomousBehaviorEngine {
   constructor(client) {
     this.client = client;
     this.jobs = [];
+    this._stopped = false; // emergency stop flag
+
+    // Rate limiting state: channelName → last post timestamp
+    this._lastPostTime = new Map();
 
     // GEX monitor state — tracks last-known regime so we only alert on flips
     // Key: ticker, Value: { flipStrike, regime, spotPrice, lastAlertTime }
@@ -35,11 +49,13 @@ class AutonomousBehaviorEngine {
 
   startAllSchedules() {
     console.log(`[Sprocket] Starting autonomous behavior schedules...`);
+    this._stopped = false;
 
     // 1. PRE-MARKET BRIEFING (8:30 AM ET, Monday-Friday)
     this.jobs.push(
       schedule.scheduleJob({ rule: '30 8 * * 1-5', tz: 'America/New_York' }, async () => {
-        console.log('[Sprocket] Running pre-market briefing...');
+        if (this._stopped) return;
+        auditLog.log('schedule', 'Running pre-market briefing');
         try {
           const spyData = await this.getPreMarketMove('SPY');
 
@@ -72,6 +88,7 @@ class AutonomousBehaviorEngine {
           await this.postToChannel(config.tradingChannelName, message);
         } catch (err) {
           console.error('[Sprocket] Pre-market briefing error:', err.message);
+          auditLog.log('error', `Pre-market briefing error: ${err.message}`);
         }
       })
     );
@@ -79,7 +96,8 @@ class AutonomousBehaviorEngine {
     // 2. MARKET HEALTH PULSE (Every 2 hours during market hours: 10, 12, 2, 4 PM ET)
     this.jobs.push(
       schedule.scheduleJob({ rule: '0 10,12,14,16 * * 1-5', tz: 'America/New_York' }, async () => {
-        console.log('[Sprocket] Running market health pulse...');
+        if (this._stopped) return;
+        auditLog.log('schedule', 'Running market health pulse');
         try {
           // Decay mood toward neutral between updates
           mood.decay();
@@ -97,6 +115,7 @@ class AutonomousBehaviorEngine {
           await this.postToChannel(config.tradingChannelName, message);
         } catch (err) {
           console.error('[Sprocket] Market health pulse error:', err.message);
+          auditLog.log('error', `Market health pulse error: ${err.message}`);
         }
       })
     );
@@ -104,8 +123,9 @@ class AutonomousBehaviorEngine {
     // 3. UNPROMPTED OBSERVATIONS (11 AM ET, 30% chance)
     this.jobs.push(
       schedule.scheduleJob({ rule: '0 11 * * 1-5', tz: 'America/New_York' }, async () => {
+        if (this._stopped) return;
         if (Math.random() > 0.3) return; // 30% chance to trigger
-        console.log('[Sprocket] Running unprompted observation...');
+        auditLog.log('schedule', 'Running unprompted observation');
         try {
           const observation = await this.scanForUnusualActivity();
           if (!observation) return;
@@ -116,6 +136,7 @@ class AutonomousBehaviorEngine {
           await this.postToChannel(config.tradingChannelName, message);
         } catch (err) {
           console.error('[Sprocket] Observation scan error:', err.message);
+          auditLog.log('error', `Observation scan error: ${err.message}`);
         }
       })
     );
@@ -123,7 +144,8 @@ class AutonomousBehaviorEngine {
     // 4. WEEKEND REFLECTION (Saturday 10 AM ET)
     this.jobs.push(
       schedule.scheduleJob({ rule: '0 10 * * 6', tz: 'America/New_York' }, async () => {
-        console.log('[Sprocket] Running weekend reflection...');
+        if (this._stopped) return;
+        auditLog.log('schedule', 'Running weekend reflection');
         try {
           const reflection = await this.generateWeeklyReflection();
 
@@ -138,6 +160,7 @@ class AutonomousBehaviorEngine {
           await this.postToChannel(config.generalChannelName, message);
         } catch (err) {
           console.error('[Sprocket] Weekend reflection error:', err.message);
+          auditLog.log('error', `Weekend reflection error: ${err.message}`);
         }
       })
     );
@@ -147,7 +170,8 @@ class AutonomousBehaviorEngine {
     if (gamma.enabled) {
       this.jobs.push(
         schedule.scheduleJob({ rule: '*/30 9-16 * * 1-5', tz: 'America/New_York' }, async () => {
-          console.log('[Sprocket] Running GEX flip monitor...');
+          if (this._stopped) return;
+          auditLog.log('schedule', 'Running GEX flip monitor');
           await this._runGEXMonitor();
         })
       );
@@ -159,6 +183,7 @@ class AutonomousBehaviorEngine {
     mahoraga.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
     const scanMinutes = policy.getConfig().scan_interval_minutes || 5;
     this._mahoragaInterval = setInterval(async () => {
+      if (this._stopped) return;
       if (!mahoraga.enabled) return;
       // Only trade during market hours (Mon-Fri, roughly 9:30-16:00 ET)
       const now = new Date();
@@ -168,7 +193,7 @@ class AutonomousBehaviorEngine {
       const day = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' })).getDay();
       if (day === 0 || day === 6) return; // weekend
       if (etHour < 9 || etHour >= 16) return; // outside market hours
-      console.log('[SHARK] Running autonomous trading cycle...');
+      auditLog.log('schedule', 'Running SHARK autonomous trading cycle');
       await mahoraga.runCycle();
     }, scanMinutes * 60 * 1000);
     console.log(`[Sprocket] SHARK trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
@@ -185,10 +210,53 @@ class AutonomousBehaviorEngine {
       clearInterval(this._mahoragaInterval);
       this._mahoragaInterval = null;
     }
+    this._stopped = true;
     console.log('[Sprocket] All scheduled behaviors stopped.');
+    auditLog.log('schedule', 'All scheduled behaviors stopped');
   }
 
-  // ── Channel posting ────────────────────────────────────────────────
+  /**
+   * Emergency stop — kills the autonomous loop, the trading engine,
+   * closes all positions, and writes a post-mortem log.
+   * Triggered by !emergency prefix command.
+   * @returns {{ postMortemPath: string, message: string }}
+   */
+  async emergencyStop() {
+    auditLog.log('emergency', 'EMERGENCY STOP INITIATED');
+
+    // 1. Stop all scheduled behaviors immediately
+    this.stopAllSchedules();
+
+    // 2. Kill the trading engine (closes positions, writes post-mortem)
+    let postMortemPath = null;
+    try {
+      postMortemPath = await mahoraga.kill();
+    } catch (err) {
+      auditLog.log('error', `Emergency kill error: ${err.message}`);
+    }
+
+    // 3. Post to trading channel
+    try {
+      await this.postToChannel(config.tradingChannelName, [
+        `🚨 **EMERGENCY STOP ACTIVATED**`,
+        ``,
+        `All autonomous behaviors have been halted.`,
+        `Kill switch activated — all orders cancelled, positions closing.`,
+        `Post-mortem log written for debugging.`,
+        ``,
+        `_Use /agent enable and restart schedules to resume._`,
+      ].join('\n'));
+    } catch {
+      // Best effort — don't fail the emergency stop
+    }
+
+    const message = 'Emergency stop complete. All schedules stopped, kill switch active, positions closing.';
+    auditLog.log('emergency', message);
+
+    return { postMortemPath, message };
+  }
+
+  // ── Channel posting (rate-limited) ──────────────────────────────────
 
   async postToChannel(channelName, content) {
     const channel = this.client.channels.cache.find(
@@ -200,11 +268,35 @@ class AutonomousBehaviorEngine {
       return;
     }
 
+    // Rate limiting: enforce minimum gap between posts to same channel
+    const lastPost = this._lastPostTime.get(channelName) || 0;
+    const elapsed = Date.now() - lastPost;
+    if (elapsed < RATE_LIMIT_MS) {
+      const waitMs = RATE_LIMIT_MS - elapsed;
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+    }
+
     try {
       await channel.send(content);
+      this._lastPostTime.set(channelName, Date.now());
       stats.recordMessage();
     } catch (err) {
-      console.error(`[Sprocket] Failed to post to #${channelName}:`, err.message);
+      // Handle Discord rate limit (429) with retry
+      if (err.httpStatus === 429 || err.message?.includes('rate limit')) {
+        const retryAfter = err.retryAfter || 5000;
+        console.warn(`[Sprocket] Discord rate limited on #${channelName}, waiting ${retryAfter}ms`);
+        auditLog.log('rate_limit', `Discord rate limit on #${channelName}, waiting ${retryAfter}ms`);
+        await new Promise(resolve => setTimeout(resolve, retryAfter));
+        try {
+          await channel.send(content);
+          this._lastPostTime.set(channelName, Date.now());
+          stats.recordMessage();
+        } catch (retryErr) {
+          console.error(`[Sprocket] Retry failed for #${channelName}:`, retryErr.message);
+        }
+      } else {
+        console.error(`[Sprocket] Failed to post to #${channelName}:`, err.message);
+      }
     }
   }
 
@@ -344,7 +436,7 @@ class AutonomousBehaviorEngine {
           ].join('\n');
 
           await this.postToChannel(config.tradingChannelName, alert);
-          console.log(`[Sprocket] GEX alert sent for ${ticker}: ${flip.regime}`);
+          auditLog.log('gex', `GEX alert: ${ticker} regime=${flip.regime}`);
 
           this.gexState.set(ticker, {
             flipStrike: flip.flipStrike,
@@ -372,6 +464,8 @@ class AutonomousBehaviorEngine {
    */
   async generateWeeklyReflection() {
     const botStats = stats.getSummary();
+    const moodSummary = mood.getSummary();
+    const cbStatus = circuitBreaker.getStatus();
 
     const lines = [
       `Another week in the books. Here's the efficiency report:`,
@@ -381,6 +475,8 @@ class AutonomousBehaviorEngine {
       `- Errors encountered: **${botStats.errors}** ${botStats.errors === 0 ? '(running at peak efficiency)' : '(room for optimization)'}`,
       `- Uptime: **${botStats.uptime}**`,
       `- Memory footprint: **${botStats.memory.heapUsed}/${botStats.memory.heapTotal} MB** heap`,
+      `- Mood: **${moodSummary.mood}** (score: ${moodSummary.score}, rolling avg PNL: ${(moodSummary.rollingAvgPnL || 0).toFixed(2)}%)`,
+      `- Circuit breaker trips: **${cbStatus.totalTrips}** (consecutive bad trades: ${cbStatus.consecutiveBadTrades})`,
       ``,
       `Market data review is not available until data providers are connected.`,
       `Use /analyze <ticker> during the week for live analysis.`,

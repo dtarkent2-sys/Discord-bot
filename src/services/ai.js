@@ -4,6 +4,7 @@ const memory = require('./memory');
 const mood = require('./mood');
 const { persona, buildPersonalityPrompt } = require('../personality');
 const { webSearch, formatResultsForAI } = require('../tools/web-search');
+const auditLog = require('./audit-log');
 
 class AIService {
   constructor() {
@@ -344,10 +345,15 @@ ${mood.buildMoodContext()}
   }
 
   async complete(prompt) {
+    const startTime = Date.now();
+
     // Try Kimi agent mode first if enabled
     if (this.kimiEnabled) {
       try {
-        return await this._kimiAgentChat([{ role: 'user', content: prompt }]);
+        const result = await this._kimiAgentChat([{ role: 'user', content: prompt }]);
+        const durationMs = Date.now() - startTime;
+        auditLog.logOllama('kimi-complete', prompt, result, durationMs);
+        return result;
       } catch (err) {
         console.error('[AI] Kimi completion error, falling back to Ollama:', err.message);
       }
@@ -364,9 +370,14 @@ ${mood.buildMoodContext()}
       for await (const part of stream) {
         result += part.message.content;
       }
+
+      const durationMs = Date.now() - startTime;
+      auditLog.logOllama('ollama-complete', prompt, result, durationMs);
+
       return result;
     } catch (err) {
       console.error('Ollama completion error:', err.message);
+      auditLog.log('error', `Ollama completion error: ${err.message}`);
       return null;
     }
   }
