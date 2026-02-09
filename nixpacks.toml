@@ -1,0 +1,15 @@
+# System packages required by the `canvas` npm module (chartjs-node-canvas).
+# Without these, fontconfig cannot load its default config and chart rendering fails.
+[phases.setup]
+aptPkgs = [
+  "fontconfig",
+  "libfontconfig1",
+  "libcairo2",
+  "libpango-1.0-0",
+  "libpangocairo-1.0-0",
+  "libjpeg-dev",
+  "libgif-dev",
+  "librsvg2-dev",
+  "libpixman-1-0",
+  "fonts-dejavu-core",
+]
