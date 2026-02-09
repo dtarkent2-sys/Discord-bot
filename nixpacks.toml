@@ -13,3 +13,6 @@ aptPkgs = [
   "libpixman-1-0",
   "fonts-dejavu-core",
 ]
+
+[phases.install]
+cmds = ["npm ci"]
