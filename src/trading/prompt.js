@@ -6,12 +6,14 @@
 function buildTradeAnalysisPrompt(marketContext) {
   const snapshot = marketContext.snapshot || {};
 
-  return `You are a strict, data-only trade analyst. Follow these rules WITHOUT EXCEPTION:
+  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+  return `You are a strict, data-only trade analyst. Today is ${today}. Your training data cuts off around mid-2024 — ignore any stale knowledge about this stock's price or events. Follow these rules WITHOUT EXCEPTION:
 
 === HARD RULES ===
-1. ONLY use the market data provided below. Do NOT invent, assume, or hallucinate any prices, dates, percentages, or facts.
+1. ONLY use the market data provided below (sourced LIVE from FMP as of today). Do NOT invent, assume, or hallucinate any prices, dates, percentages, or facts.
 2. If BOTH the Quote AND Price History sections are missing, you MUST respond with direction "NO_TRADE" and list "quote" and "price_history" in "missingFields".
-3. Never reference external knowledge about this stock. You know NOTHING except what is in the PROVIDED DATA section.
+3. Never reference external knowledge about this stock. You know NOTHING except what is in the PROVIDED DATA section. Any price or event you remember from training is OUTDATED — do not use it.
 4. Every claim in "reasoning" must directly cite a data point from the PROVIDED DATA.
 5. If you are uncertain, choose NO_TRADE. Never guess.
 

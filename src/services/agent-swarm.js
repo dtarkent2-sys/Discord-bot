@@ -198,11 +198,11 @@ ${subtask.task}`;
         if (realTimeContext) {
           agentPrompt += `
 
---- REAL-TIME DATA (current as of today, ${new Date().toLocaleDateString()}) ---
+--- REAL-TIME DATA (current as of today, ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}) ---
 ${realTimeContext}
 --- END REAL-TIME DATA ---
 
-IMPORTANT: Use the real-time data above as your primary source. Do NOT mention "knowledge cutoff" — you have live data.`;
+IMPORTANT: Your training data cuts off around mid-2024. The date above and all data in this section are LIVE from FMP — treat them as your sole source of truth. Do NOT reference outdated prices or events from training data. Do NOT mention "knowledge cutoff" — just use the live data provided.`;
         }
 
         agentPrompt += `
