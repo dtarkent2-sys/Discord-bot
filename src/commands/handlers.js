@@ -6,6 +6,7 @@ const reactions = require('../services/reactions');
 const sentiment = require('../services/sentiment');
 const yahoo = require('../services/yahoo');
 const tradingAgents = require('../services/trading-agents');
+const agentSwarm = require('../services/agent-swarm');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 
 async function handleCommand(interaction) {
@@ -39,6 +40,8 @@ async function handleCommand(interaction) {
       return handleProfile(interaction);
     case 'deepanalysis':
       return handleDeepAnalysis(interaction);
+    case 'research':
+      return handleResearch(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', ephemeral: true });
   }
@@ -246,6 +249,7 @@ async function handleHelp(interaction) {
     '`/ask <question>` — Ask the AI a question',
     '`/analyze <ticker>` — AI-powered stock/crypto analysis with live data (e.g. AAPL, BTC, ETH)',
     '`/deepanalysis <ticker>` — Multi-agent deep analysis — BUY/SELL/HOLD signal (stocks & crypto)',
+    '`/research <query>` — Agent Swarm — parallel AI agents research any complex topic',
     '`/price <ticker>` — Quick price + key stats lookup (stocks & crypto)',
     '`/screen <universe> [rules]` — Run a stock screen',
     '`/watchlist [action] [ticker]` — Manage your stock/crypto watchlist',
@@ -472,6 +476,51 @@ async function handleDeepAnalysis(interaction) {
   } catch (err) {
     console.error(`[DeepAnalysis] Error for ${ticker}:`, err);
     await interaction.editReply(`**TradingAgents — ${ticker}**\n❌ Analysis failed: ${err.message}`);
+  }
+}
+
+// ── /research — Agent Swarm parallel research ────────────────────────
+async function handleResearch(interaction) {
+  await interaction.deferReply();
+
+  const query = interaction.options.getString('query');
+
+  const updateProgress = async (message) => {
+    try {
+      await interaction.editReply(`**Agent Swarm Research**\n⏳ ${message}`);
+    } catch (e) {
+      // Ignore edit errors during rapid updates
+    }
+  };
+
+  try {
+    const result = await agentSwarm.research(query, updateProgress);
+
+    // Main synthesis
+    const formatted = agentSwarm.formatForDiscord(result);
+    await interaction.editReply(formatted);
+
+    // Detailed report as ephemeral follow-up
+    const detailed = agentSwarm.formatDetailedReport(result);
+    if (detailed.length <= 1950) {
+      await interaction.followUp({ content: `\`\`\`md\n${detailed}\n\`\`\``, ephemeral: true });
+    } else {
+      const chunks = [];
+      let remaining = detailed;
+      while (remaining.length > 0) {
+        chunks.push(remaining.slice(0, 1900));
+        remaining = remaining.slice(1900);
+      }
+      for (let i = 0; i < Math.min(chunks.length, 5); i++) {
+        await interaction.followUp({
+          content: `\`\`\`md\n${chunks[i]}\n\`\`\``,
+          ephemeral: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.error(`[Research] Error:`, err);
+    await interaction.editReply(`**Agent Swarm Research**\n❌ Research failed: ${err.message}`);
   }
 }
 

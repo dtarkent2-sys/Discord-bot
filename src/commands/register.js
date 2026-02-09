@@ -113,6 +113,15 @@ const commands = [
         .setDescription('Stock or crypto symbol (e.g. AAPL, TSLA, BTC, ETH)')
         .setRequired(true)
     ),
+
+  new SlashCommandBuilder()
+    .setName('research')
+    .setDescription('Agent Swarm — parallel AI agents research any complex topic')
+    .addStringOption(opt =>
+      opt.setName('query')
+        .setDescription('Your research question (e.g. "Top 10 tech stocks for Q1 2026")')
+        .setRequired(true)
+    ),
 ];
 
 async function registerCommands() {
