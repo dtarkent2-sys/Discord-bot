@@ -7,6 +7,7 @@ const { webSearch, formatResultsForAI } = require('../tools/web-search');
 const auditLog = require('./audit-log');
 const { todayString, nowEST, ragEnforcementBlock, MODEL_CUTOFF, userMessageDateAnchor } = require('../date-awareness');
 const priceFetcher = require('../tools/price-fetcher');
+const { getMarketContext, formatContextForAI } = require('../data/market');
 
 class AIService {
   constructor() {
@@ -174,12 +175,17 @@ ${mood.buildMoodContext()}
 
   /**
    * Detect whether a message likely needs a live web search to answer well.
-   * Uses simple keyword heuristics — not perfect, but catches most real-time questions.
+   * Uses keyword heuristics — errs on the side of searching too much (better
+   * to search and not need it than to hallucinate stale data).
    */
   _needsWebSearch(message) {
     if (!config.searxngUrl) return false;
 
     const lower = message.toLowerCase();
+
+    // If the message mentions a ticker or company name, search for context
+    const tickers = this._extractTickers(message);
+    if (tickers.length > 0) return true;
 
     // Current events / real-time triggers
     const realtimePatterns = [
@@ -200,10 +206,15 @@ ${mood.buildMoodContext()}
       /\b(?:q[1-4]\s*20)\b/i,
       // Market / finance current events
       /\b(?:earnings|ipo|fed meeting|fomc|cpi|jobs report|nonfarm|gdp report)\b/,
-      /\b(?:interest rate|rate cut|rate hike|inflation)\b.*\b(?:now|current|latest|today)\b/,
-      /\b(?:market|stock|crypto)\b.*\b(?:crash|rally|surge|dump|moon|tank)\b/,
+      /\b(?:interest rate|rate cut|rate hike|inflation)\b/,
+      /\b(?:market|stock|crypto)\b.*\b(?:crash|rally|surge|dump|moon|tank|rip|pump|dip|correction|rebound|sell.?off)\b/,
+      /\b(?:how.?s|what.?s)\b.*\b(?:market|dow|nasdaq|s&p|s and p|sp500|spy|qqq)\b/,
       // Specific lookups
       /\b(?:what is|tell me about|who is|explain)\b.*\b[A-Z]{2,5}\b/,
+      // Price / trading intent
+      /\b(?:price|at|trading|worth)\b.*\b(?:now|today|rn|right now|currently)\b/,
+      /\b(?:should i|is .{1,20} a)\b.*\b(?:buy|sell|hold|short|put|call)\b/,
+      /\b(?:bull|bear|bullish|bearish|overbought|oversold|squeeze|breakout)\b/,
     ];
 
     // Question patterns that suggest "look this up"
@@ -250,11 +261,17 @@ ${mood.buildMoodContext()}
   /**
    * Extract potential stock/crypto tickers from a message.
    * Returns uppercase symbols like ['TSLA', 'AAPL', 'BTC'].
+   * Detects:
+   *   - $TICKER format ($TSLA, $BTC)
+   *   - ALL-CAPS words (TSLA, AAPL) with stop-word filtering
+   *   - Company names (tesla → TSLA, nvidia → NVDA, bitcoin → BTC)
    */
   _extractTickers(message) {
-    // Match $TICKER format or standalone uppercase 1-5 char words
+    // Match $TICKER format
     const dollarTickers = (message.match(/\$([A-Za-z]{1,5})\b/g) || [])
       .map(t => t.slice(1).toUpperCase());
+
+    // Match standalone uppercase 1-5 char words
     const upperWords = (message.match(/\b[A-Z]{1,5}\b/g) || []);
 
     const stopWords = new Set([
@@ -266,39 +283,100 @@ ${mood.buildMoodContext()}
       'THEM', 'THAN', 'EACH', 'MAKE', 'LIKE', 'INTO', 'OVER', 'SUCH', 'JUST',
       'ALSO', 'BUY', 'SELL', 'HOLD', 'IPO', 'ETF', 'GDP', 'FED', 'SEC',
       'LOL', 'OMG', 'WTF', 'IMO', 'TBH', 'NGL', 'IDK', 'LMAO',
+      'RN', 'NVM', 'TBF', 'SMH', 'FWIW', 'TLDR', 'BTW', 'TMI',
+      'HEY', 'YO', 'BRO', 'OK', 'YES', 'NO', 'ANY', 'BAD', 'BIG',
     ]);
     const filtered = upperWords.filter(w => !stopWords.has(w));
 
-    return [...new Set([...dollarTickers, ...filtered])].slice(0, 5);
+    // Match company/crypto names in any case
+    const lower = message.toLowerCase();
+    const nameMap = {
+      'tesla': 'TSLA', 'nvidia': 'NVDA', 'apple': 'AAPL', 'google': 'GOOGL',
+      'alphabet': 'GOOGL', 'amazon': 'AMZN', 'microsoft': 'MSFT', 'meta': 'META',
+      'facebook': 'META', 'netflix': 'NFLX', 'amd': 'AMD', 'intel': 'INTC',
+      'disney': 'DIS', 'walmart': 'WMT', 'costco': 'COST', 'target': 'TGT',
+      'boeing': 'BA', 'palantir': 'PLTR', 'gamestop': 'GME', 'robinhood': 'HOOD',
+      'coinbase': 'COIN', 'paypal': 'PYPL', 'shopify': 'SHOP', 'spotify': 'SPOT',
+      'uber': 'UBER', 'airbnb': 'ABNB', 'snowflake': 'SNOW', 'crowdstrike': 'CRWD',
+      'salesforce': 'CRM', 'oracle': 'ORCL', 'ibm': 'IBM', 'cisco': 'CSCO',
+      'qualcomm': 'QCOM', 'broadcom': 'AVGO', 'micron': 'MU', 'arm': 'ARM',
+      'rivian': 'RIVN', 'lucid': 'LCID', 'nio': 'NIO', 'ford': 'F',
+      'gm': 'GM', 'general motors': 'GM', 'jpmorgan': 'JPM', 'goldman': 'GS',
+      'goldman sachs': 'GS', 'bank of america': 'BAC', 'morgan stanley': 'MS',
+      'berkshire': 'BRK.B', 'warren buffett': 'BRK.B',
+      'bitcoin': 'BTC', 'btc': 'BTC', 'ethereum': 'ETH', 'eth': 'ETH',
+      'solana': 'SOL', 'sol': 'SOL', 'dogecoin': 'DOGE', 'doge': 'DOGE',
+      'cardano': 'ADA', 'ripple': 'XRP', 'xrp': 'XRP', 'polkadot': 'DOT',
+      'chainlink': 'LINK', 'avalanche': 'AVAX', 'litecoin': 'LTC',
+      'shiba': 'SHIB', 'pepe': 'PEPE', 'sui': 'SUI',
+      'spy': 'SPY', 'qqq': 'QQQ', 'dia': 'DIA', 'iwm': 'IWM', 'voo': 'VOO',
+    };
+    const nameTickers = [];
+    for (const [name, ticker] of Object.entries(nameMap)) {
+      // Use word boundary matching for short names to avoid false positives
+      if (name.length <= 3) {
+        const re = new RegExp(`\\b${name}\\b`, 'i');
+        if (re.test(lower)) nameTickers.push(ticker);
+      } else {
+        if (lower.includes(name)) nameTickers.push(ticker);
+      }
+    }
+
+    return [...new Set([...dollarTickers, ...filtered, ...nameTickers])].slice(0, 5);
   }
 
   async chat(userId, username, userMessage, options = {}) {
-    const { sentiment, imageDescription, liveData } = options;
+    const { sentiment, imageDescription } = options;
+    let { liveData } = options;
 
     memory.recordInteraction(userId, username, userMessage);
 
-    // ── Pre-fetch: Auto-fetch prices for any tickers mentioned ──
+    // ── Auto-detect tickers in the message ──
+    const tickers = this._extractTickers(userMessage);
+    if (tickers.length > 0) {
+      console.log(`[AI] Detected tickers: ${tickers.join(', ')}`);
+    }
+
+    // ── Pre-fetch: Auto-fetch full market context for first ticker ──
+    // This gives the AI real price data, technicals, fundamentals via Alpaca/FMP
     let livePrices = null;
-    if (priceFetcher.isAvailable()) {
-      const tickers = this._extractTickers(userMessage);
-      if (tickers.length > 0) {
+    if (!liveData && tickers.length > 0) {
+      try {
+        const ctx = await getMarketContext(tickers[0]);
+        if (!ctx.error) {
+          liveData = formatContextForAI(ctx);
+          console.log(`[AI] Auto-fetched market context for ${tickers[0]} via ${ctx.source}`);
+        } else {
+          console.log(`[AI] Market context unavailable for ${tickers[0]}: ${ctx.message}`);
+        }
+      } catch (err) {
+        console.log(`[AI] Market context fetch failed for ${tickers[0]}: ${err.message}`);
+      }
+
+      // Also fetch yahoo-finance2 prices for any additional tickers
+      if (tickers.length > 1 && priceFetcher.isAvailable()) {
         try {
-          const prices = await priceFetcher.getMultiplePrices(tickers);
+          const extraTickers = tickers.slice(1);
+          const prices = await priceFetcher.getMultiplePrices(extraTickers);
           const formatted = priceFetcher.formatForPrompt(prices);
           if (formatted && !formatted.includes('unavailable')) {
             livePrices = formatted;
-            console.log(`[AI] Auto-fetched prices for: ${tickers.join(', ')}`);
+            console.log(`[AI] Extra prices fetched for: ${extraTickers.join(', ')}`);
           }
         } catch (err) {
-          console.error('[AI] Price fetch failed:', err.message);
+          console.error('[AI] Extra price fetch failed:', err.message);
         }
       }
     }
 
     // ── Auto-search for real-time questions ──
-    // Skip when Kimi agent mode handles search natively
+    // Skip when Kimi agent mode handles search natively.
+    // Trigger search when: tickers detected OR message matches real-time patterns.
+    // Tickers bypass the _needsWebSearch check since we already know the topic is market-related.
     let searchResults = null;
-    if (!this.kimiEnabled && !liveData && this._needsWebSearch(userMessage)) {
+    const shouldSearch = !this.kimiEnabled && config.searxngUrl &&
+      (tickers.length > 0 || this._needsWebSearch(userMessage));
+    if (shouldSearch) {
       try {
         const query = this._buildSearchQuery(userMessage);
         console.log(`[AI] Auto-searching: "${query}"`);

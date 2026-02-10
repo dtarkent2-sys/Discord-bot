@@ -11,8 +11,10 @@
 let yahooFinance;
 try {
   yahooFinance = require('yahoo-finance2').default;
-} catch {
-  // yahoo-finance2 not installed — module degrades gracefully
+  console.log('[PriceFetcher] yahoo-finance2 loaded successfully');
+} catch (err) {
+  // yahoo-finance2 not installed or failed to load — module degrades gracefully
+  console.warn(`[PriceFetcher] yahoo-finance2 NOT available: ${err.message}`);
   yahooFinance = null;
 }
 
