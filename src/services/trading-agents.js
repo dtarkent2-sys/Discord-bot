@@ -66,7 +66,7 @@ class TradingAgents {
 
     // ── Stage 0: Fetch market data ──
     progress('data', `Fetching market data for ${upper}...`);
-    const context = await getMarketContext(upper);
+    const context = await getMarketContext(upper, { skipAlpaca: true });
     if (context.error) {
       throw new Error(`Cannot fetch data for ${upper}: ${context.message}`);
     }
