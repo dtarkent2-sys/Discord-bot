@@ -6,6 +6,7 @@
  */
 
 const { persona } = require('../personality');
+const mood = require('./mood');
 
 class CommentaryGenerator {
   constructor() {

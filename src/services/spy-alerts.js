@@ -614,10 +614,11 @@ function buildErrorEmbed(alert, errorMsg) {
  */
 async function generateChartUrl() {
   try {
-    // Try to get SPY history from yahoo-finance2
+    // Try to get SPY history from yahoo-finance2 (ESM-only, use dynamic import)
     let yahooFinance;
     try {
-      yahooFinance = require('yahoo-finance2').default;
+      const mod = await import('yahoo-finance2');
+      yahooFinance = mod.default || mod;
     } catch {
       return null;
     }
@@ -831,12 +832,19 @@ async function handleWebhookAlert(message) {
       embed.setImage(chartUrl);
     }
 
-    await ackMessage.edit({ embeds: [embed] });
+    // Edit ack with final embed; if ack was deleted, send a new message instead
+    let targetMessage = ackMessage;
+    try {
+      await ackMessage.edit({ embeds: [embed] });
+    } catch (editErr) {
+      log.warn(`Could not edit ack (${editErr.message}), sending new message`);
+      targetMessage = await message.channel.send({ embeds: [embed] });
+    }
 
     // ── Step 4: Create thread for discussion ──
     let thread;
     try {
-      thread = await ackMessage.startThread({
+      thread = await targetMessage.startThread({
         name: `${alert.action} ${alert.type} — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET`,
         autoArchiveDuration: 60, // Archive after 1 hour of inactivity
       });
@@ -846,8 +854,8 @@ async function handleWebhookAlert(message) {
 
     // ── Step 5: Add reactions for learning ──
     try {
-      await ackMessage.react('👍');
-      await ackMessage.react('👎');
+      await targetMessage.react('👍');
+      await targetMessage.react('👎');
     } catch (err) {
       log.warn(`Could not add reactions: ${err.message}`);
     }
@@ -861,11 +869,11 @@ async function handleWebhookAlert(message) {
   } catch (err) {
     log.error(`Alert processing error: ${err.message}`);
 
-    // Edit ack to show error
+    // Try to edit ack with error; fall back to new message if ack was deleted
     try {
       await ackMessage.edit({ embeds: [buildErrorEmbed(alert, err.message)] });
     } catch {
-      // If edit fails too, nothing we can do
+      try { await message.channel.send({ embeds: [buildErrorEmbed(alert, err.message)] }); } catch { /* nothing */ }
     }
   }
 }
