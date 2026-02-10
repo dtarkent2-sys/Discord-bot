@@ -29,7 +29,9 @@ ${ragEnforcementBlock()}
 Action: ${alert.action || 'UNKNOWN'}
 Type: ${alert.type || 'SPY 0DTE'}
 Alert Price: $${alert.price || 'N/A'}
-Reason: ${alert.reason || 'No reason provided'}
+Timeframe: ${alert.interval || 'N/A'}
+Confidence: ${alert.confidence || 'N/A'}
+Signal Text: ${alert.reason || 'No reason provided'}
 
 === LIVE SPY DATA ===
 ${priceData || 'UNAVAILABLE'}

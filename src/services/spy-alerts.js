@@ -110,19 +110,22 @@ async function prewarmOllama() {
 /**
  * Parse a TradingView webhook alert. Extremely flexible — handles:
  *
- *   1. Already-parsed object (from Express JSON body)
- *   2. JSON string (from Discord webhook message content)
- *   3. Plain text (fallback)
+ *   1. Structured JSON with standard keys (action, ticker, price, etc.)
+ *   2. Text-wrapper JSON like {"content": "SPY PUMP INCOMING on 1m low confidence"}
+ *   3. Plain text ("Buy SPY 0DTE Call @ $590.50")
  *
- * TradingView common variables mapped:
- *   {{strategy.order.action}} → action
- *   {{strategy.order.price}}  → price
- *   {{ticker}}                → ticker
- *   {{close}}, {{open}}, {{high}}, {{low}} → price data
- *   {{interval}}, {{time}}    → metadata
+ * The user's TradingView alerts send:
+ *   {"content": "SPY PUMP INCOMING on 1m low confidence"}
+ *   {"content": "High Conviction - SPY Sell"}
+ *   {"content": "Tanking 5m"}
+ *
+ * Signal keywords detected:
+ *   BUY:  buy, long, pump, bullish
+ *   SELL: sell, short, tank, tanking, bearish
+ *   TP:   TP, take profit
  *
  * @param {string|object} content — Raw message content or parsed JSON object
- * @returns {{ action, ticker, type, price, close, open, high, low, volume, interval, reason, raw, extra }}
+ * @returns {{ action, ticker, type, price, interval, confidence, reason, raw, extra, ... }}
  */
 function parseAlert(content) {
   let json = null;
@@ -145,6 +148,7 @@ function parseAlert(content) {
     // Normalize keys (TradingView uses various naming conventions)
     const flat = _flattenObject(json);
 
+    // Check if JSON has standard structured trading fields
     const action = _firstOf(flat,
       'action', 'signal', 'direction', 'order_action', 'side',
       'strategy.order.action', 'strategy.order_action'
@@ -152,53 +156,139 @@ function parseAlert(content) {
     const ticker = _firstOf(flat,
       'ticker', 'symbol', 'stock', 'underlying'
     );
-    const type = _firstOf(flat,
-      'type', 'instrument', 'contract', 'order_type',
-      'strategy.order.type'
-    );
-    const price = _firstNum(flat,
-      'price', 'close', 'last', 'entry', 'entry_price',
-      'strategy.order.price', 'order_price'
-    );
-    const reason = _firstOf(flat,
-      'reason', 'message', 'note', 'comment', 'description', 'alert_message'
-    );
 
-    return {
-      action: action ? action.toUpperCase() : 'ALERT',
-      ticker: ticker ? ticker.toUpperCase() : 'SPY',
-      type: type || 'SPY 0DTE',
-      price,
-      close: _firstNum(flat, 'close') ?? null,
-      open: _firstNum(flat, 'open') ?? null,
-      high: _firstNum(flat, 'high') ?? null,
-      low: _firstNum(flat, 'low') ?? null,
-      volume: _firstNum(flat, 'volume') ?? null,
-      interval: _firstOf(flat, 'interval', 'timeframe', 'resolution') || null,
-      time: _firstOf(flat, 'time', 'timestamp', 'timenow') || null,
-      reason: reason || '',
-      raw: rawStr,
-      extra: json, // keep full original for the AI prompt
-    };
+    // If JSON has structured trading keys → use the structured path
+    if (action || ticker) {
+      const type = _firstOf(flat,
+        'type', 'instrument', 'contract', 'order_type',
+        'strategy.order.type'
+      );
+      const price = _firstNum(flat,
+        'price', 'close', 'last', 'entry', 'entry_price',
+        'strategy.order.price', 'order_price'
+      );
+      const reason = _firstOf(flat,
+        'reason', 'message', 'note', 'comment', 'description', 'alert_message'
+      );
+
+      return {
+        action: action ? action.toUpperCase() : 'ALERT',
+        ticker: ticker ? ticker.toUpperCase() : 'SPY',
+        type: type || 'SPY 0DTE',
+        price,
+        close: _firstNum(flat, 'close') ?? null,
+        open: _firstNum(flat, 'open') ?? null,
+        high: _firstNum(flat, 'high') ?? null,
+        low: _firstNum(flat, 'low') ?? null,
+        volume: _firstNum(flat, 'volume') ?? null,
+        interval: _firstOf(flat, 'interval', 'timeframe', 'resolution') || null,
+        confidence: null,
+        time: _firstOf(flat, 'time', 'timestamp', 'timenow') || null,
+        reason: reason || '',
+        raw: rawStr,
+        extra: json, // keep full original for the AI prompt
+      };
+    }
+
+    // Text-wrapper JSON: {"content": "SPY PUMP INCOMING on 1m low confidence"}
+    const textContent = _firstOf(flat,
+      'content', 'text', 'message', 'alert_message', 'msg',
+      'alert', 'description', 'body', 'note'
+    );
+    if (textContent) {
+      return _parseAlertText(textContent, rawStr, json);
+    }
+
+    // Unknown JSON structure — stringify the whole thing and text-parse
+    return _parseAlertText(rawStr, rawStr, json);
   }
 
-  // Text fallback: "Buy SPY 0DTE Call @ $590.50" or similar
-  const actionMatch = rawStr.match(/\b(buy|sell|long|short|alert)\b/i);
-  const tickerMatch = rawStr.match(/\b([A-Z]{1,5})\b/);
-  const priceMatch = rawStr.match(/\$?([\d,]+\.?\d*)/);
-  const typeMatch = rawStr.match(/((?:SPY|QQQ|IWM)\s*0DTE\s*(?:Call|Put|Straddle|Strangle)?)/i);
-  const reasonMatch = rawStr.match(/(?:reason|note|because|signal)[:=]\s*(.+)/i);
+  // Plain text fallback
+  return _parseAlertText(rawStr, rawStr, null);
+}
+
+/**
+ * Parse a text-based alert for trading signals, timeframe, and confidence.
+ *
+ * Handles the user's 17 TradingView alert types:
+ *   PUMP INCOMING, 5m PUMP, 15M PUMP       → BUY
+ *   TANKING, Tanking 5m, SPY TANK 15M      → SELL
+ *   Buy, SPY Buy, 15 m buy                 → BUY
+ *   Sell, Spy Sell, 15 m sell               → SELL
+ *   Trend bullish, Bearish Trend            → BUY / SELL
+ *   High Conviction - SPY Sell/BUY          → SELL / BUY (HIGH confidence)
+ *   TP                                      → TAKE_PROFIT
+ *
+ * @param {string} text — The alert text to parse
+ * @param {string} rawStr — Full raw string for the raw field
+ * @param {object|null} originalJson — Original JSON if it was a wrapper
+ */
+function _parseAlertText(text, rawStr, originalJson) {
+  // ── Direction / Action ──
+  // Order matters: check specific compound patterns first, then single keywords
+  const ACTION_PATTERNS = [
+    [/\btake\s*profit\b/i, 'TAKE_PROFIT'],
+    [/\bTP\b/, 'TAKE_PROFIT'],
+    [/\bbuy\b/i, 'BUY'],
+    [/\blong\b/i, 'BUY'],
+    [/\bpump\b/i, 'BUY'],
+    [/\bbullish\b/i, 'BUY'],
+    [/\bsell\b/i, 'SELL'],
+    [/\bshort\b/i, 'SELL'],
+    [/\btank(?:ing)?\b/i, 'SELL'],
+    [/\bbearish\b/i, 'SELL'],
+  ];
+
+  let action = 'ALERT';
+  for (const [pattern, act] of ACTION_PATTERNS) {
+    if (pattern.test(text)) {
+      action = act;
+      break;
+    }
+  }
+
+  // ── Ticker ──
+  // Use known tickers to avoid matching signal words like "PUMP", "TANK"
+  const KNOWN_TICKERS = /\b(SPY|QQQ|IWM|DIA|AAPL|TSLA|NVDA|AMD|AMZN|GOOG|GOOGL|META|MSFT|NFLX|TQQQ|SQQQ|SPXL|SPXS|VIX|UVXY)\b/i;
+  const tickerMatch = text.match(KNOWN_TICKERS);
+  const ticker = tickerMatch ? tickerMatch[1].toUpperCase() : 'SPY';
+
+  // ── Price ──
+  // Only match $ prefixed or @ prefixed prices to avoid false positives (e.g. "1m" → $1)
+  let price = null;
+  const dollarMatch = text.match(/\$\s*([\d,]+\.?\d+)/);
+  const atMatch = text.match(/@\s*\$?([\d,]+\.?\d+)/);
+  if (dollarMatch) price = parseFloat(dollarMatch[1].replace(',', ''));
+  else if (atMatch) price = parseFloat(atMatch[1].replace(',', ''));
+
+  // ── Timeframe ──
+  // Match: "1m", "5m", "15m", "15M", "15 m", "5 min", etc.
+  const tfMatch = text.match(/\b(\d+)\s*m(?:in(?:ute)?s?)?\b/i);
+  const interval = tfMatch ? `${tfMatch[1]}m` : null;
+
+  // ── Confidence ──
+  let confidence = null;
+  if (/high\s*conviction/i.test(text)) confidence = 'HIGH';
+  else if (/high\s*confidence/i.test(text)) confidence = 'HIGH';
+  else if (/low\s*confidence/i.test(text)) confidence = 'LOW';
+  else if (/medium\s*confidence/i.test(text)) confidence = 'MEDIUM';
+
+  // ── Type ──
+  const typeMatch = text.match(/((?:SPY|QQQ|IWM)\s*0DTE\s*(?:Call|Put|Straddle|Strangle)?)/i);
+  const type = typeMatch ? typeMatch[1].trim() : `${ticker} 0DTE`;
 
   return {
-    action: actionMatch ? actionMatch[1].toUpperCase() : 'ALERT',
-    ticker: tickerMatch ? tickerMatch[1] : 'SPY',
-    type: typeMatch ? typeMatch[1].trim() : 'SPY 0DTE',
-    price: priceMatch ? parseFloat(priceMatch[1].replace(',', '')) : null,
+    action,
+    ticker,
+    type,
+    price,
     close: null, open: null, high: null, low: null, volume: null,
-    interval: null, time: null,
-    reason: reasonMatch ? reasonMatch[1].trim() : '',
+    interval,
+    confidence,
+    time: null,
+    reason: text, // full text becomes the reason for the AI
     raw: rawStr,
-    extra: null,
+    extra: originalJson,
   };
 }
 
@@ -353,9 +443,17 @@ const CONVICTION_EMOJIS = {
  * Build the "processing" ack embed.
  */
 function buildAckEmbed(alert) {
+  const parts = [`**${alert.action}** ${alert.ticker}`];
+  if (alert.price) parts.push(`@ $${alert.price}`);
+  if (alert.interval) parts.push(`(${alert.interval})`);
+  if (alert.confidence) parts.push(`[${alert.confidence}]`);
+  if (alert.reason && alert.reason !== alert.action) {
+    parts.push(`\n> _${alert.reason.slice(0, 120)}_`);
+  }
+
   return new EmbedBuilder()
     .setTitle('⏳ Alert Received! Processing...')
-    .setDescription(`**${alert.action}** ${alert.type}${alert.price ? ` @ $${alert.price}` : ''}`)
+    .setDescription(parts.join(' '))
     .setColor(0xFFAA00)
     .setFooter({ text: 'Sprocket 0DTE Pipeline • Analyzing...' })
     .setTimestamp();
@@ -386,8 +484,13 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
     titleFlair = ' 🚀';
   }
 
+  const titleParts = [`${actionEmoji[analysis.action] || '⚪'} Enhanced 0DTE Alert: ${alert.action} ${alert.ticker}`];
+  if (alert.price) titleParts.push(`@ $${alert.price}`);
+  if (alert.interval) titleParts.push(`(${alert.interval})`);
+  titleParts.push(titleFlair);
+
   const embed = new EmbedBuilder()
-    .setTitle(`${actionEmoji[analysis.action] || '⚪'} Enhanced 0DTE Alert: ${alert.action} ${alert.type}${alert.price ? ` @ $${alert.price}` : ''}${titleFlair}`)
+    .setTitle(titleParts.join(' ').trim())
     .setColor(riskColor[analysis.riskLevel] || 0x5865F2)
     .setTimestamp();
 
@@ -434,11 +537,11 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
     },
   );
 
-  // Timeframe and mood
+  // Timeframe, confidence, and mood
   embed.addFields(
     {
       name: '⏰ Timeframe',
-      value: `**${analysis.timeframe || 'EOD'}**`,
+      value: `**${analysis.timeframe || alert.interval || 'EOD'}**`,
       inline: true,
     },
     {
@@ -453,10 +556,20 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
     },
   );
 
-  // Alert reason
+  // Confidence (from TradingView signal text)
+  if (alert.confidence) {
+    const confEmoji = alert.confidence === 'HIGH' ? '🔥' : alert.confidence === 'LOW' ? '💤' : '⚡';
+    embed.addFields({
+      name: `${confEmoji} Signal Confidence`,
+      value: `**${alert.confidence}**`,
+      inline: true,
+    });
+  }
+
+  // Alert signal text (from TradingView content)
   if (alert.reason) {
     embed.addFields({
-      name: '📝 Alert Reason',
+      name: '📝 Signal',
       value: alert.reason.slice(0, 200),
       inline: false,
     });
