@@ -190,13 +190,23 @@ function parseAlert(content) {
       };
     }
 
-    // Text-wrapper JSON: {"content": "SPY PUMP INCOMING on 1m low confidence"}
+    // Text-wrapper JSON: {"content": "SPY PUMP INCOMING on 1m low confidence", "price": 590.50}
     const textContent = _firstOf(flat,
       'content', 'text', 'message', 'alert_message', 'msg',
       'alert', 'description', 'body', 'note'
     );
     if (textContent) {
-      return _parseAlertText(textContent, rawStr, json);
+      const result = _parseAlertText(textContent, rawStr, json);
+      // Merge any structured fields from the JSON (e.g. price, time from TradingView vars)
+      const jsonPrice = _firstNum(flat, 'price', 'close', 'last', 'entry');
+      if (jsonPrice && !result.price) result.price = jsonPrice;
+      const jsonTime = _firstOf(flat, 'time', 'timestamp', 'timenow');
+      if (jsonTime && !result.time) result.time = jsonTime;
+      const jsonTicker = _firstOf(flat, 'ticker', 'symbol');
+      if (jsonTicker) result.ticker = jsonTicker.toUpperCase();
+      const jsonInterval = _firstOf(flat, 'interval', 'timeframe', 'resolution');
+      if (jsonInterval && !result.interval) result.interval = jsonInterval;
+      return result;
     }
 
     // Unknown JSON structure — stringify the whole thing and text-parse
