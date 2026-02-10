@@ -3,12 +3,18 @@
  * Hard rule: only use provided context. If data is missing, output NO_TRADE.
  */
 
+const { todayString, ragEnforcementBlock } = require('../date-awareness');
+
 function buildTradeAnalysisPrompt(marketContext) {
   const snapshot = marketContext.snapshot || {};
 
-  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const today = todayString();
 
-  return `You are a strict, data-only trade analyst. Today is ${today}. Your training data cuts off around mid-2024 — ignore any stale knowledge about this stock's price or events. Follow these rules WITHOUT EXCEPTION:
+  return `You are a strict, data-only trade analyst.
+
+${ragEnforcementBlock()}
+
+Follow these rules WITHOUT EXCEPTION:
 
 === HARD RULES ===
 1. ONLY use the market data provided below (sourced LIVE as of today). Do NOT invent, assume, or hallucinate any prices, dates, percentages, or facts.

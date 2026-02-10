@@ -19,6 +19,7 @@ const { webSearch, formatResultsForAI } = require('../tools/web-search');
 const marketData = require('./yahoo');
 const alpaca = require('./alpaca');
 const { getMarketContext } = require('../data/market');
+const { todayString, ragEnforcementBlock, MODEL_CUTOFF } = require('../date-awareness');
 
 const KIMI_TOOLS = [
   { type: 'builtin_function', function: { name: '$web_search' } },
@@ -254,11 +255,13 @@ ${subtask.task}`;
         if (realTimeContext) {
           agentPrompt += `
 
---- REAL-TIME DATA (current as of today, ${new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}) ---
+${ragEnforcementBlock()}
+
+--- REAL-TIME DATA (current as of ${todayString()}) ---
 ${realTimeContext}
 --- END REAL-TIME DATA ---
 
-IMPORTANT: Your training data cuts off around mid-2024. The date above and all data in this section are LIVE market data — treat them as your sole source of truth. Do NOT reference outdated prices or events from training data. Do NOT mention "knowledge cutoff" — just use the live data provided.`;
+Use the real-time data above as your sole source of truth for any prices, events, or metrics after ${MODEL_CUTOFF}. Do NOT reference outdated training data.`;
         }
 
         agentPrompt += `

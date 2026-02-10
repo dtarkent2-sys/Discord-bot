@@ -85,96 +85,116 @@ async function handleCommand(interaction) {
 async function handleAsk(interaction) {
   await interaction.deferReply();
 
-  const question = interaction.options.getString('question');
-  const userId = interaction.user.id;
-  const username = interaction.user.username;
+  try {
+    const question = interaction.options.getString('question');
+    const userId = interaction.user.id;
+    const username = interaction.user.username;
 
-  const sentimentResult = sentiment.track(userId, question);
-  const response = await ai.chat(userId, username, question, { sentiment: sentimentResult });
+    const sentimentResult = sentiment.track(userId, question);
+    const response = await ai.chat(userId, username, question, { sentiment: sentimentResult });
 
-  await interaction.editReply(response);
+    await interaction.editReply(response);
+  } catch (err) {
+    console.error('[Ask] Error:', err);
+    await interaction.editReply('Something went wrong processing your question. Try again in a moment.').catch(() => {});
+  }
 }
 
 async function handleMemory(interaction) {
-  const userId = interaction.user.id;
-  const userData = memory.getUser(userId);
-  const sentimentStats = sentiment.getStats(userId);
-  const reactionStats = reactions.getUserStats(userId);
+  try {
+    const userId = interaction.user.id;
+    const userData = memory.getUser(userId);
+    const sentimentStats = sentiment.getStats(userId);
+    const reactionStats = reactions.getUserStats(userId);
 
-  const parts = [`**What I remember about you, ${interaction.user.username}:**\n`];
+    const parts = [`**What I remember about you, ${interaction.user.username}:**\n`];
 
-  if (userData.facts.length > 0) {
-    parts.push(`**Facts:** ${userData.facts.join(', ')}`);
-  } else {
-    parts.push("I don't have any specific facts about you yet. Chat with me more!");
+    if (userData.facts.length > 0) {
+      parts.push(`**Facts:** ${userData.facts.join(', ')}`);
+    } else {
+      parts.push("I don't have any specific facts about you yet. Chat with me more!");
+    }
+
+    parts.push(`**Interactions:** ${userData.interactionCount}`);
+
+    if (userData.firstSeen) {
+      parts.push(`**First seen:** ${new Date(userData.firstSeen).toLocaleDateString()}`);
+    }
+
+    const frequentTickers = memory.getFrequentTickers(userId);
+    if (frequentTickers.length > 0) {
+      parts.push(`\n**Your favorite tickers:** ${frequentTickers.map(f => `${f.ticker} (${f.count}x)`).join(', ')}`);
+    }
+    const lastInteraction = memory.getLastInteraction(userId);
+    if (lastInteraction && lastInteraction.tickers.length > 0) {
+      parts.push(`**Last discussed:** ${lastInteraction.tickers.join(', ')}${lastInteraction.topic ? ` (${lastInteraction.topic})` : ''}`);
+    }
+
+    parts.push(`\n**Sentiment:** ${sentimentStats.label} (trend: ${sentimentStats.trend})`);
+    parts.push(`**Feedback:** ${reactionStats.thumbsUp} 👍 / ${reactionStats.thumbsDown} 👎`);
+
+    if (Object.keys(userData.preferences).length > 0) {
+      const prefs = Object.entries(userData.preferences)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(', ');
+      parts.push(`**Preferences:** ${prefs}`);
+    }
+
+    await interaction.reply({ content: parts.join('\n'), flags: MessageFlags.Ephemeral });
+  } catch (err) {
+    console.error('[Memory] Error:', err);
+    await interaction.reply({ content: 'Could not retrieve your memory data right now.', flags: MessageFlags.Ephemeral }).catch(() => {});
   }
-
-  parts.push(`**Interactions:** ${userData.interactionCount}`);
-
-  if (userData.firstSeen) {
-    parts.push(`**First seen:** ${new Date(userData.firstSeen).toLocaleDateString()}`);
-  }
-
-  const frequentTickers = memory.getFrequentTickers(userId);
-  if (frequentTickers.length > 0) {
-    parts.push(`\n**Your favorite tickers:** ${frequentTickers.map(f => `${f.ticker} (${f.count}x)`).join(', ')}`);
-  }
-  const lastInteraction = memory.getLastInteraction(userId);
-  if (lastInteraction && lastInteraction.tickers.length > 0) {
-    parts.push(`**Last discussed:** ${lastInteraction.tickers.join(', ')}${lastInteraction.topic ? ` (${lastInteraction.topic})` : ''}`);
-  }
-
-  parts.push(`\n**Sentiment:** ${sentimentStats.label} (trend: ${sentimentStats.trend})`);
-  parts.push(`**Feedback:** ${reactionStats.thumbsUp} 👍 / ${reactionStats.thumbsDown} 👎`);
-
-  if (Object.keys(userData.preferences).length > 0) {
-    const prefs = Object.entries(userData.preferences)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join(', ');
-    parts.push(`**Preferences:** ${prefs}`);
-  }
-
-  await interaction.reply({ content: parts.join('\n'), flags: MessageFlags.Ephemeral });
 }
 
 async function handleModel(interaction) {
-  const modelName = interaction.options.getString('name');
-  const oldModel = ai.getModel();
-  ai.setModel(modelName);
+  try {
+    const modelName = interaction.options.getString('name');
+    const oldModel = ai.getModel();
+    ai.setModel(modelName);
 
-  await interaction.reply(`Switched AI model: **${oldModel}** → **${modelName}**`);
+    await interaction.reply(`Switched AI model: **${oldModel}** → **${modelName}**`);
+  } catch (err) {
+    console.error('[Model] Error:', err);
+    await interaction.reply({ content: 'Failed to switch model.', flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
 }
 
 async function handleStats(interaction) {
-  const summary = stats.getSummary();
-  const reactionStats = reactions.getStats();
+  try {
+    const summary = stats.getSummary();
+    const reactionStats = reactions.getStats();
 
-  const msg = [
-    '**Bot Statistics**\n',
-    `**Uptime:** ${summary.uptime}`,
-    `**Servers:** ${summary.guilds}`,
-    `**Messages processed:** ${summary.messagesProcessed}`,
-    `**Commands run:** ${summary.commandsRun}`,
-    `**Errors:** ${summary.errors}`,
-    `**AI Model:** ${ai.getModel()}`,
-    `**Mood:** ${mood.getMood()} (${mood.getSummary().score}/10)`,
-    `**Market Data:** ${buildMarketDataLabel()}`,
-    `\n**Memory Usage:**`,
-    `  RSS: ${summary.memory.rss} MB`,
-    `  Heap: ${summary.memory.heapUsed}/${summary.memory.heapTotal} MB`,
-    `\n**Reaction Feedback:**`,
-    `  Total: ${reactionStats.total} (${reactionStats.ratio}% positive)`,
-    `  👍 ${reactionStats.positive} / 👎 ${reactionStats.negative}`,
-  ];
+    const msg = [
+      '**Bot Statistics**\n',
+      `**Uptime:** ${summary.uptime}`,
+      `**Servers:** ${summary.guilds}`,
+      `**Messages processed:** ${summary.messagesProcessed}`,
+      `**Commands run:** ${summary.commandsRun}`,
+      `**Errors:** ${summary.errors}`,
+      `**AI Model:** ${ai.getModel()}`,
+      `**Mood:** ${mood.getMood()} (${mood.getSummary().score}/10)`,
+      `**Market Data:** ${buildMarketDataLabel()}`,
+      `\n**Memory Usage:**`,
+      `  RSS: ${summary.memory.rss} MB`,
+      `  Heap: ${summary.memory.heapUsed}/${summary.memory.heapTotal} MB`,
+      `\n**Reaction Feedback:**`,
+      `  Total: ${reactionStats.total} (${reactionStats.ratio}% positive)`,
+      `  👍 ${reactionStats.positive} / 👎 ${reactionStats.negative}`,
+    ];
 
-  if (reactionStats.patterns.length > 0) {
-    msg.push('\n**Top Successful Topics:**');
-    for (const p of reactionStats.patterns.slice(0, 5)) {
-      msg.push(`  • ${p.topic} (${p.ratio}% positive, ${p.count} interactions)`);
+    if (reactionStats.patterns.length > 0) {
+      msg.push('\n**Top Successful Topics:**');
+      for (const p of reactionStats.patterns.slice(0, 5)) {
+        msg.push(`  • ${p.topic} (${p.ratio}% positive, ${p.count} interactions)`);
+      }
     }
-  }
 
-  await interaction.reply(msg.join('\n'));
+    await interaction.reply(msg.join('\n'));
+  } catch (err) {
+    console.error('[Stats] Error:', err);
+    await interaction.reply({ content: 'Could not retrieve bot statistics.', flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
 }
 
 // ── /analyze — AI-powered analysis with live market data ─────────────
@@ -355,23 +375,28 @@ async function handleNews(interaction) {
 
 // ── /sentiment — Analyze text sentiment ─────────────────────────────
 async function handleSentiment(interaction) {
-  const text = interaction.options.getString('text');
-  const result = sentiment.analyze(text);
+  try {
+    const text = interaction.options.getString('text');
+    const result = sentiment.analyze(text);
 
-  const lines = [
-    `**Sentiment Analysis**`,
-    `**Text:** ${text.length > 200 ? text.slice(0, 200) + '...' : text}`,
-    `**Result:** ${result.label}`,
-    `**Score:** ${result.score} (comparative: ${result.comparative.toFixed(3)})`,
-  ];
-  if (result.positive.length > 0) {
-    lines.push(`**Positive words:** ${result.positive.join(', ')}`);
-  }
-  if (result.negative.length > 0) {
-    lines.push(`**Negative words:** ${result.negative.join(', ')}`);
-  }
+    const lines = [
+      `**Sentiment Analysis**`,
+      `**Text:** ${text.length > 200 ? text.slice(0, 200) + '...' : text}`,
+      `**Result:** ${result.label}`,
+      `**Score:** ${result.score} (comparative: ${result.comparative.toFixed(3)})`,
+    ];
+    if (result.positive.length > 0) {
+      lines.push(`**Positive words:** ${result.positive.join(', ')}`);
+    }
+    if (result.negative.length > 0) {
+      lines.push(`**Negative words:** ${result.negative.join(', ')}`);
+    }
 
-  await interaction.reply(lines.join('\n'));
+    await interaction.reply(lines.join('\n'));
+  } catch (err) {
+    console.error('[Sentiment] Error:', err);
+    await interaction.reply({ content: 'Sentiment analysis failed.', flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
 }
 
 // ── /topic — Generate an AI discussion topic ────────────────────────
@@ -621,7 +646,11 @@ async function handleResearch(interaction) {
 async function handleGEX(interaction) {
   await interaction.deferReply();
 
-  const ticker = interaction.options.getString('ticker').toUpperCase();
+  const rawTicker = interaction.options.getString('ticker');
+  const ticker = yahoo.sanitizeTicker(rawTicker);
+  if (!ticker) {
+    return interaction.editReply('Invalid ticker symbol. Use 1-12 alphanumeric characters (e.g. SPY, AAPL).');
+  }
 
   if (!gamma.enabled) {
     return interaction.editReply('GEX analysis is currently unavailable.');
@@ -777,7 +806,11 @@ function buildMarketDataLabel() {
 async function handleTechnicals(interaction) {
   await interaction.deferReply();
 
-  const ticker = interaction.options.getString('ticker').toUpperCase();
+  const rawTicker = interaction.options.getString('ticker');
+  const ticker = yahoo.sanitizeTicker(rawTicker);
+  if (!ticker) {
+    return interaction.editReply('Invalid ticker symbol. Use 1-12 alphanumeric characters (e.g. AAPL, TSLA).');
+  }
 
   try {
     await interaction.editReply(`**${ticker} — Technical Analysis**\n⏳ Fetching 200+ days of price history & computing indicators...`);
@@ -796,7 +829,11 @@ async function handleTechnicals(interaction) {
 async function handleSocial(interaction) {
   await interaction.deferReply();
 
-  const ticker = interaction.options.getString('ticker').toUpperCase();
+  const rawTicker = interaction.options.getString('ticker');
+  const ticker = yahoo.sanitizeTicker(rawTicker);
+  if (!ticker) {
+    return interaction.editReply('Invalid ticker symbol. Use 1-12 alphanumeric characters (e.g. AAPL, BTC).');
+  }
 
   try {
     const result = await stocktwits.analyzeSymbol(ticker);
@@ -905,7 +942,11 @@ async function handleSectors(interaction) {
 async function handleValidea(interaction) {
   await interaction.deferReply();
 
-  const ticker = interaction.options.getString('ticker').toUpperCase();
+  const rawTicker = interaction.options.getString('ticker');
+  const ticker = yahoo.sanitizeTicker(rawTicker);
+  if (!ticker) {
+    return interaction.editReply('Invalid ticker symbol. Use 1-12 alphanumeric characters (e.g. AAPL, MSFT).');
+  }
 
   try {
     await interaction.editReply(`**${ticker} — Validea Guru Analysis**\n⏳ Fetching fundamental scores from Validea...`);
