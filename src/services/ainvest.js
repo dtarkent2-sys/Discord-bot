@@ -165,11 +165,12 @@ class AInvestService {
       fromMs = now - count * 1.5 * 24 * 60 * 60 * 1000;
     }
 
+    const restArgs = { ticker: tkr, interval, step, from: Math.floor(fromMs), to: 0 };
     const data = await this._mcpOrRest(
       'get-marketdata-candles',
-      { symbol: tkr, period_type: interval, count },
+      restArgs,
       '/marketdata/candles',
-      { ticker: tkr, interval, step, from: Math.floor(fromMs) },
+      restArgs,
     );
 
     if (!Array.isArray(data)) return [];
@@ -223,7 +224,7 @@ class AInvestService {
     const tkr = ticker.toUpperCase();
     const now = Date.now();
     const data = await this._mcpOrRest(
-      'get-marketdata-trades', { symbol: tkr },
+      'get-marketdata-trades', { ticker: tkr, count, to: now },
       '/marketdata/trades', { ticker: tkr, count, to: now },
     );
     return Array.isArray(data) ? data : (data?.list || []);
@@ -243,11 +244,11 @@ class AInvestService {
   async getNews({ tab = 'all', tickers = [], limit = 10 } = {}) {
     const size = Math.min(Math.max(limit, 1), 50);
     const restParams = { tab, size };
-    const mcpArgs = { tab, page_size: size };
+    const mcpArgs = { ...restParams };
 
     if (tickers.length > 0) {
       restParams.tickers = tickers.join(',');
-      mcpArgs.symbols = tickers.join(',');
+      mcpArgs.tickers = tickers.join(',');
     }
 
     const data = await this._mcpOrRest(
@@ -303,7 +304,7 @@ class AInvestService {
   async getAnalystConsensus(ticker) {
     const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
-      'get-analyst-ratings', { symbol: tkr },
+      'get-analyst-ratings', { ticker: tkr },
       '/analysis-ratings/consensus', { ticker: tkr },
     );
 
@@ -334,7 +335,7 @@ class AInvestService {
   async getAnalystHistory(ticker, limit = 10) {
     const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
-      'get-analyst-ratings-history', { symbol: tkr },
+      'get-analyst-ratings-history', { ticker: tkr },
       '/analysis-ratings/history', { ticker: tkr },
     );
 
@@ -463,7 +464,7 @@ class AInvestService {
   async getInsiderTrades(ticker) {
     const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
-      'get-ownership-insider', { symbol: tkr },
+      'get-ownership-insider', { ticker: tkr },
       '/ownership/insider', { ticker: tkr },
     );
     return Array.isArray(data) ? data : (data?.list || []);
@@ -475,7 +476,7 @@ class AInvestService {
   async getCongressTrades(ticker) {
     const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
-      'get-ownership-congress', { symbol: tkr },
+      'get-ownership-congress', { ticker: tkr },
       '/ownership/congress', { ticker: tkr },
     );
     return Array.isArray(data) ? data : (data?.list || []);
