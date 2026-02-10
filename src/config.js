@@ -51,4 +51,10 @@ module.exports = {
   tradingChannelName: process.env.TRADING_CHANNEL || 'trading-floor',
   generalChannelName: process.env.GENERAL_CHANNEL || 'general',
   sharkAutoEnable: (process.env.SHARK_AUTO_ENABLE || '').toLowerCase() === 'true',
+
+  // SPY 0DTE Alert Integration
+  spyChannelId: process.env.SPY_CHANNEL_ID || 'YOUR_SPY_CHANNEL_ID',
+  alertOllamaModel: process.env.ALERT_OLLAMA_MODEL || 'qwen3:4b',
+  alertCacheTtl: parseInt(process.env.ALERT_CACHE_TTL, 10) || 60000, // 60s default
+  alertFollowUpMs: parseInt(process.env.ALERT_FOLLOWUP_MS, 10) || 5 * 60 * 1000, // 5min default
 };

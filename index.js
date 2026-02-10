@@ -31,6 +31,7 @@ const { registerCommands } = require('./src/commands/register');
 const AutonomousBehaviorEngine = require('./src/services/autonomous');
 const { handlePrefixCommand } = require('./src/commands/prefix');
 const stream = require('./src/services/stream');
+const { handleWebhookAlert, prewarmOllama } = require('./src/services/spy-alerts');
 
 log.info('Health server started, all modules loaded');
 
@@ -70,6 +71,9 @@ client.once(Events.ClientReady, async (c) => {
 
   // Initialize Alpaca stream (connects lazily on first /stream start)
   stream.init(client);
+
+  // Pre-warm Ollama alert model for faster first response
+  prewarmOllama().catch(() => {});
 });
 
 // ── Slash Command Handler ────────────────────────────────────────────
@@ -92,6 +96,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 // ── Message Handler ──────────────────────────────────────────────────
 client.on(Events.MessageCreate, async (message) => {
+  // ── TradingView Webhook Alert Handler ──
+  // Process webhook messages in the SPY 0DTE channel BEFORE the bot filter
+  if (message.webhookId && message.channel.id === config.spyChannelId) {
+    handleWebhookAlert(message).catch((err) => {
+      log.error('Webhook alert handler error:', err);
+    });
+    return;
+  }
+
   // Ignore bots and system messages
   if (message.author.bot) return;
   if (!message.content && message.attachments.size === 0) return;
