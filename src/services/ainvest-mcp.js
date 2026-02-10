@@ -256,47 +256,53 @@ class AInvestMCP {
   // ── Convenience wrappers (correct tool names from discovery) ──────────
   // Actual MCP tool names use hyphens: get-marketdata-candles, get-news-headlines, etc.
 
-  async mcpGetCandles(ticker, { interval = 'day', count = 20 } = {}) {
+  async mcpGetCandles(ticker, { interval = 'day', step = 1, count = 20 } = {}) {
+    const now = Date.now();
+    const fromMs = interval === 'min'
+      ? now - count * step * 60 * 1000
+      : now - count * 1.5 * 24 * 60 * 60 * 1000;
     return this.callTool('get-marketdata-candles', {
-      symbol: ticker.toUpperCase(),
-      period_type: interval,
-      count,
+      ticker: ticker.toUpperCase(),
+      interval,
+      step,
+      from: Math.floor(fromMs),
+      to: 0,
     });
   }
 
   async mcpGetNews({ tab = 'all', tickers = [], limit = 10 } = {}) {
-    const args = { tab, page_size: Math.min(limit, 50) };
-    if (tickers.length > 0) args.symbols = tickers.join(',');
+    const args = { tab, size: Math.min(limit, 50) };
+    if (tickers.length > 0) args.tickers = tickers.join(',');
     return this.callTool('get-news-headlines', args);
   }
 
   async mcpGetAnalystRatings(ticker) {
     return this.callTool('get-analyst-ratings', {
-      symbol: ticker.toUpperCase(),
+      ticker: ticker.toUpperCase(),
     });
   }
 
   async mcpGetAnalystRatingsHistory(ticker) {
     return this.callTool('get-analyst-ratings-history', {
-      symbol: ticker.toUpperCase(),
+      ticker: ticker.toUpperCase(),
     });
   }
 
   async mcpGetInsiderTrades(ticker) {
     return this.callTool('get-ownership-insider', {
-      symbol: ticker.toUpperCase(),
+      ticker: ticker.toUpperCase(),
     });
   }
 
   async mcpGetCongressTrades(ticker) {
     return this.callTool('get-ownership-congress', {
-      symbol: ticker.toUpperCase(),
+      ticker: ticker.toUpperCase(),
     });
   }
 
   async mcpGetTrades(ticker) {
     return this.callTool('get-marketdata-trades', {
-      symbol: ticker.toUpperCase(),
+      ticker: ticker.toUpperCase(),
     });
   }
 
