@@ -477,8 +477,14 @@ Keep it under 1800 characters total (Discord limit). Use markdown formatting.`;
 
       let result = '';
       for await (const part of stream) {
-        result += part.message.content;
+        const content = part.message?.content;
+        if (content) result += content;
       }
+      // Strip thinking tags (qwen3, deepseek, etc.)
+      result = result
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
+        .trim();
       return result;
     } catch (err) {
       console.error('[AgentSwarm] Ollama call error:', err.message);

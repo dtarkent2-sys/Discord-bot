@@ -409,19 +409,54 @@ ${mood.buildMoodContext()}
 
     // ── Standard Ollama path ──
     try {
-      const stream = await this.ollama.chat({
-        model: this.model,
-        messages: chatMessages,
-        stream: true,
-      });
-
+      // Try streaming first
       let assistantMessage = '';
-      for await (const part of stream) {
-        assistantMessage += part.message.content;
+      let chunkCount = 0;
+      try {
+        const stream = await this.ollama.chat({
+          model: this.model,
+          messages: chatMessages,
+          stream: true,
+        });
+
+        for await (const part of stream) {
+          chunkCount++;
+          const content = part.message?.content;
+          if (content) assistantMessage += content;
+        }
+      } catch (streamErr) {
+        console.warn(`[AI] Streaming failed (${streamErr.message}), trying non-streaming...`);
+        // Retry without streaming — some Ollama setups have streaming issues
+        const result = await this.ollama.chat({
+          model: this.model,
+          messages: chatMessages,
+          stream: false,
+        });
+        assistantMessage = result.message?.content || '';
+        chunkCount = assistantMessage ? 1 : 0;
       }
 
       if (!assistantMessage || !assistantMessage.trim()) {
-        console.warn('[AI] Ollama returned empty response');
+        console.warn(`[AI] Ollama returned empty response (${chunkCount} chunks, model: ${this.model})`);
+        // Strip thinking tags some models wrap around empty responses
+        const stripped = assistantMessage
+          .replace(/<think>[\s\S]*?<\/think>/g, '')
+          .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/g, '')
+          .trim();
+        if (stripped) {
+          assistantMessage = stripped;
+        } else {
+          return "Hmm, I blanked out for a second there. What were you saying?";
+        }
+      }
+
+      // Strip thinking tags from models that use them (qwen, deepseek, etc.)
+      assistantMessage = assistantMessage
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')
+        .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
+        .trim();
+
+      if (!assistantMessage) {
         return "Hmm, I blanked out for a second there. What were you saying?";
       }
 
