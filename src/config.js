@@ -57,6 +57,7 @@ module.exports = {
   alertOllamaModel: process.env.ALERT_OLLAMA_MODEL || 'qwen3:4b',
   alertCacheTtl: parseInt(process.env.ALERT_CACHE_TTL, 10) || 60000, // 60s default
   alertFollowUpMs: parseInt(process.env.ALERT_FOLLOWUP_MS, 10) || 5 * 60 * 1000, // 5min default
+  alertMinConviction: parseInt(process.env.ALERT_MIN_CONVICTION, 10) || 7, // Only post alerts with conviction >= this (1-10, default 7 = A setups)
   webhookSecret: process.env.WEBHOOK_SECRET || '', // Optional auth for TradingView webhook
 
   // AInvest API (news, candles, fundamentals, analyst ratings, earnings)
