@@ -31,6 +31,8 @@ Type: ${alert.type || 'SPY 0DTE'}
 Alert Price: $${alert.price || 'N/A'}
 Timeframe: ${alert.interval || 'N/A'}
 Confidence: ${alert.confidence || 'N/A'}
+Stop Loss: ${alert.stopLoss ? '$' + alert.stopLoss : 'N/A'}
+Take Profit: ${alert.takeProfit ? '$' + alert.takeProfit : 'N/A'}
 Signal Text: ${alert.reason || 'No reason provided'}
 
 === LIVE SPY DATA ===

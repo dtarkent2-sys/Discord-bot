@@ -149,8 +149,9 @@ function parseAlert(content) {
     const flat = _flattenObject(json);
 
     // Check if JSON has standard structured trading fields
+    // Also handles SMRT Algo JSON keys (signal_condition, take_profit, stop_loss, etc.)
     const action = _firstOf(flat,
-      'action', 'signal', 'direction', 'order_action', 'side',
+      'action', 'signal', 'signal_condition', 'direction', 'order_action', 'side',
       'strategy.order.action', 'strategy.order_action'
     );
     const ticker = _firstOf(flat,
@@ -168,9 +169,13 @@ function parseAlert(content) {
         'strategy.order.price', 'order_price'
       );
       const reason = _firstOf(flat,
-        'reason', 'message', 'note', 'comment', 'description', 'alert_message'
+        'reason', 'message', 'note', 'comment', 'description', 'alert_message', 'content'
       );
-      const confidence = _firstOf(flat, 'confidence', 'conviction') || null;
+      const confidence = _firstOf(flat, 'confidence', 'conviction', 'strength') || null;
+
+      // Extract SMRT Algo specific fields
+      const stopLoss = _firstNum(flat, 'stop_loss', 'stoploss', 'sl', 'stop') ?? null;
+      const takeProfit = _firstNum(flat, 'take_profit', 'takeprofit', 'tp', 'tp1', 'target') ?? null;
 
       // Map signal words to standard actions (PUMP→BUY, TANK→SELL, etc.)
       let normalizedAction = action ? action.toUpperCase() : 'ALERT';
@@ -190,8 +195,10 @@ function parseAlert(content) {
         volume: _firstNum(flat, 'volume') ?? null,
         interval: _normalizeInterval(_firstOf(flat, 'interval', 'timeframe', 'resolution')),
         confidence: confidence ? confidence.toUpperCase() : null,
+        stopLoss,
+        takeProfit,
         time: _firstOf(flat, 'time', 'timestamp', 'timenow') || null,
-        reason: reason || action || '',
+        reason: _stripBranding(reason || action || ''),
         raw: rawStr,
         extra: json, // keep full original for the AI prompt
       };
@@ -303,7 +310,7 @@ function _parseAlertText(text, rawStr, originalJson) {
     interval,
     confidence,
     time: null,
-    reason: text, // full text becomes the reason for the AI
+    reason: _stripBranding(text), // full text, branding stripped
     raw: rawStr,
     extra: originalJson,
   };
@@ -322,6 +329,22 @@ function _flattenObject(obj, prefix = '', result = {}) {
     }
   }
   return result;
+}
+
+/** Strip indicator/algo branding from display text. */
+const BRANDING_PATTERNS = [
+  /Pro\s*V\d+\s*\[SMRT\s*Algo\]:?\s*/gi,
+  /\[SMRT\s*Algo\]:?\s*/gi,
+  /SMRT\s*Algo:?\s*/gi,
+  /Any\s*alert\(\)\s*function\s*call\s*/gi,
+];
+function _stripBranding(text) {
+  if (!text) return text;
+  let s = String(text);
+  for (const pattern of BRANDING_PATTERNS) {
+    s = s.replace(pattern, '');
+  }
+  return s.trim();
 }
 
 /** Normalize interval: TradingView {{interval}} returns "1", "5", "15" — append "m" if bare number. */
@@ -551,12 +574,12 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
     },
     {
       name: '🛑 Stop Loss',
-      value: `**${analysis.stopLoss || 'N/A'}**`,
+      value: `**${alert.stopLoss ? '$' + alert.stopLoss : (analysis.stopLoss || 'N/A')}**`,
       inline: true,
     },
     {
       name: '🎯 Target',
-      value: `**${analysis.target || 'N/A'}**`,
+      value: `**${alert.takeProfit ? '$' + alert.takeProfit : (analysis.target || 'N/A')}**`,
       inline: true,
     },
   );
