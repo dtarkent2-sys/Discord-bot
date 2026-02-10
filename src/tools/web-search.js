@@ -1,29 +1,29 @@
 /**
- * Web Search — Live internet search via SearXNG.
+ * Web Search — Multi-source search with automatic fallback.
  *
- * SearXNG (https://docs.searxng.org) is a free, open-source metasearch engine.
- * No API key required — just point to any SearXNG instance.
+ * Source priority:
+ *   1. SearXNG instances (configured primary + public fallbacks)
+ *   2. DuckDuckGo HTML (scrapes lite.duckduckgo.com — no API key)
  *
- * Setup:
- *   1. Use a public instance (e.g. https://search.ononoki.org) or self-host one
- *   2. Add to your Railway environment variables:
- *        SEARXNG_URL=https://your-searxng-instance.com
- *   3. Or add to your local .env file
- *
- * Usage from ai-engine.js or any other module:
- *   const { webSearch, formatResultsForDiscord } = require('./src/tools/web-search');
- *   const results = await webSearch('AAPL earnings 2026');
+ * Setup (optional — works out of the box with fallbacks):
+ *   1. Add SEARXNG_URL=https://your-instance.com to .env for a custom instance
+ *   2. Or just use it — public SearXNG instances and DuckDuckGo are tried automatically
  */
 
 const config = require('../config');
 
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+// Alpaca news as final fallback for market-related queries
+let alpacaClient;
+try {
+  alpacaClient = require('../services/alpaca');
+} catch {
+  alpacaClient = null;
+}
 
-// Simple in-memory cache to avoid duplicate queries
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const cache = new Map();
 
 // ── Fallback SearXNG instances (tried in order if primary fails) ─────────
-// Public instances rotate — update this list if one goes down permanently.
 const FALLBACK_INSTANCES = [
   'https://search.ononoki.org',
   'https://search.sapti.me',
@@ -42,7 +42,7 @@ async function tryInstance(instanceUrl, query, num) {
   url.searchParams.set('categories', 'general');
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000); // 10s per instance
+  const timeout = setTimeout(() => controller.abort(), 10000);
 
   try {
     const response = await fetch(url.toString(), {
@@ -61,7 +61,6 @@ async function tryInstance(instanceUrl, query, num) {
     const data = await response.json();
     const rawResults = data.results || [];
 
-    // If zero results, this instance might be broken — try the next one
     if (rawResults.length === 0 && !data.infoboxes?.length) {
       return { ok: false, error: 'Zero results returned' };
     }
@@ -93,8 +92,150 @@ async function tryInstance(instanceUrl, query, num) {
 }
 
 /**
- * Search the web using a SearXNG instance.
- * Tries the configured primary instance first, then falls back to public instances.
+ * Fallback: Search via DuckDuckGo HTML (lite.duckduckgo.com).
+ * Parses the lightweight HTML response to extract result links and snippets.
+ * No API key needed — works from datacenter IPs.
+ * @returns {{ ok: true, data: object } | { ok: false, error: string }}
+ */
+async function tryDuckDuckGo(query, num) {
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query.trim())}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; DiscordBot/1.0)',
+        'Accept': 'text/html',
+      },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      return { ok: false, error: `DuckDuckGo ${response.status} ${response.statusText}` };
+    }
+
+    const html = await response.text();
+
+    // Parse results from DuckDuckGo HTML
+    // Each result is in a <div class="result"> with:
+    //   <a class="result__a" href="...">Title</a>
+    //   <a class="result__snippet">Snippet text</a>
+    const results = [];
+    const resultBlocks = html.split(/class="result\s/);
+
+    for (let i = 1; i < resultBlocks.length && results.length < num; i++) {
+      const block = resultBlocks[i];
+
+      // Extract URL from result__a href
+      const urlMatch = block.match(/class="result__a"[^>]*href="([^"]+)"/);
+      if (!urlMatch) continue;
+
+      let link = urlMatch[1];
+      // DuckDuckGo wraps URLs in a redirect — extract the actual URL
+      const uddgMatch = link.match(/uddg=([^&]+)/);
+      if (uddgMatch) {
+        link = decodeURIComponent(uddgMatch[1]);
+      }
+
+      // Skip ad/tracking links
+      if (link.includes('duckduckgo.com') || link.includes('ad_domain')) continue;
+
+      // Extract title text
+      const titleMatch = block.match(/class="result__a"[^>]*>([^<]+)</);
+      const title = titleMatch ? _decodeHtml(titleMatch[1].trim()) : '';
+
+      // Extract snippet
+      const snippetMatch = block.match(/class="result__snippet"[^>]*>([^<]*(?:<[^>]*>[^<]*)*)/);
+      let snippet = '';
+      if (snippetMatch) {
+        snippet = _decodeHtml(snippetMatch[1].replace(/<[^>]+>/g, '').trim());
+      }
+
+      if (title && link) {
+        results.push({
+          title,
+          link,
+          snippet,
+          engine: 'duckduckgo',
+          position: results.length + 1,
+        });
+      }
+    }
+
+    if (results.length === 0) {
+      return { ok: false, error: 'DuckDuckGo returned no parseable results' };
+    }
+
+    return { ok: true, data: { results, infobox: null } };
+  } catch (err) {
+    clearTimeout(timeout);
+    const msg = err.name === 'AbortError' ? 'timeout' : (err.message || String(err));
+    return { ok: false, error: `DuckDuckGo: ${msg}` };
+  }
+}
+
+/**
+ * Fallback: Search via Alpaca News API.
+ * Only useful for market/finance queries, but very reliable from Railway.
+ * @returns {{ ok: true, data: object } | { ok: false, error: string }}
+ */
+async function tryAlpacaNews(query, num) {
+  if (!alpacaClient || !alpacaClient.enabled) {
+    return { ok: false, error: 'Alpaca not configured' };
+  }
+
+  try {
+    // Extract potential ticker symbols from the query for targeted news
+    const tickerMatch = query.match(/\b[A-Z]{1,5}\b/g) || [];
+    const symbols = tickerMatch.filter(t => !['THE', 'FOR', 'AND', 'NOT', 'YOU', 'ALL', 'CAN', 'ARE',
+      'HAS', 'HOW', 'NOW', 'NEW', 'WAS', 'WHO', 'DID', 'GET', 'SAY', 'TOO', 'TOP',
+      'WHAT', 'WITH', 'THAT', 'THIS', 'WILL', 'FROM', 'HAVE', 'MANY', 'SOME',
+      'BUY', 'SELL', 'HOLD', 'IPO', 'ETF', 'GDP', 'FED', 'SEC', 'DOW', 'TODAY'].includes(t));
+
+    const articles = await alpacaClient.getNews({
+      symbols: symbols.slice(0, 3),
+      limit: Math.min(num, 10),
+    });
+
+    if (!articles || articles.length === 0) {
+      return { ok: false, error: 'Alpaca News returned no articles' };
+    }
+
+    const results = articles.slice(0, num).map((article, i) => ({
+      title: article.headline || article.title || '',
+      link: article.url || '',
+      snippet: (article.summary || '').slice(0, 300),
+      engine: 'alpaca-news',
+      position: i + 1,
+    }));
+
+    return { ok: true, data: { results, infobox: null } };
+  } catch (err) {
+    return { ok: false, error: `Alpaca News: ${err.message}` };
+  }
+}
+
+/** Decode basic HTML entities. */
+function _decodeHtml(text) {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/')
+    .replace(/&nbsp;/g, ' ');
+}
+
+/**
+ * Search the web using multiple sources with automatic fallback.
+ * Tries SearXNG instances first, then DuckDuckGo HTML.
  *
  * @param {string} query — The search query
  * @param {number} [numResults=3] — Number of results to return (max 10)
@@ -114,18 +255,14 @@ async function webSearch(query, numResults = 3) {
 
   const num = Math.min(Math.max(numResults, 1), 10);
 
-  // Build ordered list of instances to try: configured primary + fallbacks
+  // Build ordered list of SearXNG instances to try
   const instances = [];
   if (config.searxngUrl) instances.push(config.searxngUrl);
   for (const fb of FALLBACK_INSTANCES) {
     if (!instances.includes(fb)) instances.push(fb);
   }
 
-  if (instances.length === 0) {
-    return { error: 'No SearXNG instances available. Set SEARXNG_URL in your .env.', query };
-  }
-
-  // Try each instance in order until one succeeds
+  // Try each SearXNG instance in order
   const errors = [];
   for (const instanceUrl of instances) {
     const attempt = await tryInstance(instanceUrl, query, num);
@@ -139,34 +276,71 @@ async function webSearch(query, numResults = 3) {
         instance: instanceUrl,
       };
 
-      // Cache the result
       cache.set(cacheKey, { data: result, timestamp: Date.now() });
-
-      // Prune old cache entries
-      if (cache.size > 100) {
-        const now = Date.now();
-        for (const [key, val] of cache) {
-          if (now - val.timestamp > CACHE_TTL) cache.delete(key);
-        }
-      }
-
+      _pruneCache();
       return result;
     }
 
     errors.push(`${instanceUrl}: ${attempt.error}`);
-    console.warn(`[WebSearch] Instance failed: ${instanceUrl} — ${attempt.error}`);
+    console.warn(`[WebSearch] SearXNG failed: ${instanceUrl} — ${attempt.error}`);
   }
 
-  // All instances failed
-  console.error(`[WebSearch] All ${instances.length} SearXNG instances failed for "${query}": ${errors.join(' | ')}`);
-  return { error: `All SearXNG instances failed. Last errors: ${errors.slice(-2).join('; ')}`, query };
+  // All SearXNG instances failed — try DuckDuckGo HTML as last resort
+  console.log(`[WebSearch] All SearXNG instances failed, trying DuckDuckGo HTML...`);
+  const ddgAttempt = await tryDuckDuckGo(query, num);
+
+  if (ddgAttempt.ok) {
+    const result = {
+      ...ddgAttempt.data,
+      query: query.trim(),
+      resultCount: ddgAttempt.data.results.length,
+      timestamp: new Date().toISOString(),
+      instance: 'duckduckgo-html',
+    };
+
+    cache.set(cacheKey, { data: result, timestamp: Date.now() });
+    _pruneCache();
+    console.log(`[WebSearch] DuckDuckGo returned ${result.resultCount} results for "${query}"`);
+    return result;
+  }
+
+  errors.push(ddgAttempt.error);
+
+  // Last resort: Alpaca News (only covers market/finance, but reliable from Railway)
+  console.log(`[WebSearch] DuckDuckGo failed too, trying Alpaca News...`);
+  const alpacaAttempt = await tryAlpacaNews(query, num);
+
+  if (alpacaAttempt.ok) {
+    const result = {
+      ...alpacaAttempt.data,
+      query: query.trim(),
+      resultCount: alpacaAttempt.data.results.length,
+      timestamp: new Date().toISOString(),
+      instance: 'alpaca-news',
+    };
+
+    cache.set(cacheKey, { data: result, timestamp: Date.now() });
+    _pruneCache();
+    console.log(`[WebSearch] Alpaca News returned ${result.resultCount} articles for "${query}"`);
+    return result;
+  }
+
+  errors.push(alpacaAttempt.error);
+  console.error(`[WebSearch] ALL search sources failed for "${query}": ${errors.join(' | ')}`);
+  return { error: `All search sources failed. Errors: ${errors.slice(-3).join('; ')}`, query };
+}
+
+function _pruneCache() {
+  if (cache.size > 100) {
+    const now = Date.now();
+    for (const [key, val] of cache) {
+      if (now - val.timestamp > CACHE_TTL) cache.delete(key);
+    }
+  }
 }
 
 /**
  * Format search results as a readable string for Discord.
- *
- * @param {{ results, infobox, query }} searchResult
- * @returns {string}
  */
 function formatResultsForDiscord(searchResult) {
   if (searchResult.error) {
@@ -197,9 +371,6 @@ function formatResultsForDiscord(searchResult) {
 
 /**
  * Format search results as context for an AI prompt.
- *
- * @param {{ results, infobox, query }} searchResult
- * @returns {string}
  */
 function formatResultsForAI(searchResult) {
   if (searchResult.error) {
