@@ -15,16 +15,20 @@
 let yahooFinance;
 try {
   yahooFinance = require('yahoo-finance2').default;
-} catch {
+  console.log('[PriceFetcher] yahoo-finance2 loaded OK');
+} catch (err) {
   yahooFinance = null;
+  console.warn(`[PriceFetcher] yahoo-finance2 failed to load: ${err.message}`);
 }
 
 // FMP client (already exists in the codebase — uses API key)
 let fmpClient;
 try {
   fmpClient = require('../services/yahoo');
-} catch {
+  console.log(`[PriceFetcher] FMP client loaded OK (enabled=${fmpClient.enabled})`);
+} catch (err) {
   fmpClient = null;
+  console.warn(`[PriceFetcher] FMP client failed to load: ${err.message}`);
 }
 
 // ── Cache: ticker → { data, fetchedAt } ────────────────────────────────
