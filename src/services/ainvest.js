@@ -126,14 +126,20 @@ class AInvestService {
     if (mcpReady && mcp) {
       try {
         const result = await mcp.callTool(mcpToolName, mcpArgs);
-        if (result != null) return result;
+        if (result != null) {
+          console.log(`[AInvest] ${mcpToolName} via MCP OK`);
+          return result;
+        }
+        console.warn(`[AInvest] MCP tool ${mcpToolName} returned null, falling back to REST`);
       } catch (err) {
         console.warn(`[AInvest] MCP tool ${mcpToolName} failed, falling back to REST: ${err.message}`);
       }
     }
 
     // REST fallback
-    return this._fetch(restPath, restParams);
+    const result = await this._fetch(restPath, restParams);
+    console.log(`[AInvest] ${restPath} via REST OK`);
+    return result;
   }
 
   // ═══════════════════════════════════════════════════════════════════════

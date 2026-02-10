@@ -200,7 +200,10 @@ async function _tryAInvest(ticker) {
 
   try {
     const quote = await ainvestClient.getQuote(ticker);
-    if (!quote || quote.price == null) return null;
+    if (!quote || quote.price == null) {
+      console.warn(`[PriceFetcher] AInvest returned no price for ${ticker} (quote=${JSON.stringify(quote)})`);
+      return null;
+    }
     return quote;
   } catch (err) {
     console.warn(`[PriceFetcher] AInvest failed for ${ticker}: ${err.message}`);
