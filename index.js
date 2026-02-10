@@ -13,7 +13,7 @@ process.on('unhandledRejection', (reason) => {
 // Railway's healthcheck begins as soon as the container launches.
 // Bind the HTTP server before loading heavy modules (canvas, chartjs)
 // so the /health endpoint is reachable even if later imports fail.
-const { startDashboard } = require('./src/dashboard/server');
+const { startDashboard, setDiscordClient } = require('./src/dashboard/server');
 startDashboard();
 
 // ── Load remaining modules ──────────────────────────────────────────
@@ -78,6 +78,9 @@ client.once(Events.ClientReady, async (c) => {
 
   // Initialize Alpaca stream (connects lazily on first /stream start)
   stream.init(client);
+
+  // Register Discord client with dashboard server for HTTP webhook handling
+  setDiscordClient(client);
 
   // Pre-warm Ollama alert model for faster first response (only if module loaded)
   if (spyAlerts) {

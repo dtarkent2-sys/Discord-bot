@@ -108,44 +108,134 @@ async function prewarmOllama() {
 // ── Parse Alert ─────────────────────────────────────────────────────────
 
 /**
- * Parse a TradingView webhook alert. Handles JSON or plain text.
+ * Parse a TradingView webhook alert. Extremely flexible — handles:
  *
- * @param {string} content — Raw message content
- * @returns {{ action, type, price, reason, raw }}
+ *   1. Already-parsed object (from Express JSON body)
+ *   2. JSON string (from Discord webhook message content)
+ *   3. Plain text (fallback)
  *
- * JSON example: {"action":"Buy","type":"SPY 0DTE Call","price":"590.50","reason":"RSI oversold"}
- * Text example: "Buy SPY 0DTE Call @ $590.50"
+ * TradingView common variables mapped:
+ *   {{strategy.order.action}} → action
+ *   {{strategy.order.price}}  → price
+ *   {{ticker}}                → ticker
+ *   {{close}}, {{open}}, {{high}}, {{low}} → price data
+ *   {{interval}}, {{time}}    → metadata
+ *
+ * @param {string|object} content — Raw message content or parsed JSON object
+ * @returns {{ action, ticker, type, price, close, open, high, low, volume, interval, reason, raw, extra }}
  */
 function parseAlert(content) {
-  const raw = content.trim();
+  let json = null;
+  let rawStr = '';
 
-  // Try JSON first
-  try {
-    const json = JSON.parse(raw);
+  // If already an object (from Express JSON body), use directly
+  if (typeof content === 'object' && content !== null) {
+    json = content;
+    rawStr = JSON.stringify(content);
+  } else {
+    rawStr = String(content).trim();
+    try {
+      json = JSON.parse(rawStr);
+    } catch {
+      // Not JSON — will use text parsing below
+    }
+  }
+
+  if (json) {
+    // Normalize keys (TradingView uses various naming conventions)
+    const flat = _flattenObject(json);
+
+    const action = _firstOf(flat,
+      'action', 'signal', 'direction', 'order_action', 'side',
+      'strategy.order.action', 'strategy.order_action'
+    );
+    const ticker = _firstOf(flat,
+      'ticker', 'symbol', 'stock', 'underlying'
+    );
+    const type = _firstOf(flat,
+      'type', 'instrument', 'contract', 'order_type',
+      'strategy.order.type'
+    );
+    const price = _firstNum(flat,
+      'price', 'close', 'last', 'entry', 'entry_price',
+      'strategy.order.price', 'order_price'
+    );
+    const reason = _firstOf(flat,
+      'reason', 'message', 'note', 'comment', 'description', 'alert_message'
+    );
+
     return {
-      action: (json.action || json.signal || json.direction || 'UNKNOWN').toUpperCase(),
-      type: json.type || json.instrument || 'SPY 0DTE',
-      price: parseFloat(json.price) || null,
-      reason: json.reason || json.message || json.note || '',
-      raw,
+      action: action ? action.toUpperCase() : 'ALERT',
+      ticker: ticker ? ticker.toUpperCase() : 'SPY',
+      type: type || 'SPY 0DTE',
+      price,
+      close: _firstNum(flat, 'close') ?? null,
+      open: _firstNum(flat, 'open') ?? null,
+      high: _firstNum(flat, 'high') ?? null,
+      low: _firstNum(flat, 'low') ?? null,
+      volume: _firstNum(flat, 'volume') ?? null,
+      interval: _firstOf(flat, 'interval', 'timeframe', 'resolution') || null,
+      time: _firstOf(flat, 'time', 'timestamp', 'timenow') || null,
+      reason: reason || '',
+      raw: rawStr,
+      extra: json, // keep full original for the AI prompt
     };
-  } catch {
-    // Not JSON — parse as text
   }
 
   // Text fallback: "Buy SPY 0DTE Call @ $590.50" or similar
-  const actionMatch = raw.match(/\b(buy|sell|long|short)\b/i);
-  const priceMatch = raw.match(/\$?([\d,]+\.?\d*)/);
-  const typeMatch = raw.match(/(SPY\s*0DTE\s*(?:Call|Put|Straddle|Strangle)?)/i);
-  const reasonMatch = raw.match(/(?:reason|note|because|signal)[:=]\s*(.+)/i);
+  const actionMatch = rawStr.match(/\b(buy|sell|long|short|alert)\b/i);
+  const tickerMatch = rawStr.match(/\b([A-Z]{1,5})\b/);
+  const priceMatch = rawStr.match(/\$?([\d,]+\.?\d*)/);
+  const typeMatch = rawStr.match(/((?:SPY|QQQ|IWM)\s*0DTE\s*(?:Call|Put|Straddle|Strangle)?)/i);
+  const reasonMatch = rawStr.match(/(?:reason|note|because|signal)[:=]\s*(.+)/i);
 
   return {
-    action: actionMatch ? actionMatch[1].toUpperCase() : 'UNKNOWN',
+    action: actionMatch ? actionMatch[1].toUpperCase() : 'ALERT',
+    ticker: tickerMatch ? tickerMatch[1] : 'SPY',
     type: typeMatch ? typeMatch[1].trim() : 'SPY 0DTE',
     price: priceMatch ? parseFloat(priceMatch[1].replace(',', '')) : null,
+    close: null, open: null, high: null, low: null, volume: null,
+    interval: null, time: null,
     reason: reasonMatch ? reasonMatch[1].trim() : '',
-    raw,
+    raw: rawStr,
+    extra: null,
   };
+}
+
+/** Flatten nested object keys: { strategy: { order: { action: "buy" } } } → { "strategy.order.action": "buy", "action": "buy" } */
+function _flattenObject(obj, prefix = '', result = {}) {
+  for (const [key, val] of Object.entries(obj)) {
+    const fullKey = prefix ? `${prefix}.${key}` : key;
+    if (val && typeof val === 'object' && !Array.isArray(val)) {
+      _flattenObject(val, fullKey, result);
+    } else {
+      result[fullKey] = val;
+      // Also store the leaf key for easy lookup
+      if (!result[key]) result[key] = val;
+    }
+  }
+  return result;
+}
+
+/** Return the first non-empty string value found for any of the given keys. */
+function _firstOf(flat, ...keys) {
+  for (const k of keys) {
+    const v = flat[k];
+    if (v != null && String(v).trim() !== '') return String(v).trim();
+  }
+  return null;
+}
+
+/** Return the first parseable number found for any of the given keys. */
+function _firstNum(flat, ...keys) {
+  for (const k of keys) {
+    const v = flat[k];
+    if (v != null) {
+      const n = parseFloat(v);
+      if (!isNaN(n)) return n;
+    }
+  }
+  return null;
 }
 
 // ── Fetch SPY data (cached) ─────────────────────────────────────────────
@@ -657,8 +747,90 @@ async function handleWebhookAlert(message) {
   }
 }
 
+// ── HTTP Webhook Handler (TradingView → Express → Discord) ──────────────
+
+/**
+ * Handle an alert received via HTTP POST (from TradingView directly).
+ * Posts the ack embed to the SPY channel, then processes async.
+ *
+ * @param {import('discord.js').TextChannel} channel — The Discord channel to post in
+ * @param {object|string} body — Raw request body (JSON object or string)
+ */
+async function handleHttpAlert(channel, body) {
+  // Rate limit check
+  if (isAlertRateLimited()) {
+    log.warn('Alert rate limited — skipping HTTP alert');
+    return { ok: false, reason: 'rate_limited' };
+  }
+  recordAlert();
+
+  const alert = parseAlert(body);
+  log.info(`HTTP alert received: ${alert.action} ${alert.ticker} @ $${alert.price || 'N/A'}`);
+
+  // ── Step 1: Instant ack ──
+  let ackMessage;
+  try {
+    ackMessage = await channel.send({ embeds: [buildAckEmbed(alert)] });
+  } catch (err) {
+    log.error(`Failed to send ack to channel: ${err.message}`);
+    return { ok: false, reason: 'discord_send_failed' };
+  }
+
+  // ── Step 2: Async processing (don't block the HTTP response) ──
+  (async () => {
+    try {
+      const [priceData, newsData] = await Promise.all([
+        fetchSPYPrice(),
+        fetchSPYNews(),
+      ]);
+
+      const analysis = await runFastAnalysis(alert, priceData, newsData);
+      const chartUrl = await generateChartUrl().catch(() => null);
+
+      const embed = buildEnhancedEmbed(alert, analysis, priceData);
+      if (chartUrl) embed.setImage(chartUrl);
+
+      await ackMessage.edit({ embeds: [embed] });
+
+      // Thread
+      let thread;
+      try {
+        thread = await ackMessage.startThread({
+          name: `${alert.action} ${alert.ticker} — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET`,
+          autoArchiveDuration: 60,
+        });
+      } catch (err) {
+        log.warn(`Could not create thread: ${err.message}`);
+      }
+
+      // Reactions
+      try {
+        await ackMessage.react('👍');
+        await ackMessage.react('👎');
+      } catch (err) {
+        log.warn(`Could not add reactions: ${err.message}`);
+      }
+
+      // Follow-up
+      if (thread && alert.price) {
+        scheduleFollowUp(thread, alert, analysis);
+      }
+
+      log.info(`HTTP alert processed: ${alert.action} ${alert.ticker} — conviction ${analysis.conviction}/10`);
+    } catch (err) {
+      log.error(`HTTP alert processing error: ${err.message}`);
+      try {
+        await ackMessage.edit({ embeds: [buildErrorEmbed(alert, err.message)] });
+      } catch { /* nothing */ }
+    }
+  })();
+
+  return { ok: true, alert: { action: alert.action, ticker: alert.ticker, price: alert.price } };
+}
+
 module.exports = {
   handleWebhookAlert,
+  handleHttpAlert,
   parseAlert,
   buildEnhancedEmbed,
   buildAckEmbed,
