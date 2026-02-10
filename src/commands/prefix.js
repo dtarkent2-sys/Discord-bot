@@ -3,6 +3,7 @@ const github = require('../github-client');
 const aicoder = require('../ai-coder');
 const selfHealModule = require('./self-heal');
 const circuitBreaker = require('../services/circuit-breaker');
+const { instrumentMessage } = require('../utils/safe-send');
 
 // Owner-only guard
 function isOwner(message) {
@@ -239,6 +240,45 @@ async function handleCbReset(message) {
   return message.reply('Circuit breaker reset. Trading can resume on next cycle.');
 }
 
+// ── !debugperms ────────────────────────────────────────────────────
+// Reply with the bot's permissions in the current channel for diagnostics.
+async function handleDebugperms(message) {
+  if (!isOwner(message)) {
+    return message.reply('This command is restricted to the bot owner.');
+  }
+
+  const channel = message.channel;
+  const botMember = channel.guild?.members?.me;
+
+  if (!botMember) {
+    return message.reply('Cannot resolve bot member (may be a DM channel).');
+  }
+
+  const perms = channel.permissionsFor(botMember);
+  if (!perms) {
+    return message.reply('Cannot resolve permissions for this channel.');
+  }
+
+  const permArray = perms.toArray();
+  const critical = ['SendMessages', 'ViewChannel', 'EmbedLinks', 'AttachFiles', 'ReadMessageHistory'];
+  const missing = critical.filter(p => !permArray.includes(p));
+
+  const lines = [
+    `**Bot Permissions in #${channel.name}** (${channel.id})`,
+    '',
+    `**All permissions (${permArray.length}):**`,
+    `\`${permArray.join('`, `')}\``,
+  ];
+
+  if (missing.length > 0) {
+    lines.push('', `**MISSING critical permissions:** \`${missing.join('`, `')}\``);
+  } else {
+    lines.push('', 'All critical send permissions are present.');
+  }
+
+  return message.reply(lines.join('\n'));
+}
+
 // ── !help ──────────────────────────────────────────────────────────
 async function handleHelp(message) {
   const prefix = config.botPrefix;
@@ -265,6 +305,7 @@ async function handleHelp(message) {
     `\`${prefix}selfheal <file>\` — AI auto-fix critical bugs`,
     `\`${prefix}emergency\` — **EMERGENCY STOP** — kill all trading + schedules`,
     `\`${prefix}cbreset\` — Reset circuit breaker after review`,
+    `\`${prefix}debugperms\` — Show bot permissions in this channel`,
     `\`${prefix}help\` — Show this message`,
   ].join('\n'));
 }
@@ -295,12 +336,16 @@ const commands = {
   selfheal: handleSelfheal,
   emergency: handleEmergency,
   cbreset: handleCbReset,
+  debugperms: handleDebugperms,
   help: handleHelp,
 };
 
 async function handlePrefixCommand(message) {
   const prefix = config.botPrefix;
   if (!message.content.startsWith(prefix)) return false;
+
+  // Instrument all outbound sends/replies on this message for diagnostics
+  instrumentMessage(message);
 
   const content = message.content.slice(prefix.length).trim();
   const parts = content.split(/\s+/);

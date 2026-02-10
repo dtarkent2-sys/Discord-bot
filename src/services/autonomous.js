@@ -28,6 +28,7 @@ const policy = require('./policy');
 const config = require('../config');
 const auditLog = require('./audit-log');
 const circuitBreaker = require('./circuit-breaker');
+const { classifySendError, contentPreview, notifyOwner } = require('../utils/safe-send');
 
 // Rate limit: minimum ms between Discord posts per channel
 const RATE_LIMIT_MS = 2000;
@@ -276,11 +277,20 @@ class AutonomousBehaviorEngine {
       await new Promise(resolve => setTimeout(resolve, waitMs));
     }
 
+    const preview = contentPreview(content);
+    console.log(`[SafeSend] autonomous channel.send channel:${channel.id} (#${channelName}) content:${preview}`);
+
     try {
       await channel.send(content);
       this._lastPostTime.set(channelName, Date.now());
       stats.recordMessage();
     } catch (err) {
+      const known = classifySendError(err);
+      if (known) {
+        console.error(`[SafeSend] ${known.type} posting to #${channelName} (${channel.id}): ${known.detail}`, err.message);
+        await notifyOwner(this.client, `${known.type} posting to #${channelName} (<#${channel.id}>): ${known.detail}`);
+      }
+
       // Handle Discord rate limit (429) with retry
       if (err.httpStatus === 429 || err.message?.includes('rate limit')) {
         const retryAfter = err.retryAfter || 5000;
@@ -294,7 +304,7 @@ class AutonomousBehaviorEngine {
         } catch (retryErr) {
           console.error(`[Sprocket] Retry failed for #${channelName}:`, retryErr.message);
         }
-      } else {
+      } else if (!known) {
         console.error(`[Sprocket] Failed to post to #${channelName}:`, err.message);
       }
     }
