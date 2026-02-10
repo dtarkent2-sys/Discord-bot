@@ -103,87 +103,109 @@ class ValideaService {
 
   /**
    * Attempt to log into Validea and capture session cookies.
-   * Tries common login endpoint patterns.
+   * Validea runs on Classic ASP — login is a form POST with ASPSESSIONID cookies.
    */
   async _login() {
     this._loginAttempted = true;
-    console.log('[Validea] Attempting auto-login...');
+    console.log('[Validea] Attempting auto-login (Classic ASP)...');
 
+    // Step 1: GET the login page to pick up initial ASPSESSIONID cookie
+    let initialCookies = '';
+    try {
+      const getRes = await fetch(`${VALIDEA_HOST}/login`, {
+        headers: BROWSER_HEADERS,
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15000),
+      });
+      const getCookies = getRes.headers.getSetCookie ? getRes.headers.getSetCookie() : [];
+      initialCookies = this._parseCookies(getCookies.length > 0 ? getCookies : [getRes.headers.get('set-cookie') || '']) || '';
+      console.log(`[Validea] Login page: status ${getRes.status}, cookies: ${getCookies.length}`);
+
+      // Try to find the login form action from the HTML
+      if (getRes.ok) {
+        const html = await getRes.text();
+        const formMatch = html.match(/<form[^>]*action="([^"]*)"[^>]*>/i);
+        if (formMatch) {
+          console.log(`[Validea] Found login form action: ${formMatch[1]}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[Validea] Could not GET login page: ${err.message}`);
+    }
+
+    // Step 2: POST login credentials — try Classic ASP endpoints
+    // Classic ASP form fields are typically: username, password, txtUsername, txtPassword
     const loginEndpoints = [
-      { url: `${VALIDEA_HOST}/login`, contentType: 'application/x-www-form-urlencoded' },
-      { url: `${VALIDEA_HOST}/api/auth/login`, contentType: 'application/json' },
-      { url: `${VALIDEA_HOST}/users/sign_in`, contentType: 'application/x-www-form-urlencoded' },
-      { url: `${VALIDEA_HOST}/account/login`, contentType: 'application/x-www-form-urlencoded' },
+      `${VALIDEA_HOST}/login`,
+      `${VALIDEA_HOST}/login.asp`,
+      `${VALIDEA_HOST}/account/login`,
+      `${VALIDEA_HOST}/checklogin.asp`,
     ];
 
-    for (const endpoint of loginEndpoints) {
-      try {
-        let body;
-        const headers = { ...BROWSER_HEADERS };
+    // Classic ASP sites use various field name conventions
+    const fieldCombos = [
+      { username: config.valideaEmail, password: config.valideaPassword },
+      { txtUsername: config.valideaEmail, txtPassword: config.valideaPassword },
+      { email: config.valideaEmail, password: config.valideaPassword },
+      { UserName: config.valideaEmail, Password: config.valideaPassword },
+    ];
 
-        if (endpoint.contentType === 'application/json') {
-          headers['Content-Type'] = 'application/json';
-          headers['Accept'] = 'application/json';
-          body = JSON.stringify({
-            email: config.valideaEmail,
-            password: config.valideaPassword,
-            username: config.valideaEmail,
+    for (const url of loginEndpoints) {
+      for (const fields of fieldCombos) {
+        try {
+          const headers = {
+            ...BROWSER_HEADERS,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': `${VALIDEA_HOST}/login`,
+          };
+          if (initialCookies) {
+            headers['Cookie'] = initialCookies;
+          }
+
+          const body = new URLSearchParams(fields).toString();
+
+          const res = await fetch(url, {
+            method: 'POST',
+            headers,
+            body,
+            redirect: 'manual', // Capture Set-Cookie before redirect
+            signal: AbortSignal.timeout(15000),
           });
-        } else {
-          headers['Content-Type'] = 'application/x-www-form-urlencoded';
-          body = new URLSearchParams({
-            email: config.valideaEmail,
-            password: config.valideaPassword,
-            username: config.valideaEmail,
-            'user[email]': config.valideaEmail,
-            'user[password]': config.valideaPassword,
-          }).toString();
-        }
 
-        const res = await fetch(endpoint.url, {
-          method: 'POST',
-          headers,
-          body,
-          redirect: 'manual', // Don't follow redirects — we want the Set-Cookie headers
-          signal: AbortSignal.timeout(15000),
-        });
+          // Capture cookies from response
+          const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
+          const newCookies = this._parseCookies(setCookies.length > 0 ? setCookies : [res.headers.get('set-cookie') || '']);
 
-        // Capture cookies from Set-Cookie headers
-        const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
-        const cookieHeader = res.headers.get('set-cookie') || '';
+          // Merge initial + new cookies
+          const allCookies = [initialCookies, newCookies].filter(Boolean).join('; ');
 
-        // Parse all cookies into a single Cookie header string
-        const cookies = this._parseCookies(setCookies.length > 0 ? setCookies : [cookieHeader]);
+          // Classic ASP success: 302 redirect + ASPSESSIONID + username cookie
+          const hasAspSession = allCookies.match(/ASPSESSIONID\w+=/i);
+          const hasUsername = allCookies.includes('username=');
 
-        if (cookies && (res.status === 200 || res.status === 302 || res.status === 303)) {
-          // Check if we got session-like cookies (not just tracking cookies)
-          const hasSession = cookies.includes('session') || cookies.includes('auth') ||
-                           cookies.includes('token') || cookies.includes('_validea') ||
-                           cookies.includes('remember') || cookies.includes('user');
-
-          if (hasSession || setCookies.length > 1) {
-            console.log(`[Validea] Login via ${endpoint.url} — got ${setCookies.length} cookies (status ${res.status})`);
-            this._sessionCookies = cookies;
+          if ((res.status === 200 || res.status === 302 || res.status === 303) && hasAspSession) {
+            console.log(`[Validea] Login succeeded via ${url} (status ${res.status}, ASP session + username=${!!hasUsername})`);
+            this._sessionCookies = allCookies;
             this._sessionExpiry = Date.now() + 4 * 60 * 60 * 1000; // 4 hour session
             this._loginAttempted = false; // Allow re-login after expiry
-            return cookies;
+            return allCookies;
           }
-        }
 
-        // Log non-success for debugging
-        if (res.status !== 404 && res.status !== 405) {
-          console.log(`[Validea] Login attempt ${endpoint.url} — status ${res.status}, cookies: ${setCookies.length}`);
-        }
-      } catch (err) {
-        // 503 = Cloudflare, expected from datacenter IPs
-        if (!err.message.includes('503')) {
-          console.warn(`[Validea] Login attempt ${endpoint.url} failed: ${err.message}`);
+          // Only log interesting results (not 404s)
+          if (res.status !== 404 && res.status !== 405) {
+            console.log(`[Validea] Login attempt POST ${url} (${Object.keys(fields).join(',')}) — status ${res.status}`);
+          }
+        } catch (err) {
+          if (!err.message.includes('503') && !err.message.includes('timeout')) {
+            console.warn(`[Validea] Login POST ${url} failed: ${err.message}`);
+          }
         }
       }
     }
 
-    console.warn('[Validea] Auto-login failed — set VALIDEA_COOKIE env var with session cookie from your browser');
-    console.warn('[Validea] To get cookie: log into validea.com in browser > DevTools > Application > Cookies > copy all cookie values');
+    console.warn('[Validea] Auto-login failed — set VALIDEA_COOKIE env var from your browser.');
+    console.warn('[Validea] Browser DevTools > Application > Cookies > www.validea.com');
+    console.warn('[Validea] Copy: ASPSESSIONID...=value; username=value');
     return null;
   }
 
@@ -226,6 +248,15 @@ class ValideaService {
       redirect: 'follow',
     });
 
+    // Capture any new cookies from the response (ASP may rotate session IDs)
+    const newSetCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
+    if (newSetCookies.length > 0 && this._sessionCookies) {
+      const newCookies = this._parseCookies(newSetCookies);
+      if (newCookies) {
+        this._sessionCookies = this._mergeCookies(this._sessionCookies, newCookies);
+      }
+    }
+
     if (!res.ok) {
       // If we got a redirect to login page, our session is invalid
       const finalUrl = res.url || url;
@@ -241,13 +272,30 @@ class ValideaService {
     const html = await res.text();
 
     // Detect if we were soft-redirected to login (page contains login form instead of data)
-    if (html.includes('id="login-form"') || html.includes('name="password"') && !html.includes('guru-analysis')) {
+    if ((html.includes('id="login-form"') || html.includes('name="password"')) && !html.includes('guru-analysis')) {
       this._sessionCookies = null;
       this._sessionExpiry = 0;
       throw new Error('Session invalid — received login page instead of data');
     }
 
     return { html, authenticated: !!cookies };
+  }
+
+  /**
+   * Merge two cookie strings, letting newer values override older ones.
+   */
+  _mergeCookies(existing, newer) {
+    const map = new Map();
+    for (const str of [existing, newer]) {
+      for (const part of str.split(';')) {
+        const trimmed = part.trim();
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx > 0) {
+          map.set(trimmed.slice(0, eqIdx).trim(), trimmed);
+        }
+      }
+    }
+    return [...map.values()].join('; ');
   }
 
   // ── Analysis ────────────────────────────────────────────────────────
