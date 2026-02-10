@@ -668,90 +668,65 @@ function buildErrorEmbed(alert, errorMsg) {
 // ── QuickChart.io Candlestick Chart ─────────────────────────────────────
 
 /**
- * Generate a QuickChart.io candlestick chart URL from yahoo-finance2 data.
- * Uses the QuickChart API (free, no key needed) with Chart.js config.
+ * Generate a QuickChart.io chart URL using AInvest candle data.
+ * Falls back to price-fetcher sources if AInvest fails.
  *
+ * @param {string} [ticker='SPY'] — Ticker to chart
  * @returns {string|null} — Chart image URL or null
  */
-async function generateChartUrl() {
+async function generateChartUrl(ticker = 'SPY') {
   try {
-    // Try to get SPY history from yahoo-finance2
-    let yahooFinance;
+    let candles = [];
+
+    // Try AInvest candles first (15-min bars, last ~20 candles)
     try {
-      yahooFinance = require('yahoo-finance2').default;
-    } catch {
-      return null;
+      const ainvest = require('./ainvest');
+      if (ainvest.enabled) {
+        candles = await ainvest.getCandles(ticker, { interval: 'min', step: 15, count: 20 });
+      }
+    } catch (err) {
+      log.warn(`Chart: AInvest candles failed: ${err.message}`);
     }
 
-    const endDate = new Date();
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 5); // Last 5 days for intraday view
+    // Fallback: Alpaca daily bars (last 5 days)
+    if (candles.length < 5) {
+      try {
+        const alpaca = require('./alpaca');
+        if (alpaca.enabled) {
+          const bars = await alpaca.getHistory(ticker, 5);
+          if (bars && bars.length > 0) {
+            candles = bars.map(b => ({
+              open: b.open,
+              high: b.high,
+              low: b.low,
+              close: b.close,
+              volume: b.volume,
+              timestamp: b.date ? new Date(b.date).getTime() : Date.now(),
+            }));
+          }
+        }
+      } catch (err) {
+        log.warn(`Chart: Alpaca bars failed: ${err.message}`);
+      }
+    }
 
-    const history = await yahooFinance.chart('SPY', {
-      period1: startDate,
-      period2: endDate,
-      interval: '15m',
-    });
-
-    if (!history || !history.quotes || history.quotes.length < 5) return null;
+    if (candles.length < 5) return null;
 
     // Take last 20 candles
-    const candles = history.quotes.slice(-20);
-    const labels = candles.map(c => {
-      const d = new Date(c.date);
+    const recent = candles.slice(-20);
+    const labels = recent.map(c => {
+      const d = new Date(c.timestamp);
       return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`;
     });
-    const opens = candles.map(c => c.open);
-    const highs = candles.map(c => c.high);
-    const lows = candles.map(c => c.low);
-    const closes = candles.map(c => c.close);
+    const closes = recent.map(c => c.close);
 
-    // QuickChart OHLC/candlestick via financial chart
-    const chartConfig = {
-      type: 'bar',
-      data: {
-        labels,
-        datasets: [
-          {
-            label: 'SPY Price',
-            data: closes.map((c, i) => ({
-              x: labels[i],
-              o: opens[i],
-              h: highs[i],
-              l: lows[i],
-              c: closes[i],
-            })),
-            backgroundColor: closes.map((c, i) => c >= opens[i] ? 'rgba(0, 200, 83, 0.8)' : 'rgba(255, 68, 68, 0.8)'),
-            borderColor: closes.map((c, i) => c >= opens[i] ? '#00c853' : '#ff4444'),
-            borderWidth: 1,
-          },
-        ],
-      },
-      options: {
-        plugins: {
-          title: { display: true, text: `SPY Intraday — ${todayString()}`, color: '#fff' },
-          legend: { display: false },
-        },
-        scales: {
-          y: {
-            ticks: { color: '#ccc' },
-            grid: { color: 'rgba(255,255,255,0.1)' },
-          },
-          x: {
-            ticks: { color: '#ccc', maxRotation: 45 },
-            grid: { color: 'rgba(255,255,255,0.1)' },
-          },
-        },
-      },
-    };
-
-    // Simple line chart fallback (more reliable with QuickChart)
+    // Simple line chart (reliable with QuickChart)
     const simpleChart = {
       type: 'line',
       data: {
         labels,
         datasets: [{
-          label: 'SPY',
+          label: ticker,
           data: closes,
           borderColor: closes[closes.length - 1] >= closes[0] ? '#00c853' : '#ff4444',
           backgroundColor: closes[closes.length - 1] >= closes[0] ? 'rgba(0,200,83,0.1)' : 'rgba(255,68,68,0.1)',
@@ -762,7 +737,7 @@ async function generateChartUrl() {
       },
       options: {
         plugins: {
-          title: { display: true, text: `SPY Intraday — ${todayString()}`, color: '#fff', font: { size: 14 } },
+          title: { display: true, text: `${ticker} Intraday — ${todayString()}`, color: '#fff', font: { size: 14 } },
           legend: { display: false },
         },
         scales: {
@@ -967,7 +942,7 @@ async function handleHttpAlert(channel, body) {
       fetchSPYPrice(),
       fetchSPYNews(),
       fetchFundamentals(alert.ticker || 'SPY'),
-      generateChartUrl().catch(() => null),
+      generateChartUrl(alert.ticker || 'SPY').catch(() => null),
     ]);
     priceData = price;
     chartUrl = chart;
