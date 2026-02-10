@@ -21,7 +21,11 @@ async function loadYahooFinance() {
   yahooFinanceLoaded = true;
   try {
     const mod = await import('yahoo-finance2');
-    yahooFinance = mod.default || mod;
+    // ESM dynamic import can double-wrap: mod.default.default vs mod.default
+    const candidate = mod.default || mod;
+    yahooFinance = (typeof candidate.quote === 'function') ? candidate
+                 : (candidate.default && typeof candidate.default.quote === 'function') ? candidate.default
+                 : candidate;
     console.log('[PriceFetcher] yahoo-finance2 loaded OK');
   } catch (err) {
     yahooFinance = null;

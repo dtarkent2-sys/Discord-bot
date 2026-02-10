@@ -618,7 +618,10 @@ async function generateChartUrl() {
     let yahooFinance;
     try {
       const mod = await import('yahoo-finance2');
-      yahooFinance = mod.default || mod;
+      const candidate = mod.default || mod;
+      yahooFinance = (typeof candidate.chart === 'function') ? candidate
+                   : (candidate.default && typeof candidate.default.chart === 'function') ? candidate.default
+                   : candidate;
     } catch {
       return null;
     }
