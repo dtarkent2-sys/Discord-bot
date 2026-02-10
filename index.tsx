@@ -1,3 +1,5 @@
-// Railway Bun template fallback entrypoint.
-// If the service is configured to run `bun run index.tsx`, forward to the real Node app.
-import './index.js';
+await import('./index.js');
+} catch (error) {
+  console.error('Failed to load index.js:', error);
+  process.exit(1);
+}
