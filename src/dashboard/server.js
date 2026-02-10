@@ -70,9 +70,14 @@ function startDashboard() {
       return res.status(500).json({ error: 'Alert handler not loaded' });
     }
 
-    // Respond immediately (TradingView times out after ~3s)
-    const result = await spyAlerts.handleHttpAlert(channel, body);
-    res.status(result.ok ? 200 : 429).json(result);
+    // Respond to TradingView immediately (it times out after ~3s)
+    // Analysis + Discord posting happens in the background
+    res.status(200).json({ ok: true, status: 'processing' });
+
+    // Run the full pipeline: parse → fetch data → AI analysis → post to Discord
+    spyAlerts.handleHttpAlert(channel, body).catch(err => {
+      console.error(`[Webhook] Alert pipeline failed:`, err.message);
+    });
   });
 
   // Health check endpoint (for Railway / monitoring)
