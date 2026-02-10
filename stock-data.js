@@ -1,6 +1,6 @@
 const axios = require('axios');
 
-const YAHOO_BASE = 'https://query1.finance.yahoo.com';
+const YAHOO_BASE = 'https://ainvest.com';
 
 class StockData {
   constructor() {
