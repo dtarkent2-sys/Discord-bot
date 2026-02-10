@@ -181,89 +181,78 @@ class TradingAgents {
    * Fetch all AInvest data categories in parallel for rich analysis.
    */
   async _fetchAInvestData(ticker, data, dataSources) {
-    const fetches = [
-      // Analyst consensus ratings
-      ainvest.getAnalystConsensus(ticker)
-        .then(result => {
-          if (result) {
-            data.analystRatings = this._formatAnalystConsensus(result);
-            dataSources.push('ainvest-analyst-ratings');
-          }
-        })
-        .catch(err => console.warn(`[TradingAgents] AInvest analyst consensus failed for ${ticker}:`, err.message)),
+    const delay = (ms) => new Promise(r => setTimeout(r, ms));
+    const STAGGER_MS = 350; // space out calls to avoid AInvest rate limits
 
-      // Recent analyst rating changes (individual firms)
-      ainvest.getAnalystHistory(ticker, 10)
-        .then(result => {
-          if (result && result.length > 0) {
-            data.analystHistory = this._formatAnalystHistory(result);
-            dataSources.push('ainvest-analyst-history');
-          }
-        })
-        .catch(err => console.warn(`[TradingAgents] AInvest analyst history failed for ${ticker}:`, err.message)),
-
-      // Fundamental financials
-      ainvest.getFinancials(ticker)
-        .then(result => {
-          if (result) {
-            data.fundamentals = this._formatFinancials(result);
-            dataSources.push('ainvest-financials');
-          }
-        })
-        .catch(err => console.warn(`[TradingAgents] AInvest financials failed for ${ticker}:`, err.message)),
-
-      // Recent earnings
-      ainvest.getEarnings(ticker, 4)
-        .then(result => {
-          if (result && result.length > 0) {
-            data.earnings = this._formatEarnings(result);
-            dataSources.push('ainvest-earnings');
-          }
-        })
-        .catch(err => console.warn(`[TradingAgents] AInvest earnings failed for ${ticker}:`, err.message)),
-
-      // News headlines
-      ainvest.getNews({ tickers: [ticker], limit: 10 })
-        .then(result => {
-          if (result && result.length > 0) {
-            data.news = this._formatNews(result);
-            dataSources.push('ainvest-news');
-          }
-        })
-        .catch(err => console.warn(`[TradingAgents] AInvest news failed for ${ticker}:`, err.message)),
-
-      // Insider trades
-      ainvest.getInsiderTrades(ticker)
-        .then(result => {
-          if (result && result.length > 0) {
-            data.insiderTrades = this._formatInsiderTrades(result.slice(0, 5));
-            dataSources.push('ainvest-insider-trades');
-          }
-        })
-        .catch(err => console.warn(`[TradingAgents] AInvest insider trades failed for ${ticker}:`, err.message)),
-
-      // Congress trades
-      ainvest.getCongressTrades(ticker)
-        .then(result => {
-          if (result && result.length > 0) {
-            data.congressTrades = this._formatCongressTrades(result.slice(0, 5));
-            dataSources.push('ainvest-congress-trades');
-          }
-        })
-        .catch(err => console.warn(`[TradingAgents] AInvest congress trades failed for ${ticker}:`, err.message)),
-
-      // Economic calendar (macro context)
-      ainvest.getEconomicCalendar({ importance: 'high' })
-        .then(result => {
-          if (result && result.length > 0) {
-            data.economicCalendar = this._formatEconomicCalendar(result.slice(0, 5));
-            dataSources.push('ainvest-econ-calendar');
-          }
-        })
-        .catch(err => console.warn(`[TradingAgents] AInvest economic calendar failed:`, err.message)),
+    const steps = [
+      {
+        name: 'analyst-ratings',
+        fn: () => ainvest.getAnalystConsensus(ticker),
+        ok: (result) => {
+          if (result) { data.analystRatings = this._formatAnalystConsensus(result); dataSources.push('ainvest-analyst-ratings'); }
+        },
+      },
+      {
+        name: 'analyst-history',
+        fn: () => ainvest.getAnalystHistory(ticker, 10),
+        ok: (result) => {
+          if (result && result.length > 0) { data.analystHistory = this._formatAnalystHistory(result); dataSources.push('ainvest-analyst-history'); }
+        },
+      },
+      {
+        name: 'financials',
+        fn: () => ainvest.getFinancials(ticker),
+        ok: (result) => {
+          if (result) { data.fundamentals = this._formatFinancials(result); dataSources.push('ainvest-financials'); }
+        },
+      },
+      {
+        name: 'earnings',
+        fn: () => ainvest.getEarnings(ticker, 4),
+        ok: (result) => {
+          if (result && result.length > 0) { data.earnings = this._formatEarnings(result); dataSources.push('ainvest-earnings'); }
+        },
+      },
+      {
+        name: 'news',
+        fn: () => ainvest.getNews({ tickers: [ticker], limit: 10 }),
+        ok: (result) => {
+          if (result && result.length > 0) { data.news = this._formatNews(result); dataSources.push('ainvest-news'); }
+        },
+      },
+      {
+        name: 'insider-trades',
+        fn: () => ainvest.getInsiderTrades(ticker),
+        ok: (result) => {
+          if (result && result.length > 0) { data.insiderTrades = this._formatInsiderTrades(result.slice(0, 5)); dataSources.push('ainvest-insider-trades'); }
+        },
+      },
+      {
+        name: 'congress-trades',
+        fn: () => ainvest.getCongressTrades(ticker),
+        ok: (result) => {
+          if (result && result.length > 0) { data.congressTrades = this._formatCongressTrades(result.slice(0, 5)); dataSources.push('ainvest-congress-trades'); }
+        },
+      },
+      {
+        name: 'econ-calendar',
+        fn: () => ainvest.getEconomicCalendar({ importance: 'high' }),
+        ok: (result) => {
+          if (result && result.length > 0) { data.economicCalendar = this._formatEconomicCalendar(result.slice(0, 5)); dataSources.push('ainvest-econ-calendar'); }
+        },
+      },
     ];
 
-    await Promise.allSettled(fetches);
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      try {
+        const result = await step.fn();
+        step.ok(result);
+      } catch (err) {
+        console.warn(`[TradingAgents] AInvest ${step.name} failed for ${ticker}:`, err.message);
+      }
+      if (i < steps.length - 1) await delay(STAGGER_MS);
+    }
   }
 
   // ── AInvest Data Formatters ─────────────────────────────────────────────
