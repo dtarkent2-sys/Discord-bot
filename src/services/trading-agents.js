@@ -42,6 +42,15 @@ class TradingAgents {
     this.model = config.ollamaModel;
   }
 
+  /** Update the model used for analysis (called when user switches via /model) */
+  setModel(modelName) {
+    this.model = modelName;
+  }
+
+  getModel() {
+    return this.model;
+  }
+
   // ── Main entry point ──────────────────────────────────────────────────
 
   /**
