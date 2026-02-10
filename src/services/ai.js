@@ -394,11 +394,12 @@ ${mood.buildMoodContext()}
           console.warn('[AI] Kimi returned empty response, falling back to Ollama');
           // Fall through to Ollama
         } else {
-          history.push({ role: 'assistant', content: assistantMessage });
-          if (assistantMessage.length > 1990) {
-            return assistantMessage.slice(0, 1990) + '...';
+          const cleaned = this._cleanResponse(assistantMessage);
+          if (cleaned) {
+            history.push({ role: 'assistant', content: cleaned });
+            return cleaned.length > 1990 ? cleaned.slice(0, 1990) + '...' : cleaned;
           }
-          return assistantMessage;
+          console.warn('[AI] Kimi response empty after cleaning, falling back to Ollama');
         }
       } catch (err) {
         console.error(`[AI] Kimi agent error: ${err.message}`);
@@ -409,64 +410,51 @@ ${mood.buildMoodContext()}
 
     // ── Standard Ollama path ──
     try {
-      // Try streaming first
-      let assistantMessage = '';
-      let chunkCount = 0;
-      try {
-        const stream = await this.ollama.chat({
-          model: this.model,
-          messages: chatMessages,
-          stream: true,
-        });
+      let assistantMessage = await this._ollamaChat(chatMessages);
 
-        for await (const part of stream) {
-          chunkCount++;
-          const content = part.message?.content;
-          if (content) assistantMessage += content;
-        }
-      } catch (streamErr) {
-        console.warn(`[AI] Streaming failed (${streamErr.message}), trying non-streaming...`);
-        // Retry without streaming — some Ollama setups have streaming issues
+      // Clean thinking tags and validate
+      const cleaned = this._cleanResponse(assistantMessage);
+      if (cleaned) {
+        history.push({ role: 'assistant', content: cleaned });
+        return cleaned.length > 1990 ? cleaned.slice(0, 1990) + '...' : cleaned;
+      }
+
+      // Ollama returned empty — try non-streaming as fallback
+      console.warn(`[AI] Ollama streaming returned empty (model: ${this.model}), trying non-streaming...`);
+      try {
         const result = await this.ollama.chat({
           model: this.model,
           messages: chatMessages,
           stream: false,
         });
         assistantMessage = result.message?.content || '';
-        chunkCount = assistantMessage ? 1 : 0;
+        const cleanedRetry = this._cleanResponse(assistantMessage);
+        if (cleanedRetry) {
+          history.push({ role: 'assistant', content: cleanedRetry });
+          return cleanedRetry.length > 1990 ? cleanedRetry.slice(0, 1990) + '...' : cleanedRetry;
+        }
+      } catch (retryErr) {
+        console.warn(`[AI] Non-streaming retry also failed: ${retryErr.message}`);
       }
 
-      if (!assistantMessage || !assistantMessage.trim()) {
-        console.warn(`[AI] Ollama returned empty response (${chunkCount} chunks, model: ${this.model})`);
-        // Strip thinking tags some models wrap around empty responses
-        const stripped = assistantMessage
-          .replace(/<think>[\s\S]*?<\/think>/g, '')
-          .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/g, '')
-          .trim();
-        if (stripped) {
-          assistantMessage = stripped;
-        } else {
-          return "Hmm, I blanked out for a second there. What were you saying?";
+      // Last resort: try Kimi even if not the primary model
+      if (!this.kimiEnabled && config.kimiApiKey) {
+        console.warn('[AI] Ollama empty — attempting Kimi API as last resort...');
+        try {
+          const kimiResult = await this._kimiAgentChat(chatMessages);
+          const cleanedKimi = this._cleanResponse(kimiResult);
+          if (cleanedKimi) {
+            history.push({ role: 'assistant', content: cleanedKimi });
+            return cleanedKimi.length > 1990 ? cleanedKimi.slice(0, 1990) + '...' : cleanedKimi;
+          }
+        } catch (kimiErr) {
+          console.warn(`[AI] Kimi last-resort also failed: ${kimiErr.message}`);
         }
       }
 
-      // Strip thinking tags from models that use them (qwen, deepseek, etc.)
-      assistantMessage = assistantMessage
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
-        .trim();
-
-      if (!assistantMessage) {
-        return "Hmm, I blanked out for a second there. What were you saying?";
-      }
-
-      history.push({ role: 'assistant', content: assistantMessage });
-
-      if (assistantMessage.length > 1990) {
-        return assistantMessage.slice(0, 1990) + '...';
-      }
-
-      return assistantMessage;
+      // Everything failed
+      console.error(`[AI] ALL LLM backends returned empty (model: ${this.model}, host: ${config.ollamaHost}, kimi: ${config.kimiApiKey ? 'configured' : 'not set'})`);
+      return `My AI brain isn't responding right now (model: ${this.model}). Try again in a moment, or check if the AI server is running.`;
     } catch (err) {
       console.error(`[AI] Chat error: ${err.message}`);
       if (err.cause) console.error(`[AI] Cause:`, err.cause);
@@ -479,6 +467,65 @@ ${mood.buildMoodContext()}
       }
       return `Oops, something went wrong on my end: ${msg}`;
     }
+  }
+
+  /**
+   * Stream a chat response from Ollama, returning the raw text.
+   */
+  async _ollamaChat(messages) {
+    const stream = await this.ollama.chat({
+      model: this.model,
+      messages,
+      stream: true,
+    });
+
+    let result = '';
+    let chunks = 0;
+    for await (const part of stream) {
+      chunks++;
+      const content = part.message?.content;
+      if (content) result += content;
+    }
+
+    console.log(`[AI] Ollama stream: ${chunks} chunks, ${result.length} chars raw`);
+    return result;
+  }
+
+  /**
+   * Clean an LLM response: strip thinking tags, trim, validate non-empty.
+   * Returns the cleaned string or null if empty.
+   */
+  _cleanResponse(text) {
+    if (!text) return null;
+
+    // Strip thinking tags from models that use them (qwen3, deepseek, etc.)
+    let cleaned = text
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
+      .trim();
+
+    // If stripping removed everything, try to salvage the thinking content
+    if (!cleaned && text.trim()) {
+      const thinkMatch = text.match(/<think>([\s\S]*?)<\/think>/i)
+        || text.match(/<\|think\|>([\s\S]*?)<\|\/think\|>/i);
+      if (thinkMatch) {
+        // The model only produced thinking — use the last sentence as a response
+        const thoughts = thinkMatch[1].trim();
+        // Extract the last meaningful line as the "answer"
+        const lines = thoughts.split('\n').filter(l => l.trim().length > 5);
+        if (lines.length > 0) {
+          cleaned = lines[lines.length - 1].trim();
+          console.warn(`[AI] Response was only <think> tags — salvaged: "${cleaned.slice(0, 80)}"`);
+        }
+      }
+
+      // If still empty, just use the raw text (better than nothing)
+      if (!cleaned) {
+        cleaned = text.replace(/<\/?think>/gi, '').replace(/<\|\/?think\|>/gi, '').trim();
+      }
+    }
+
+    return cleaned || null;
   }
 
   async complete(prompt) {
