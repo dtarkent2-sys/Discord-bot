@@ -686,16 +686,6 @@ async function generateChartUrl(ticker = 'SPY') {
       }
     } catch (err) {
       log.warn(`Chart: AInvest candles failed: ${err.message}`);
-    // Try to get SPY history from yahoo-finance2 (ESM-only, use dynamic import)
-    let yahooFinance;
-    try {
-      const mod = await import('yahoo-finance2');
-      const candidate = mod.default || mod;
-      yahooFinance = (typeof candidate.chart === 'function') ? candidate
-                   : (candidate.default && typeof candidate.default.chart === 'function') ? candidate.default
-                   : candidate;
-    } catch {
-      return null;
     }
 
     // Fallback: Alpaca daily bars (last 5 days)
