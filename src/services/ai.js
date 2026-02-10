@@ -177,8 +177,6 @@ ${mood.buildMoodContext()}
    * Uses simple keyword heuristics — not perfect, but catches most real-time questions.
    */
   _needsWebSearch(message) {
-    if (!config.searxngUrl) return false;
-
     const lower = message.toLowerCase();
 
     // Current events / real-time triggers
@@ -306,11 +304,17 @@ ${mood.buildMoodContext()}
 
     // ── Pre-fetch: Auto-fetch prices for any tickers mentioned ──
     let livePrices = null;
-    if (priceFetcher.isAvailable()) {
-      const tickers = this._extractTickers(userMessage);
-      if (tickers.length > 0) {
+    const tickers = this._extractTickers(userMessage);
+    if (tickers.length > 0) {
+      if (!priceFetcher.isAvailable()) {
+        console.warn(`[AI] yahoo-finance2 not available — cannot fetch prices for: ${tickers.join(', ')}`);
+      } else {
         try {
           const prices = await priceFetcher.getMultiplePrices(tickers);
+          const failed = prices.filter(p => p.error);
+          if (failed.length > 0) {
+            console.warn(`[AI] Price fetch errors: ${failed.map(p => `${p.ticker}: ${p.message}`).join(', ')}`);
+          }
           const formatted = priceFetcher.formatForPrompt(prices);
           if (formatted && !formatted.includes('unavailable')) {
             livePrices = formatted;
