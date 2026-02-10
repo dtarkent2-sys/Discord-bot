@@ -141,6 +141,29 @@ class CircuitBreaker {
     auditLog.log('circuit_breaker', 'Circuit breaker manually reset');
   }
 
+  // ── Alert Rate Limiting ─────────────────────────────────────────────
+
+  /**
+   * Check if 0DTE alerts are rate-limited.
+   * Separate from trade circuit breaker — tracks alert frequency.
+   * @param {number} [maxPerMinute=5] — max alerts per minute
+   * @returns {boolean}
+   */
+  isAlertRateLimited(maxPerMinute = 5) {
+    if (!this._alertTimestamps) this._alertTimestamps = [];
+    const now = Date.now();
+    this._alertTimestamps = this._alertTimestamps.filter(ts => ts > now - 60000);
+    return this._alertTimestamps.length >= maxPerMinute;
+  }
+
+  /**
+   * Record an alert for rate-limiting purposes.
+   */
+  recordAlertEvent() {
+    if (!this._alertTimestamps) this._alertTimestamps = [];
+    this._alertTimestamps.push(Date.now());
+  }
+
   /**
    * Get current circuit breaker state for display.
    */
