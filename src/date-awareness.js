@@ -2,16 +2,43 @@
  * Date awareness utilities for RAG-enforced freshness.
  *
  * Every LLM prompt in the bot should use these helpers so the model
- * always knows today's date AND never trusts its own training data
+ * always knows today's REAL date AND never trusts its own training data
  * for anything after the cutoff.
+ *
+ * KEY INSIGHT: Models like Kimi K2.5, Qwen 2.5, Llama 3.x have knowledge
+ * cutoffs around December 2024 / early 2025. Even if released in 2026,
+ * their weights don't contain 2026 knowledge. We MUST force tool/search
+ * usage for anything recent.
  */
 
-// Approximate cutoff of the default Ollama model (Gemma/Llama/Qwen family).
-// Update this when you swap to a model with a newer cutoff.
-const MODEL_CUTOFF = process.env.MODEL_CUTOFF || 'mid-2024';
+// Confirmed reliable cutoff for Kimi K2.5 / Qwen 2.5 family.
+// Update this when you switch to a model with a verifiably newer cutoff.
+const MODEL_CUTOFF = process.env.MODEL_CUTOFF || 'December 2024';
 
+/**
+ * Full date + time string in EST, e.g.:
+ *   "Monday, February 10, 2026, 7:36 PM EST"
+ */
+function nowEST() {
+  return new Date().toLocaleString('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+    timeZoneName: 'short',
+  });
+}
+
+/**
+ * Short date-only string, e.g.:
+ *   "Monday, February 10, 2026"
+ */
 function todayString() {
   return new Date().toLocaleDateString('en-US', {
+    timeZone: 'America/New_York',
     weekday: 'long',
     year: 'numeric',
     month: 'long',
@@ -25,43 +52,56 @@ function isoTimestamp() {
 
 /**
  * Concise date header for system prompts.
- * Returns something like:
- *   "Current date: Monday, February 10, 2026."
  */
 function dateHeader() {
-  return `Current date: ${todayString()}.`;
+  return `Current date and time: ${nowEST()}.`;
 }
 
 /**
  * Full RAG enforcement block to inject into ANY system prompt.
- * Tells the model its cutoff, today's real date, and strict rules.
+ * Uses ALL-CAPS for critical rules — models attend to this more strongly.
  */
 function ragEnforcementBlock() {
+  const now = nowEST();
   return `
-=== DATE & FRESHNESS RULES ===
-Today is ${todayString()}. The current UTC timestamp is ${isoTimestamp()}.
-Your internal training data ends around ${MODEL_CUTOFF}. That means you are MISSING many months of real-world events, prices, earnings, news, and market history.
+=== CRITICAL: DATE & FRESHNESS RULES ===
+Current real-world date and time (EST): ${now}
+You are running LIVE in ${new Date().getFullYear()}. This is NOT a simulation.
 
-STRICT RULES:
-1. For ANY fact, price, event, statistic, or development AFTER ${MODEL_CUTOFF}: you MUST rely ONLY on live data, search results, or tool outputs provided in this prompt. NEVER guess or fill in from stale memory.
-2. If no live data is provided for a question about recent events, say "I don't have current data for that" — do NOT fabricate an answer.
-3. Every price, metric, or date you cite must come from the PROVIDED DATA sections in this prompt. If a field says "N/A" or "MISSING", acknowledge it — do not invent a value.
-4. Never say "as of my last update" or "my knowledge cutoff" to users — just use the live data or say you don't have it.
+YOUR TRAINING DATA ENDS RELIABLY AROUND ${MODEL_CUTOFF.toUpperCase()}. You are MISSING over a year of real-world events, market history, prices, earnings, news, policy changes, and company developments.
+
+MANDATORY RULES — VIOLATION = HALLUCINATION:
+1. For ANY fact, price, event, statistic, news, market move, company update, crypto change, or reference AFTER ${MODEL_CUTOFF}: you MUST use ONLY the live data, search results, or tool outputs provided in this conversation. NEVER guess, NEVER fill in from stale training memory, NEVER extrapolate from old data.
+2. If you are asked about something recent and NO live data is provided: respond "I don't have current data for that — let me look it up" or "Current data unavailable." Do NOT fabricate a plausible-sounding answer.
+3. When LIVE DATA or SEARCH RESULTS sections appear below, they are your SOLE source of truth for prices, metrics, and market conditions. NEVER contradict live data with outdated training knowledge.
+4. NEVER say "as of my last update", "my knowledge cutoff", or "I was trained on data through..." — just use the live data or honestly say you need to look it up.
+5. If tools fail or return no recent data for a market/trading question, say: "Current data unavailable — my analysis would be unreliable without live data."
 === END FRESHNESS RULES ===`.trim();
 }
 
 /**
- * Short RAG reminder for mid-prompt injection (e.g. between analyst stages).
+ * Short RAG reminder for mid-prompt injection (between analyst stages, etc.)
  */
 function ragReminder() {
-  return `REMINDER: Today is ${todayString()}. Use ONLY the data provided above — never rely on training data for recent prices or events.`;
+  return `REMINDER: Current date is ${nowEST()}. Use ONLY the data provided above. Your training data ends around ${MODEL_CUTOFF} — do NOT use stale internal knowledge for any recent prices, events, or market conditions.`;
+}
+
+/**
+ * Date anchor to prepend to user messages.
+ * Repeating the date at the message level (not just system prompt) gives
+ * the model a stronger anchor against defaulting to training-era thinking.
+ */
+function userMessageDateAnchor() {
+  return `[Current date: ${nowEST()}]`;
 }
 
 module.exports = {
   MODEL_CUTOFF,
+  nowEST,
   todayString,
   isoTimestamp,
   dateHeader,
   ragEnforcementBlock,
   ragReminder,
+  userMessageDateAnchor,
 };

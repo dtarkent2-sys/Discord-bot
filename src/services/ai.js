@@ -5,7 +5,8 @@ const mood = require('./mood');
 const { persona, buildPersonalityPrompt } = require('../personality');
 const { webSearch, formatResultsForAI } = require('../tools/web-search');
 const auditLog = require('./audit-log');
-const { todayString, ragEnforcementBlock, MODEL_CUTOFF } = require('../date-awareness');
+const { todayString, nowEST, ragEnforcementBlock, MODEL_CUTOFF, userMessageDateAnchor } = require('../date-awareness');
+const priceFetcher = require('../tools/price-fetcher');
 
 class AIService {
   constructor() {
@@ -146,11 +147,11 @@ class AIService {
   }
 
   buildSystemPrompt(options = {}) {
-    const { liveData, searchResults } = options;
-    const today = todayString();
+    const { liveData, searchResults, livePrices } = options;
+    const now = nowEST();
 
     return `
-You are ${persona.name}, hanging out in a Discord server with people who are into trading, crypto, and markets.
+You are ${persona.name}, running LIVE on a Discord server in ${new Date().getFullYear()}. Current time: ${now}.
 
 ${ragEnforcementBlock()}
 
@@ -163,9 +164,10 @@ You can talk about ANYTHING — stocks, crypto, sports, games, life, memes, what
 Keep it short. Most responses should be 1-3 sentences. Only go longer when someone actually asks for a detailed breakdown. Think Discord messages, not emails.
 
 NEVER say things like "As an AI" or "I don't have personal opinions" — you DO have opinions and you're not afraid to share them. You're ${persona.name}, not a chatbot disclaimer.
-${this.kimiEnabled ? `\nYou have access to web search. When users ask about current events, live data, recent news, sports results, or anything requiring up-to-date information, you MUST use your web search tool to find accurate, current answers BEFORE responding. For any question about prices, events, or data after ${MODEL_CUTOFF}, always search first.\n` : ''}
-${liveData ? `\nLIVE DATA (use these real numbers — this is current as of today ${today}):\n${liveData}\n` : ''}
-${searchResults ? `\nWEB SEARCH RESULTS (real-time information fetched ${today} — use this to answer the user's question):\n${searchResults}\n` : ''}
+${this.kimiEnabled ? `\nYou have access to web search. For ANY question about prices, events, news, or data after ${MODEL_CUTOFF}, you MUST use your web search tool BEFORE reasoning or answering. Always search first for recency-sensitive questions.\n` : ''}
+${livePrices ? `\nLIVE PRICES (real-time via Yahoo Finance, fetched just now):\n${livePrices}\n` : ''}
+${liveData ? `\nLIVE MARKET DATA (current as of ${now}):\n${liveData}\n` : ''}
+${searchResults ? `\nWEB SEARCH RESULTS (fetched ${now} — use as source of truth):\n${searchResults}\n` : ''}
 ${mood.buildMoodContext()}
 `.trim();
   }
@@ -245,12 +247,56 @@ ${mood.buildMoodContext()}
     return q || message.slice(0, 80);
   }
 
+  /**
+   * Extract potential stock/crypto tickers from a message.
+   * Returns uppercase symbols like ['TSLA', 'AAPL', 'BTC'].
+   */
+  _extractTickers(message) {
+    // Match $TICKER format or standalone uppercase 1-5 char words
+    const dollarTickers = (message.match(/\$([A-Za-z]{1,5})\b/g) || [])
+      .map(t => t.slice(1).toUpperCase());
+    const upperWords = (message.match(/\b[A-Z]{1,5}\b/g) || []);
+
+    const stopWords = new Set([
+      'THE', 'FOR', 'AND', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HER', 'WAS',
+      'ONE', 'OUR', 'OUT', 'ARE', 'HAS', 'HIS', 'HOW', 'ITS', 'MAY', 'NEW',
+      'NOW', 'OLD', 'SEE', 'WAY', 'WHO', 'DID', 'GET', 'HIM', 'LET', 'SAY',
+      'SHE', 'TOO', 'USE', 'TOP', 'BEST', 'MOST', 'WHAT', 'WITH', 'THAT',
+      'THIS', 'WILL', 'YOUR', 'FROM', 'THEY', 'BEEN', 'HAVE', 'MANY', 'SOME',
+      'THEM', 'THAN', 'EACH', 'MAKE', 'LIKE', 'INTO', 'OVER', 'SUCH', 'JUST',
+      'ALSO', 'BUY', 'SELL', 'HOLD', 'IPO', 'ETF', 'GDP', 'FED', 'SEC',
+      'LOL', 'OMG', 'WTF', 'IMO', 'TBH', 'NGL', 'IDK', 'LMAO',
+    ]);
+    const filtered = upperWords.filter(w => !stopWords.has(w));
+
+    return [...new Set([...dollarTickers, ...filtered])].slice(0, 5);
+  }
+
   async chat(userId, username, userMessage, options = {}) {
     const { sentiment, imageDescription, liveData } = options;
 
     memory.recordInteraction(userId, username, userMessage);
 
-    // Auto-search for real-time questions (skip when Kimi agent mode handles search natively)
+    // ── Pre-fetch: Auto-fetch prices for any tickers mentioned ──
+    let livePrices = null;
+    if (priceFetcher.isAvailable()) {
+      const tickers = this._extractTickers(userMessage);
+      if (tickers.length > 0) {
+        try {
+          const prices = await priceFetcher.getMultiplePrices(tickers);
+          const formatted = priceFetcher.formatForPrompt(prices);
+          if (formatted && !formatted.includes('unavailable')) {
+            livePrices = formatted;
+            console.log(`[AI] Auto-fetched prices for: ${tickers.join(', ')}`);
+          }
+        } catch (err) {
+          console.error('[AI] Price fetch failed:', err.message);
+        }
+      }
+    }
+
+    // ── Auto-search for real-time questions ──
+    // Skip when Kimi agent mode handles search natively
     let searchResults = null;
     if (!this.kimiEnabled && !liveData && this._needsWebSearch(userMessage)) {
       try {
@@ -266,7 +312,7 @@ ${mood.buildMoodContext()}
       }
     }
 
-    const systemPrompt = this.buildSystemPrompt({ liveData, searchResults });
+    const systemPrompt = this.buildSystemPrompt({ liveData, searchResults, livePrices });
 
     const memoryContext = memory.buildContext(userId);
     let fullSystemPrompt = systemPrompt;
@@ -279,9 +325,11 @@ ${mood.buildMoodContext()}
     }
     const history = this.conversationHistory.get(userId);
 
-    let fullMessage = userMessage;
+    // Prepend date anchor to the user message so the model sees
+    // the current date at the message level, not just system prompt
+    let fullMessage = `${userMessageDateAnchor()} ${userMessage}`;
     if (imageDescription) {
-      fullMessage = `[Image in message: ${imageDescription}]\n${userMessage}`;
+      fullMessage = `${userMessageDateAnchor()} [Image in message: ${imageDescription}]\n${userMessage}`;
     }
 
     history.push({ role: 'user', content: fullMessage });
