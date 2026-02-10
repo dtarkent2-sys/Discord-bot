@@ -253,10 +253,11 @@ class AInvestMCP {
     return result;
   }
 
-  // ── Convenience wrappers (match the REST client interface) ────────────
+  // ── Convenience wrappers (correct tool names from discovery) ──────────
+  // Actual MCP tool names use hyphens: get-marketdata-candles, get-news-headlines, etc.
 
   async mcpGetCandles(ticker, { interval = 'day', count = 20 } = {}) {
-    return this.callTool('get_candles', {
+    return this.callTool('get-marketdata-candles', {
       symbol: ticker.toUpperCase(),
       period_type: interval,
       count,
@@ -266,73 +267,53 @@ class AInvestMCP {
   async mcpGetNews({ tab = 'all', tickers = [], limit = 10 } = {}) {
     const args = { tab, page_size: Math.min(limit, 50) };
     if (tickers.length > 0) args.symbols = tickers.join(',');
-    return this.callTool('get_news_wires', args);
+    return this.callTool('get-news-headlines', args);
   }
 
-  async mcpGetAnalystConsensus(ticker) {
-    return this.callTool('get_analyst_consensus', {
+  async mcpGetAnalystRatings(ticker) {
+    return this.callTool('get-analyst-ratings', {
       symbol: ticker.toUpperCase(),
     });
   }
 
-  async mcpGetFinancials(ticker) {
-    return this.callTool('get_company_financials', {
+  async mcpGetAnalystRatingsHistory(ticker) {
+    return this.callTool('get-analyst-ratings-history', {
       symbol: ticker.toUpperCase(),
     });
-  }
-
-  async mcpGetEarnings(ticker) {
-    return this.callTool('get_stock_earnings', {
-      symbol: ticker.toUpperCase(),
-    });
-  }
-
-  async mcpGetEconomicCalendar(date) {
-    const args = {};
-    if (date) args.date = date;
-    return this.callTool('get_economic_events', args);
   }
 
   async mcpGetInsiderTrades(ticker) {
-    return this.callTool('get_insider_trades', {
+    return this.callTool('get-ownership-insider', {
       symbol: ticker.toUpperCase(),
     });
   }
 
   async mcpGetCongressTrades(ticker) {
-    return this.callTool('get_congress_trades', {
+    return this.callTool('get-ownership-congress', {
       symbol: ticker.toUpperCase(),
-    });
-  }
-
-  async mcpGetETFHoldings(ticker) {
-    return this.callTool('get_etf_holdings', {
-      symbol: ticker.toUpperCase(),
-    });
-  }
-
-  async mcpGetDividends(ticker) {
-    return this.callTool('get_stock_dividends', {
-      symbol: ticker.toUpperCase(),
-    });
-  }
-
-  async mcpGetFinancialStatements(ticker, { type = 'income', period = 'annual' } = {}) {
-    return this.callTool('get_financial_statements', {
-      symbol: ticker.toUpperCase(),
-      statement_type: type,
-      period,
     });
   }
 
   async mcpGetTrades(ticker) {
-    return this.callTool('get_trades', {
+    return this.callTool('get-marketdata-trades', {
       symbol: ticker.toUpperCase(),
     });
   }
 
   async mcpSearchSecurities(query) {
-    return this.callTool('search_securities', { query });
+    return this.callTool('securities-search', { query });
+  }
+
+  async mcpGetEarningsCalendar(date) {
+    const args = {};
+    if (date) args.date = date;
+    return this.callTool('get-calendar-earnings', args);
+  }
+
+  async mcpGetDividendsCalendar(date) {
+    const args = {};
+    if (date) args.date = date;
+    return this.callTool('get-calendar-dividends', args);
   }
 }
 

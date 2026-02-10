@@ -5,12 +5,23 @@
  *   1. MCP (Model Context Protocol) — via https://docsmcp.ainvest.com
  *   2. REST fallback — via https://openapi.ainvest.com/open
  *
- * All 23 endpoints:
- *   Candles, Trades, News Wires, Wire Content, Articles, Article Content,
- *   Analyst Consensus, Analyst History, Financials, Earnings, Financial Statements,
- *   Dividends, Insider Trades, Congress Trades, ETF Profile, ETF Holdings,
- *   Economic Calendar, Earnings Calendar, Dividends Calendar, Splits Calendar,
- *   IPO Calendar, Earnings Backtesting, Securities Search
+ * MCP tool names (discovered at runtime, 11 tools):
+ *   get-marketdata-candles, get-marketdata-trades, get-news-headlines,
+ *   get-analyst-ratings, get-analyst-ratings-history, get-analyst-ratings-firms,
+ *   get-ownership-insider, get-ownership-congress, securities-search,
+ *   get-calendar-dividends, get-calendar-earnings
+ *
+ * REST endpoints (23 total):
+ *   /marketdata/candles, /marketdata/trades,
+ *   /news/v1/wire/page/history, /news/v1/wire/info/:id,
+ *   /news/v1/article/page/history, /news/v1/article/info/:id,
+ *   /analysis-ratings/consensus, /analysis-ratings/history,
+ *   /securities/stock/financials, /securities/stock/financials/earnings,
+ *   /securities/stock/financials/statements, /securities/stock/financials/dividends,
+ *   /securities/search, /securities/etf/profile, /securities/etf/holdings,
+ *   /ownership/insider, /ownership/congress,
+ *   /calendar/economics, /calendar/earnings, /calendar/dividends,
+ *   /calendar/corporateactions, /calendar/ipo, /calendar/earnings/backtesting
  *
  * Auth: Authorization: Bearer <AINVEST_API_KEY>
  * Docs: https://docs.ainvest.com
@@ -105,7 +116,7 @@ class AInvestService {
 
   /**
    * Try MCP first, fall back to REST.
-   * @param {string} mcpToolName — MCP tool name
+   * @param {string} mcpToolName — MCP tool name (hyphenated, e.g. 'get-marketdata-candles')
    * @param {object} mcpArgs — MCP tool arguments
    * @param {string} restPath — REST endpoint path
    * @param {object} restParams — REST query params
@@ -134,26 +145,42 @@ class AInvestService {
    * @param {string} ticker
    * @param {object} [opts]
    * @param {string} [opts.interval='day'] - 'min' | 'day' | 'week' | 'month'
-   * @param {number} [opts.count=20]
+   * @param {number} [opts.step=1] - Aggregation multiplier (e.g. 15 for 15-min candles)
+   * @param {number} [opts.count=20] - How many candles to request (used to compute 'from')
    */
-  async getCandles(ticker, { interval = 'day', count = 20 } = {}) {
-    const symbol = ticker.toUpperCase();
+  async getCandles(ticker, { interval = 'day', step = 1, count = 20 } = {}) {
+    const tkr = ticker.toUpperCase();
+
+    // Compute 'from' timestamp (ms) based on count + interval
+    const now = Date.now();
+    let fromMs;
+    if (interval === 'min') {
+      fromMs = now - count * step * 60 * 1000;
+    } else if (interval === 'week') {
+      fromMs = now - count * 7 * 24 * 60 * 60 * 1000;
+    } else if (interval === 'month') {
+      fromMs = now - count * 30 * 24 * 60 * 60 * 1000;
+    } else {
+      // 'day' default — add extra days for weekends/holidays
+      fromMs = now - count * 1.5 * 24 * 60 * 60 * 1000;
+    }
+
     const data = await this._mcpOrRest(
-      'get_candles',
-      { symbol, period_type: interval, count },
+      'get-marketdata-candles',
+      { symbol: tkr, period_type: interval, count },
       '/marketdata/candles',
-      { symbol, period_type: interval, count },
+      { ticker: tkr, interval, step, from: Math.floor(fromMs) },
     );
 
     if (!Array.isArray(data)) return [];
     return data.map(c => ({
-      open: c.open,
-      high: c.high,
-      low: c.low,
-      close: c.close,
-      volume: c.volume,
-      dollarVolume: c.dollar_volume || null,
-      timestamp: c.timestamp,
+      open: c.open ?? c.o,
+      high: c.high ?? c.h,
+      low: c.low ?? c.l,
+      close: c.close ?? c.c,
+      volume: c.volume ?? c.v,
+      dollarVolume: c.dollar_volume ?? c.a ?? null,
+      timestamp: c.timestamp ?? c.t,
     }));
   }
 
@@ -192,11 +219,12 @@ class AInvestService {
   /**
    * Fetch current-day tick trades for a ticker.
    */
-  async getTrades(ticker) {
-    const symbol = ticker.toUpperCase();
+  async getTrades(ticker, count = 50) {
+    const tkr = ticker.toUpperCase();
+    const now = Date.now();
     const data = await this._mcpOrRest(
-      'get_trades', { symbol },
-      '/marketdata/trades', { symbol },
+      'get-marketdata-trades', { symbol: tkr },
+      '/marketdata/trades', { ticker: tkr, count, to: now },
     );
     return Array.isArray(data) ? data : (data?.list || []);
   }
@@ -213,16 +241,18 @@ class AInvestService {
    * @param {number} [opts.limit=10]
    */
   async getNews({ tab = 'all', tickers = [], limit = 10 } = {}) {
-    const params = { tab, page_size: Math.min(Math.max(limit, 1), 50) };
-    const mcpArgs = { ...params };
+    const size = Math.min(Math.max(limit, 1), 50);
+    const restParams = { tab, size };
+    const mcpArgs = { tab, page_size: size };
+
     if (tickers.length > 0) {
-      params.symbols = tickers.join(',');
+      restParams.tickers = tickers.join(',');
       mcpArgs.symbols = tickers.join(',');
     }
 
     const data = await this._mcpOrRest(
-      'get_news_wires', mcpArgs,
-      '/news/v1/wire/page/history', params,
+      'get-news-headlines', mcpArgs,
+      '/news/v1/wire/page/history', restParams,
     );
 
     const articles = Array.isArray(data) ? data : (data?.list || []);
@@ -231,33 +261,26 @@ class AInvestService {
       summary: (a.summary || a.description || '').slice(0, 500),
       url: a.url || a.source_url || '',
       source: a.source || a.publisher || 'AInvest',
-      timestamp: a.published_at || a.created_at || a.timestamp || '',
-      tickers: a.symbols || a.tickers || [],
+      timestamp: a.published_at || a.publish_time || a.created_at || a.timestamp || '',
+      tickers: a.tag_list ? a.tag_list.map(t => t.code || t.ticker).filter(Boolean) : (a.symbols || a.tickers || []),
       contentId: a.content_id || a.id || null,
     }));
   }
 
   /**
-   * Fetch full wire content by content ID.
+   * Fetch full wire content by content ID. (REST only — no MCP tool)
    */
   async getWireContent(contentId) {
-    return this._mcpOrRest(
-      'get_wire_content', { content_id: contentId },
-      `/news/v1/wire/info/${contentId}`, {},
-    );
+    return this._fetch(`/news/v1/wire/info/${contentId}`, {});
   }
 
   /**
-   * Fetch articles (longer-form analysis pieces).
+   * Fetch articles (longer-form analysis pieces). (REST only — no MCP tool)
    */
-  async getArticles({ tickers = [], limit = 10 } = {}) {
-    const params = { page_size: Math.min(limit, 50) };
-    if (tickers.length > 0) params.symbols = tickers.join(',');
+  async getArticles({ limit = 10 } = {}) {
+    const params = { size: Math.min(limit, 50) };
 
-    const data = await this._mcpOrRest(
-      'get_articles', params,
-      '/news/v1/article/page/history', params,
-    );
+    const data = await this._fetch('/news/v1/article/page/history', params);
 
     const articles = Array.isArray(data) ? data : (data?.list || []);
     return articles.slice(0, limit).map(a => ({
@@ -265,7 +288,7 @@ class AInvestService {
       summary: (a.summary || a.description || '').slice(0, 500),
       url: a.url || '',
       source: a.source || 'AInvest',
-      timestamp: a.published_at || a.created_at || '',
+      timestamp: a.published_at || a.publish_time || a.created_at || '',
       contentId: a.content_id || a.id || null,
     }));
   }
@@ -278,24 +301,30 @@ class AInvestService {
    * Get analyst consensus (buy/hold/sell + price targets).
    */
   async getAnalystConsensus(ticker) {
-    const symbol = ticker.toUpperCase();
+    const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
-      'get_analyst_consensus', { symbol },
-      '/analysis-ratings/consensus', { symbol },
+      'get-analyst-ratings', { symbol: tkr },
+      '/analysis-ratings/consensus', { ticker: tkr },
     );
 
     if (!data) return null;
+
+    // REST response is nested: { analysts_ratings: {...}, target_price: {...} }
+    // MCP may return flat or nested — handle both
+    const ratings = data.analysts_ratings || data;
+    const targets = data.target_price || data;
+
     return {
-      buy: data.buy || 0,
-      hold: data.hold || 0,
-      sell: data.sell || 0,
-      strongBuy: data.strong_buy || 0,
-      strongSell: data.strong_sell || 0,
-      avgRating: data.average_rating || data.avg_rating || null,
-      targetHigh: data.target_price_high || data.price_target_high || null,
-      targetLow: data.target_price_low || data.price_target_low || null,
-      targetAvg: data.target_price_avg || data.price_target_avg || data.average_target_price || null,
-      totalAnalysts: (data.buy || 0) + (data.hold || 0) + (data.sell || 0) + (data.strong_buy || 0) + (data.strong_sell || 0),
+      buy: ratings.buy || 0,
+      hold: ratings.hold || 0,
+      sell: ratings.sell || 0,
+      strongBuy: ratings.strong_buy || 0,
+      strongSell: ratings.strong_sell || 0,
+      avgRating: ratings.average_rating || ratings.avg_rating || null,
+      targetHigh: targets.high || targets.target_price_high || null,
+      targetLow: targets.low || targets.target_price_low || null,
+      targetAvg: targets.average || targets.target_price_avg || targets.average_target_price || null,
+      totalAnalysts: (ratings.buy || 0) + (ratings.hold || 0) + (ratings.sell || 0) + (ratings.strong_buy || 0) + (ratings.strong_sell || 0),
     };
   }
 
@@ -303,10 +332,10 @@ class AInvestService {
    * Get full analyst ratings history (individual firm ratings).
    */
   async getAnalystHistory(ticker, limit = 10) {
-    const symbol = ticker.toUpperCase();
+    const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
-      'get_analyst_ratings', { symbol },
-      '/analysis-ratings/history', { symbol },
+      'get-analyst-ratings-history', { symbol: tkr },
+      '/analysis-ratings/history', { ticker: tkr },
     );
 
     const list = Array.isArray(data) ? data : (data?.list || []);
@@ -316,8 +345,8 @@ class AInvestService {
       action: r.action || r.rating_action || '',
       rating: r.rating || r.current_rating || '',
       targetPrice: r.target_price ?? r.price_target ?? null,
-      previousRating: r.previous_rating || null,
-      previousTarget: r.previous_target_price ?? null,
+      previousRating: r.previous_rating || r.rating_previous || null,
+      previousTarget: r.previous_target_price ?? r.target_price_previous ?? null,
     }));
   }
 
@@ -326,14 +355,11 @@ class AInvestService {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Get fundamental financial data (P/E, EPS, margins, etc.).
+   * Get fundamental financial data (P/E, EPS, margins, etc.). (REST only)
    */
   async getFinancials(ticker) {
-    const symbol = ticker.toUpperCase();
-    const data = await this._mcpOrRest(
-      'get_company_financials', { symbol },
-      '/securities/stock/financials', { symbol },
-    );
+    const tkr = ticker.toUpperCase();
+    const data = await this._fetch('/securities/stock/financials', { ticker: tkr });
 
     if (!data) return null;
     return {
@@ -341,60 +367,62 @@ class AInvestService {
       peTTM: data.pe_ttm ?? null,
       pb: data.pb ?? null,
       roeTTM: data.roe_ttm ?? null,
-      grossMargin: data.gross_margin ?? null,
+      grossMargin: data.gross_profit_ratio_ttm ?? data.gross_margin ?? null,
       operatingMargin: data.operating_margin ?? null,
-      netMargin: data.net_margin ?? null,
-      debtRatio: data.debt_ratio ?? null,
-      dividendYield: data.dividend_yield ?? null,
+      netMargin: data.net_profit_ratio_ttm ?? data.net_margin ?? null,
+      debtRatio: data.assets_debt_ratio ?? data.debt_ratio ?? null,
+      dividendYield: data.dividend_yield_ratio_ttm ?? data.dividend_yield ?? null,
       marketCap: data.market_cap ?? null,
       revenueGrowth: data.revenue_growth ?? null,
-      earningsGrowth: data.earnings_growth ?? null,
+      earningsGrowth: data.earnings_growth ?? data.net_profit_yoy ?? null,
     };
   }
 
   /**
-   * Get earnings history (actual vs forecast).
+   * Get earnings history (actual vs forecast). (REST only)
    */
   async getEarnings(ticker, limit = 4) {
-    const symbol = ticker.toUpperCase();
-    const data = await this._mcpOrRest(
-      'get_stock_earnings', { symbol },
-      '/securities/stock/financials/earnings', { symbol },
+    const tkr = ticker.toUpperCase();
+    const data = await this._fetch(
+      '/securities/stock/financials/earnings',
+      { ticker: tkr, size: limit },
     );
 
     if (!data) return [];
     const list = Array.isArray(data) ? data : (data.list || data.earnings || []);
     return list.slice(0, limit).map(e => ({
-      date: e.report_date || e.date || '',
+      date: e.release_date || e.report_date || e.date || '',
+      periodName: e.period_name || null,
       epsActual: e.eps_actual ?? e.actual_eps ?? null,
       epsForecast: e.eps_forecast ?? e.estimated_eps ?? null,
       epsSurprise: e.eps_surprise ?? e.surprise_percent ?? null,
       revenueActual: e.revenue_actual ?? null,
       revenueForecast: e.revenue_forecast ?? null,
-      summary: e.summary || null,
+      revenueSurprise: e.revenue_surprise ?? null,
+      summary: e.earnings_call_summary || e.summary || null,
     }));
   }
 
   /**
-   * Get financial statements (income, balance sheet, cash flow).
+   * Get financial statements (income, balance sheet, cash flow). (REST only)
+   * @param {string} ticker
+   * @param {object} [opts]
+   * @param {number} [opts.period=4] - 0=each, 1=Q1, 2=mid-year, 3=Q3, 4=annual
    */
-  async getFinancialStatements(ticker, { type = 'income', period = 'annual' } = {}) {
-    const symbol = ticker.toUpperCase();
-    return this._mcpOrRest(
-      'get_financial_statements', { symbol, statement_type: type, period },
-      '/securities/stock/financials/statements', { symbol, statement_type: type, period },
+  async getFinancialStatements(ticker, { period = 4 } = {}) {
+    const tkr = ticker.toUpperCase();
+    return this._fetch(
+      '/securities/stock/financials/statements',
+      { ticker: tkr, period },
     );
   }
 
   /**
-   * Get stock dividend history.
+   * Get stock dividend history. (REST only)
    */
   async getStockDividends(ticker) {
-    const symbol = ticker.toUpperCase();
-    return this._mcpOrRest(
-      'get_stock_dividends', { symbol },
-      '/securities/stock/financials/dividends', { symbol },
-    );
+    const tkr = ticker.toUpperCase();
+    return this._fetch('/securities/stock/financials/dividends', { ticker: tkr });
   }
 
   /**
@@ -402,7 +430,7 @@ class AInvestService {
    */
   async searchSecurities(query) {
     return this._mcpOrRest(
-      'search_securities', { query },
+      'securities-search', { query },
       '/securities/search', { query },
     );
   }
@@ -410,25 +438,19 @@ class AInvestService {
   // ── ETF Data ──────────────────────────────────────────────────────────
 
   /**
-   * Get ETF profile (expense ratio, AUM, etc.).
+   * Get ETF profile (expense ratio, AUM, etc.). (REST only)
    */
   async getETFProfile(ticker) {
-    const symbol = ticker.toUpperCase();
-    return this._mcpOrRest(
-      'get_etf_profile', { symbol },
-      '/securities/etf/profile', { symbol },
-    );
+    const tkr = ticker.toUpperCase();
+    return this._fetch('/securities/etf/profile', { ticker: tkr });
   }
 
   /**
-   * Get top ETF holdings.
+   * Get top ETF holdings. (REST only)
    */
   async getETFHoldings(ticker) {
-    const symbol = ticker.toUpperCase();
-    return this._mcpOrRest(
-      'get_etf_holdings', { symbol },
-      '/securities/etf/holdings', { symbol },
-    );
+    const tkr = ticker.toUpperCase();
+    return this._fetch('/securities/etf/holdings', { ticker: tkr });
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -439,10 +461,10 @@ class AInvestService {
    * Get insider trades for a ticker.
    */
   async getInsiderTrades(ticker) {
-    const symbol = ticker.toUpperCase();
+    const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
-      'get_insider_trades', { symbol },
-      '/ownership/insider', { symbol },
+      'get-ownership-insider', { symbol: tkr },
+      '/ownership/insider', { ticker: tkr },
     );
     return Array.isArray(data) ? data : (data?.list || []);
   }
@@ -451,10 +473,10 @@ class AInvestService {
    * Get US Congress member trades.
    */
   async getCongressTrades(ticker) {
-    const symbol = ticker.toUpperCase();
+    const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
-      'get_congress_trades', { symbol },
-      '/ownership/congress', { symbol },
+      'get-ownership-congress', { symbol: tkr },
+      '/ownership/congress', { ticker: tkr },
     );
     return Array.isArray(data) ? data : (data?.list || []);
   }
@@ -464,24 +486,22 @@ class AInvestService {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Get economic calendar events.
+   * Get economic calendar events. (REST only — no MCP tool)
    */
   async getEconomicCalendar({ date, importance } = {}) {
     const params = {};
-    if (date) params.date = date;
+    // Default to today's date (required by API)
+    params.date = date || new Date().toISOString().split('T')[0];
     if (importance) params.importance = importance;
 
-    const data = await this._mcpOrRest(
-      'get_economic_events', params,
-      '/calendar/economics', params,
-    );
+    const data = await this._fetch('/calendar/economics', params);
 
     if (!data) return [];
     const list = Array.isArray(data) ? data : (data.list || data.events || []);
     return list.map(e => ({
-      event: e.event || e.title || e.name || '',
+      event: e.index || e.event || e.title || e.name || '',
       date: e.date || e.time || '',
-      importance: e.importance || e.level || 'medium',
+      importance: e.importance ?? 'medium',
       actual: e.actual ?? null,
       forecast: e.forecast ?? e.consensus ?? null,
       previous: e.previous ?? null,
@@ -493,12 +513,12 @@ class AInvestService {
    * Get earnings calendar for a date.
    */
   async getEarningsCalendar(date) {
-    const params = {};
-    if (date) params.date = date;
+    // Default to today's date (required by API)
+    const d = date || new Date().toISOString().split('T')[0];
 
     return this._mcpOrRest(
-      'get_earnings_calendar', params,
-      '/calendar/earnings', params,
+      'get-calendar-earnings', { date: d },
+      '/calendar/earnings', { date: d },
     );
   }
 
@@ -506,50 +526,36 @@ class AInvestService {
    * Get dividends calendar.
    */
   async getDividendsCalendar(date) {
-    const params = {};
-    if (date) params.date = date;
+    const d = date || new Date().toISOString().split('T')[0];
 
     return this._mcpOrRest(
-      'get_dividends_calendar', params,
-      '/calendar/dividends', params,
+      'get-calendar-dividends', { date: d },
+      '/calendar/dividends', { date: d },
     );
   }
 
   /**
-   * Get stock splits calendar.
+   * Get stock splits calendar. (REST only)
    */
   async getSplitsCalendar(date) {
-    const params = {};
-    if (date) params.date = date;
-
-    return this._mcpOrRest(
-      'get_splits_calendar', params,
-      '/calendar/corporateactions', params,
-    );
+    const d = date || new Date().toISOString().split('T')[0];
+    return this._fetch('/calendar/corporateactions', { date: d });
   }
 
   /**
-   * Get IPO calendar.
+   * Get IPO calendar. (REST only)
    */
   async getIPOCalendar(date) {
-    const params = {};
-    if (date) params.date = date;
-
-    return this._mcpOrRest(
-      'get_ipo_calendar', params,
-      '/calendar/ipo', params,
-    );
+    const d = date || new Date().toISOString().split('T')[0];
+    return this._fetch('/calendar/ipo', { date: d });
   }
 
   /**
-   * Get earnings backtesting data.
+   * Get earnings backtesting data. (REST only)
+   * @param {string} uniqueId — from earnings calendar `unique_id` field
    */
-  async getEarningsBacktesting(ticker) {
-    const symbol = ticker.toUpperCase();
-    return this._mcpOrRest(
-      'get_earnings_backtesting', { symbol },
-      '/calendar/earnings/backtesting', { symbol },
-    );
+  async getEarningsBacktesting(uniqueId) {
+    return this._fetch('/calendar/earnings/backtesting', { unique_id: uniqueId });
   }
 
   // ═══════════════════════════════════════════════════════════════════════
