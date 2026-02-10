@@ -7,8 +7,73 @@ const auditLog = require('../services/audit-log');
 const circuitBreaker = require('../services/circuit-breaker');
 const mood = require('../services/mood');
 
+// Discord client ref — set after client is ready via setDiscordClient()
+let discordClient = null;
+
+// SPY alerts module — loaded defensively
+let spyAlerts = null;
+try {
+  spyAlerts = require('../services/spy-alerts');
+} catch {
+  spyAlerts = null;
+}
+
+function setDiscordClient(client) {
+  discordClient = client;
+  console.log('[Dashboard] Discord client registered for webhook handling');
+}
+
 function startDashboard() {
   const app = express();
+
+  // Parse JSON bodies (for TradingView webhook POSTs)
+  app.use(express.json({ limit: '1mb' }));
+  // Also accept plain text (some TradingView configs send text/plain)
+  app.use(express.text({ type: 'text/plain', limit: '1mb' }));
+
+  // ── TradingView Webhook Endpoint ──────────────────────────────────────
+  // URL to set in TradingView: https://your-app.up.railway.app/webhook/tradingview
+  // Optional: add ?secret=YOUR_SECRET for authentication
+  app.post('/webhook/tradingview', async (req, res) => {
+    // Authenticate if WEBHOOK_SECRET is set
+    if (config.webhookSecret) {
+      const secret = req.query.secret || req.headers['x-webhook-secret'] || req.body?.secret;
+      if (secret !== config.webhookSecret) {
+        console.warn('[Webhook] Unauthorized request (bad secret)');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    // Need Discord client and SPY channel
+    if (!discordClient) {
+      console.warn('[Webhook] Discord client not ready yet');
+      return res.status(503).json({ error: 'Bot not ready' });
+    }
+
+    if (!config.spyChannelId) {
+      console.warn('[Webhook] SPY_CHANNEL_ID not configured');
+      return res.status(500).json({ error: 'SPY_CHANNEL_ID not set' });
+    }
+
+    const channel = discordClient.channels.cache.get(config.spyChannelId);
+    if (!channel) {
+      console.warn(`[Webhook] Channel ${config.spyChannelId} not found in cache`);
+      return res.status(500).json({ error: 'Channel not found' });
+    }
+
+    // Log the raw payload for debugging
+    const body = req.body;
+    console.log(`[Webhook] TradingView alert received:`, typeof body === 'string' ? body.slice(0, 200) : JSON.stringify(body).slice(0, 200));
+
+    if (!spyAlerts) {
+      console.warn('[Webhook] spy-alerts module not loaded');
+      return res.status(500).json({ error: 'Alert handler not loaded' });
+    }
+
+    // Respond immediately (TradingView times out after ~3s)
+    const result = await spyAlerts.handleHttpAlert(channel, body);
+    res.status(result.ok ? 200 : 429).json(result);
+  });
 
   // Health check endpoint (for Railway / monitoring)
   app.get('/health', (req, res) => {
@@ -179,4 +244,4 @@ function startDashboard() {
   return app;
 }
 
-module.exports = { startDashboard };
+module.exports = { startDashboard, setDiscordClient };
