@@ -21,6 +21,14 @@ const alpaca = require('./alpaca');
 const { getMarketContext } = require('../data/market');
 const { todayString, ragEnforcementBlock, MODEL_CUTOFF } = require('../date-awareness');
 
+// AInvest — news, analyst ratings, fundamentals (optional enrichment)
+let ainvest;
+try {
+  ainvest = require('./ainvest');
+} catch {
+  ainvest = null;
+}
+
 const KIMI_TOOLS = [
   { type: 'builtin_function', function: { name: '$web_search' } },
 ];
@@ -142,6 +150,53 @@ class AgentSwarm {
 
       if (overviewParts.length > 0) {
         parts.push(`LIVE MARKET OVERVIEW (real-time — use these numbers):\n${overviewParts.join('\n\n')}`);
+      }
+    }
+
+    // AInvest enrichment — news, analyst ratings, fundamentals for detected tickers
+    if (ainvest && ainvest.enabled && tickers.length > 0) {
+      const ainvestParts = [];
+      const ainvestFetches = tickers.slice(0, 3).map(async (ticker) => {
+        try {
+          const [news, analysts, financials] = await Promise.allSettled([
+            ainvest.getNews({ tickers: [ticker], limit: 5 }),
+            ainvest.getAnalystConsensus(ticker),
+            ainvest.getFinancials(ticker),
+          ]);
+
+          const lines = [`AINVEST DATA FOR ${ticker}:`];
+
+          if (analysts.status === 'fulfilled' && analysts.value) {
+            const a = analysts.value;
+            lines.push(`  Analyst Consensus (${a.totalAnalysts} analysts): Buy ${a.strongBuy + a.buy} | Hold ${a.hold} | Sell ${a.sell + a.strongSell}`);
+            if (a.targetAvg != null) lines.push(`  Price Target: $${a.targetLow}–$${a.targetHigh} (avg $${a.targetAvg})`);
+          }
+
+          if (financials.status === 'fulfilled' && financials.value) {
+            const f = financials.value;
+            const fParts = [];
+            if (f.peTTM != null) fParts.push(`P/E: ${f.peTTM.toFixed(1)}`);
+            if (f.epsTTM != null) fParts.push(`EPS: $${f.epsTTM.toFixed(2)}`);
+            if (f.roeTTM != null) fParts.push(`ROE: ${(f.roeTTM * 100).toFixed(1)}%`);
+            if (f.marketCap != null) fParts.push(`Mkt Cap: $${(f.marketCap / 1e9).toFixed(1)}B`);
+            if (fParts.length > 0) lines.push(`  Fundamentals: ${fParts.join(' | ')}`);
+          }
+
+          if (news.status === 'fulfilled' && news.value && news.value.length > 0) {
+            lines.push(`  Recent News:`);
+            for (const n of news.value.slice(0, 3)) {
+              lines.push(`    • ${n.title} (${n.source || 'AInvest'})`);
+            }
+          }
+
+          if (lines.length > 1) ainvestParts.push(lines.join('\n'));
+        } catch (err) {
+          console.warn(`[AgentSwarm] AInvest data for ${ticker} failed:`, err.message);
+        }
+      });
+      await Promise.allSettled(ainvestFetches);
+      if (ainvestParts.length > 0) {
+        parts.push(`AINVEST FUNDAMENTALS & NEWS (real-time):\n${ainvestParts.join('\n\n')}`);
       }
     }
 
