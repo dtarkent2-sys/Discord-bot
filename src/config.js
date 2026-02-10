@@ -62,4 +62,9 @@ module.exports = {
   // AInvest API (news, candles, fundamentals, analyst ratings, earnings)
   ainvestApiKey: process.env.AINVEST_API_KEY || '',
   ainvestBaseUrl: process.env.AINVEST_BASE_URL || 'https://openapi.ainvest.com/open',
+
+  // Validea (guru analysis — paid subscription)
+  valideaEmail: process.env.VALIDEA_EMAIL || '',
+  valideaPassword: process.env.VALIDEA_PASSWORD || '',
+  valideaCookie: process.env.VALIDEA_COOKIE || '', // Manual override: paste session cookie if auto-login blocked
 };

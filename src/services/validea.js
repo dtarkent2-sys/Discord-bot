@@ -1,9 +1,14 @@
 /**
- * Validea Guru Analysis Scraper
+ * Validea Guru Analysis — Authenticated Scraper
  *
- * Scrapes guru strategy scores from Validea's public stock analysis pages.
+ * Scrapes guru strategy scores from Validea's subscriber pages.
  * Each stock is rated 0-100% across ~22 guru strategies based on fundamental
  * criteria from investors like Warren Buffett, Peter Lynch, Benjamin Graham, etc.
+ *
+ * Authentication (in priority order):
+ *   1. VALIDEA_COOKIE env var — paste session cookie from browser (most reliable)
+ *   2. VALIDEA_EMAIL + VALIDEA_PASSWORD — auto-login via POST
+ *   3. Unauthenticated fallback — public page (limited data)
  *
  * Scores:
  *   - 90%+ = Strong Interest
@@ -11,61 +16,245 @@
  *   - Below 80% = Fail / Neutral
  *
  * Data is cached for 12 hours (Validea updates nightly).
- * Falls back gracefully when scraping is blocked.
  */
 
-const VALIDEA_BASE = 'https://www.validea.com/guru-analysis';
+const config = require('../config');
+
+const VALIDEA_HOST = 'https://www.validea.com';
+const VALIDEA_BASE = `${VALIDEA_HOST}/guru-analysis`;
 
 // Known guru strategies and their common identifiers in Validea's HTML
 const GURU_STRATEGIES = [
-  { id: 'twin_momentum', guru: 'Dashan Huang', name: 'Twin Momentum Investor' },
-  { id: 'patient_investor', guru: 'Warren Buffett', name: 'Patient Investor' },
-  { id: 'pe_growth', guru: 'Peter Lynch', name: 'P/E/Growth Investor' },
-  { id: 'price_sales', guru: 'Kenneth Fisher', name: 'Price/Sales Investor' },
-  { id: 'low_pe', guru: 'John Neff', name: 'Low P/E Investor' },
-  { id: 'growth_value', guru: "James O'Shaughnessy", name: 'Growth/Value Investor' },
-  { id: 'value_composite', guru: "James O'Shaughnessy", name: 'Value Composite Investor' },
-  { id: 'book_market', guru: 'Joseph Piotroski', name: 'Book/Market Investor' },
-  { id: 'contrarian', guru: 'David Dreman', name: 'Contrarian Investor' },
-  { id: 'earnings_yield', guru: 'Joel Greenblatt', name: 'Earnings Yield Investor' },
-  { id: 'pb_growth', guru: 'Partha Mohanram', name: 'P/B Growth Investor' },
-  { id: 'multi_factor', guru: 'Pim van Vliet', name: 'Multi-Factor Investor' },
-  { id: 'millennial', guru: "Patrick O'Shaughnessy", name: 'Millennial Investor' },
-  { id: 'earnings_revision', guru: 'Wayne Thorp', name: 'Earnings Revision Investor' },
-  { id: 'quantitative_momentum', guru: 'Wesley Gray', name: 'Quantitative Momentum Investor' },
-  { id: 'shareholder_yield', guru: 'Meb Faber', name: 'Shareholder Yield Investor' },
-  { id: 'acquirers_multiple', guru: 'Tobias Carlisle', name: "Acquirer's Multiple Investor" },
-  { id: 'momentum', guru: 'Validea', name: 'Momentum Investor' },
-  { id: 'graham_defensive', guru: 'Benjamin Graham', name: 'Defensive Investor' },
-  { id: 'graham_enterprising', guru: 'Benjamin Graham', name: 'Enterprising Investor' },
-  { id: 'small_cap_growth', guru: 'Motley Fool', name: 'Small-Cap Growth Investor' },
-  { id: 'top_gurus', guru: 'Validea', name: 'Top Guru Composite' },
+  { id: 'twin_momentum', guru: 'Dashan Huang', name: 'Twin Momentum Investor', keywords: ['twin momentum'] },
+  { id: 'patient_investor', guru: 'Warren Buffett', name: 'Patient Investor', keywords: ['patient investor', 'buffett'] },
+  { id: 'pe_growth', guru: 'Peter Lynch', name: 'P/E/Growth Investor', keywords: ['p/e/growth', 'peter lynch', 'lynch'] },
+  { id: 'price_sales', guru: 'Kenneth Fisher', name: 'Price/Sales Investor', keywords: ['price/sales', 'kenneth fisher', 'fisher'] },
+  { id: 'low_pe', guru: 'John Neff', name: 'Low P/E Investor', keywords: ['low p/e', 'john neff', 'neff'] },
+  { id: 'growth_value', guru: "James O'Shaughnessy", name: 'Growth/Value Investor', keywords: ['growth/value', "o'shaughnessy"] },
+  { id: 'value_composite', guru: "James O'Shaughnessy", name: 'Value Composite Investor', keywords: ['value composite'] },
+  { id: 'book_market', guru: 'Joseph Piotroski', name: 'Book/Market Investor', keywords: ['book/market', 'piotroski'] },
+  { id: 'contrarian', guru: 'David Dreman', name: 'Contrarian Investor', keywords: ['contrarian', 'dreman'] },
+  { id: 'earnings_yield', guru: 'Joel Greenblatt', name: 'Earnings Yield Investor', keywords: ['earnings yield', 'greenblatt', 'magic formula'] },
+  { id: 'pb_growth', guru: 'Partha Mohanram', name: 'P/B Growth Investor', keywords: ['p/b growth', 'mohanram'] },
+  { id: 'multi_factor', guru: 'Pim van Vliet', name: 'Multi-Factor Investor', keywords: ['multi-factor', 'van vliet'] },
+  { id: 'millennial', guru: "Patrick O'Shaughnessy", name: 'Millennial Investor', keywords: ['millennial'] },
+  { id: 'earnings_revision', guru: 'Wayne Thorp', name: 'Earnings Revision Investor', keywords: ['earnings revision', 'thorp'] },
+  { id: 'quantitative_momentum', guru: 'Wesley Gray', name: 'Quantitative Momentum Investor', keywords: ['quantitative momentum', 'wesley gray'] },
+  { id: 'shareholder_yield', guru: 'Meb Faber', name: 'Shareholder Yield Investor', keywords: ['shareholder yield', 'faber'] },
+  { id: 'acquirers_multiple', guru: 'Tobias Carlisle', name: "Acquirer's Multiple Investor", keywords: ["acquirer", 'carlisle'] },
+  { id: 'momentum', guru: 'Validea', name: 'Momentum Investor', keywords: ['momentum investor'] },
+  { id: 'graham_defensive', guru: 'Benjamin Graham', name: 'Defensive Investor', keywords: ['defensive investor', 'graham'] },
+  { id: 'graham_enterprising', guru: 'Benjamin Graham', name: 'Enterprising Investor', keywords: ['enterprising investor'] },
+  { id: 'small_cap_growth', guru: 'Motley Fool', name: 'Small-Cap Growth Investor', keywords: ['small-cap growth', 'motley fool'] },
+  { id: 'top_gurus', guru: 'Validea', name: 'Top Guru Composite', keywords: ['guru composite', 'top guru'] },
 ];
 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.5',
-  'Accept-Encoding': 'gzip, deflate, br',
   'Connection': 'keep-alive',
   'Upgrade-Insecure-Requests': '1',
   'Sec-Fetch-Dest': 'document',
   'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-Site': 'same-origin',
   'Sec-Fetch-User': '?1',
-  'Cache-Control': 'max-age=0',
 };
 
 class ValideaService {
   constructor() {
-    this._cache = new Map(); // symbol → { data, expiry }
+    this._cache = new Map(); // symbol -> { data, expiry }
     this._cacheMs = 12 * 60 * 60 * 1000; // 12 hours (scores update nightly)
+    this._sessionCookies = null;     // Cookie string from login
+    this._sessionExpiry = 0;         // When to re-login
+    this._loginAttempted = false;    // Avoid repeated failed logins
   }
+
+  get enabled() {
+    return !!(config.valideaCookie || config.valideaEmail);
+  }
+
+  // ── Authentication ──────────────────────────────────────────────────
+
+  /**
+   * Get valid session cookies for authenticated requests.
+   * Priority: manual cookie env var > auto-login > unauthenticated
+   */
+  async _getSessionCookies() {
+    // Priority 1: Manual cookie override (most reliable — bypasses Cloudflare)
+    if (config.valideaCookie) {
+      return config.valideaCookie;
+    }
+
+    // Priority 2: Cached session from previous login
+    if (this._sessionCookies && Date.now() < this._sessionExpiry) {
+      return this._sessionCookies;
+    }
+
+    // Priority 3: Auto-login with email/password
+    if (config.valideaEmail && config.valideaPassword && !this._loginAttempted) {
+      const cookies = await this._login();
+      if (cookies) return cookies;
+    }
+
+    // No auth available
+    return null;
+  }
+
+  /**
+   * Attempt to log into Validea and capture session cookies.
+   * Tries common login endpoint patterns.
+   */
+  async _login() {
+    this._loginAttempted = true;
+    console.log('[Validea] Attempting auto-login...');
+
+    const loginEndpoints = [
+      { url: `${VALIDEA_HOST}/login`, contentType: 'application/x-www-form-urlencoded' },
+      { url: `${VALIDEA_HOST}/api/auth/login`, contentType: 'application/json' },
+      { url: `${VALIDEA_HOST}/users/sign_in`, contentType: 'application/x-www-form-urlencoded' },
+      { url: `${VALIDEA_HOST}/account/login`, contentType: 'application/x-www-form-urlencoded' },
+    ];
+
+    for (const endpoint of loginEndpoints) {
+      try {
+        let body;
+        const headers = { ...BROWSER_HEADERS };
+
+        if (endpoint.contentType === 'application/json') {
+          headers['Content-Type'] = 'application/json';
+          headers['Accept'] = 'application/json';
+          body = JSON.stringify({
+            email: config.valideaEmail,
+            password: config.valideaPassword,
+            username: config.valideaEmail,
+          });
+        } else {
+          headers['Content-Type'] = 'application/x-www-form-urlencoded';
+          body = new URLSearchParams({
+            email: config.valideaEmail,
+            password: config.valideaPassword,
+            username: config.valideaEmail,
+            'user[email]': config.valideaEmail,
+            'user[password]': config.valideaPassword,
+          }).toString();
+        }
+
+        const res = await fetch(endpoint.url, {
+          method: 'POST',
+          headers,
+          body,
+          redirect: 'manual', // Don't follow redirects — we want the Set-Cookie headers
+          signal: AbortSignal.timeout(15000),
+        });
+
+        // Capture cookies from Set-Cookie headers
+        const setCookies = res.headers.getSetCookie ? res.headers.getSetCookie() : [];
+        const cookieHeader = res.headers.get('set-cookie') || '';
+
+        // Parse all cookies into a single Cookie header string
+        const cookies = this._parseCookies(setCookies.length > 0 ? setCookies : [cookieHeader]);
+
+        if (cookies && (res.status === 200 || res.status === 302 || res.status === 303)) {
+          // Check if we got session-like cookies (not just tracking cookies)
+          const hasSession = cookies.includes('session') || cookies.includes('auth') ||
+                           cookies.includes('token') || cookies.includes('_validea') ||
+                           cookies.includes('remember') || cookies.includes('user');
+
+          if (hasSession || setCookies.length > 1) {
+            console.log(`[Validea] Login via ${endpoint.url} — got ${setCookies.length} cookies (status ${res.status})`);
+            this._sessionCookies = cookies;
+            this._sessionExpiry = Date.now() + 4 * 60 * 60 * 1000; // 4 hour session
+            this._loginAttempted = false; // Allow re-login after expiry
+            return cookies;
+          }
+        }
+
+        // Log non-success for debugging
+        if (res.status !== 404 && res.status !== 405) {
+          console.log(`[Validea] Login attempt ${endpoint.url} — status ${res.status}, cookies: ${setCookies.length}`);
+        }
+      } catch (err) {
+        // 503 = Cloudflare, expected from datacenter IPs
+        if (!err.message.includes('503')) {
+          console.warn(`[Validea] Login attempt ${endpoint.url} failed: ${err.message}`);
+        }
+      }
+    }
+
+    console.warn('[Validea] Auto-login failed — set VALIDEA_COOKIE env var with session cookie from your browser');
+    console.warn('[Validea] To get cookie: log into validea.com in browser > DevTools > Application > Cookies > copy all cookie values');
+    return null;
+  }
+
+  /**
+   * Parse Set-Cookie headers into a Cookie header string.
+   */
+  _parseCookies(setCookieHeaders) {
+    const parts = [];
+    for (const header of setCookieHeaders) {
+      if (!header) continue;
+      // Each Set-Cookie may contain multiple cookies separated by comma
+      // but also date strings with commas, so split on the cookie name=value part
+      const cookieParts = header.split(/,(?=[^ ]+=)/);
+      for (const part of cookieParts) {
+        const nameValue = part.trim().split(';')[0]; // Take just name=value before attributes
+        if (nameValue && nameValue.includes('=')) {
+          parts.push(nameValue);
+        }
+      }
+    }
+    return parts.length > 0 ? parts.join('; ') : null;
+  }
+
+  // ── Fetching ────────────────────────────────────────────────────────
+
+  /**
+   * Fetch a Validea page with authentication.
+   */
+  async _fetchPage(url) {
+    const cookies = await this._getSessionCookies();
+    const headers = { ...BROWSER_HEADERS };
+
+    if (cookies) {
+      headers['Cookie'] = cookies;
+    }
+
+    const res = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(20000),
+      redirect: 'follow',
+    });
+
+    if (!res.ok) {
+      // If we got a redirect to login page, our session is invalid
+      const finalUrl = res.url || url;
+      if (finalUrl.includes('/login') || finalUrl.includes('/sign_in')) {
+        this._sessionCookies = null;
+        this._sessionExpiry = 0;
+        this._loginAttempted = false;
+        throw new Error('Session expired — redirected to login');
+      }
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const html = await res.text();
+
+    // Detect if we were soft-redirected to login (page contains login form instead of data)
+    if (html.includes('id="login-form"') || html.includes('name="password"') && !html.includes('guru-analysis')) {
+      this._sessionCookies = null;
+      this._sessionExpiry = 0;
+      throw new Error('Session invalid — received login page instead of data');
+    }
+
+    return { html, authenticated: !!cookies };
+  }
+
+  // ── Analysis ────────────────────────────────────────────────────────
 
   /**
    * Fetch and parse Validea guru scores for a stock.
    * @param {string} symbol - Ticker symbol (e.g. AAPL)
-   * @returns {{ symbol, scores: Array<{guru, name, score, interest}>, topStrategy, avgScore, strongCount, someCount, scraped, error? }}
    */
   async analyze(symbol) {
     const upper = symbol.toUpperCase();
@@ -77,91 +266,232 @@ class ValideaService {
     }
 
     const url = `${VALIDEA_BASE}/${upper}`;
-    let html;
 
     try {
-      const res = await fetch(url, {
-        headers: BROWSER_HEADERS,
-        signal: AbortSignal.timeout(15000),
-        redirect: 'follow',
-      });
+      const { html, authenticated } = await this._fetchPage(url);
 
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+      // Log page size for debugging
+      console.log(`[Validea] Fetched ${upper}: ${html.length} chars (auth=${authenticated})`);
+
+      // Parse scores from HTML
+      const scores = this._parseScores(html, upper);
+
+      if (scores.length === 0) {
+        // Dump a sample of the HTML for debugging
+        const sample = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, 500);
+        console.warn(`[Validea] ${upper}: 0 scores parsed. Page sample: ${sample}`);
+
+        if (!authenticated) {
+          return this._buildFallback(upper, 'Could not parse scores — try setting VALIDEA_COOKIE env var for subscriber access');
+        }
+        return this._buildFallback(upper, 'Could not parse guru scores (page structure may have changed)');
       }
 
-      html = await res.text();
+      console.log(`[Validea] ${upper}: parsed ${scores.length} guru scores (top: ${scores[0]?.guru} ${scores[0]?.score}%)`);
+
+      const result = this._buildResult(upper, scores);
+      this._cache.set(upper, { data: result, expiry: Date.now() + this._cacheMs });
+      return result;
     } catch (err) {
       console.warn(`[Validea] Fetch failed for ${upper}: ${err.message}`);
       return this._buildFallback(upper, `Could not reach Validea: ${err.message}`);
     }
-
-    // Parse scores from HTML
-    const scores = this._parseScores(html, upper);
-
-    if (scores.length === 0) {
-      // Page loaded but we couldn't parse scores — might be behind a paywall or different structure
-      return this._buildFallback(upper, 'Could not parse guru scores (page structure may have changed or content may require login)');
-    }
-
-    const result = this._buildResult(upper, scores);
-    this._cache.set(upper, { data: result, expiry: Date.now() + this._cacheMs });
-    return result;
   }
+
+  // ── HTML Parsing ────────────────────────────────────────────────────
 
   /**
    * Parse guru scores from Validea's HTML.
-   * Looks for percentage patterns near known guru/strategy names.
+   * Tries multiple parsing strategies to extract scores.
    */
   _parseScores(html, symbol) {
+    let scores = [];
+
+    // Strategy 1: Look for JSON data embedded in <script> tags
+    scores = this._parseFromScripts(html);
+    if (scores.length > 0) return scores;
+
+    // Strategy 2: Parse score cards / table rows with guru names + percentages
+    scores = this._parseFromGuruNames(html);
+    if (scores.length > 0) return scores;
+
+    // Strategy 3: Broad percentage pattern matching near score-like contexts
+    scores = this._parseFromBroadPatterns(html);
+    return scores;
+  }
+
+  /**
+   * Strategy 1: Look for JSON or structured data in script tags.
+   * Many modern sites embed data as JSON in __NEXT_DATA__, window.__data, etc.
+   */
+  _parseFromScripts(html) {
     const scores = [];
 
-    // Strategy 1: Look for patterns like "93%" or "Score: 93" near guru names
-    // Validea pages typically show scores in table rows or score cards
+    // Look for Next.js page data
+    const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nextDataMatch) {
+      try {
+        const data = JSON.parse(nextDataMatch[1]);
+        return this._extractScoresFromJson(data);
+      } catch { /* not JSON */ }
+    }
 
-    // Pattern: Match guru name followed by a percentage somewhere nearby
+    // Look for window.__data or similar
+    const windowDataPatterns = [
+      /window\.__data\s*=\s*({[\s\S]*?});/,
+      /window\.guruData\s*=\s*({[\s\S]*?});/,
+      /window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});/,
+      /data-scores\s*=\s*'([^']+)'/,
+      /data-guru\s*=\s*'([^']+)'/,
+    ];
+
+    for (const pattern of windowDataPatterns) {
+      const match = html.match(pattern);
+      if (match) {
+        try {
+          const data = JSON.parse(match[1]);
+          const extracted = this._extractScoresFromJson(data);
+          if (extracted.length > 0) return extracted;
+        } catch { /* not JSON */ }
+      }
+    }
+
+    // Look for JSON-LD structured data
+    const jsonLdMatches = html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g);
+    for (const m of jsonLdMatches) {
+      try {
+        const data = JSON.parse(m[1]);
+        if (data.rating || data.score || data.aggregateRating) {
+          const extracted = this._extractScoresFromJson(data);
+          if (extracted.length > 0) return extracted;
+        }
+      } catch { /* skip */ }
+    }
+
+    return scores;
+  }
+
+  /**
+   * Recursively search a JSON structure for guru score data.
+   */
+  _extractScoresFromJson(obj, depth = 0) {
+    if (depth > 10 || !obj || typeof obj !== 'object') return [];
+
+    const scores = [];
+
+    // Check if this object looks like a score entry
+    if (obj.score !== undefined && (obj.guru || obj.name || obj.strategy)) {
+      const matchedStrategy = this._matchStrategy(obj.guru || obj.name || obj.strategy || '');
+      scores.push({
+        id: matchedStrategy?.id || `json_${scores.length}`,
+        guru: matchedStrategy?.guru || obj.guru || 'Unknown',
+        name: matchedStrategy?.name || obj.name || obj.strategy || 'Unknown Strategy',
+        score: typeof obj.score === 'number' ? obj.score : parseInt(obj.score, 10),
+        interest: this._scoreToInterest(typeof obj.score === 'number' ? obj.score : parseInt(obj.score, 10)),
+      });
+      return scores;
+    }
+
+    // Check arrays
+    if (Array.isArray(obj)) {
+      for (const item of obj) {
+        scores.push(...this._extractScoresFromJson(item, depth + 1));
+      }
+      return scores;
+    }
+
+    // Recurse into object values
+    for (const value of Object.values(obj)) {
+      if (typeof value === 'object' && value !== null) {
+        scores.push(...this._extractScoresFromJson(value, depth + 1));
+      }
+    }
+
+    return scores;
+  }
+
+  /**
+   * Strategy 2: Match known guru/strategy names near percentage values.
+   */
+  _parseFromGuruNames(html) {
+    const scores = [];
+
+    // Strip HTML tags but keep structure hints (newlines for rows)
+    const textBlocks = html
+      .replace(/<\/tr>/gi, '\n')
+      .replace(/<\/div>/gi, '\n')
+      .replace(/<\/li>/gi, '\n')
+      .replace(/<br\s*\/?>/gi, '\n');
+
     for (const strategy of GURU_STRATEGIES) {
-      // Search for the guru name or strategy name in the HTML
-      const guruEscaped = strategy.guru.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const nameEscaped = strategy.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      // Build flexible patterns for each keyword
+      for (const keyword of strategy.keywords) {
+        const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-      // Try multiple patterns
-      const patterns = [
-        // "Strategy Name ... XX%"
-        new RegExp(`${nameEscaped}[^%]*?(\\d{1,3})\\s*%`, 'i'),
-        // "Guru Name ... XX%"
-        new RegExp(`${guruEscaped}[^%]*?(\\d{1,3})\\s*%`, 'i'),
-        // Shorter name match (e.g. just "Twin Momentum" or "Patient Investor")
-        new RegExp(`${strategy.name.split(' ').slice(0, 2).join('\\s+')}[^%]*?(\\d{1,3})\\s*%`, 'i'),
-      ];
+        // Pattern: keyword ... NN% (within ~200 chars)
+        const patterns = [
+          new RegExp(`${escaped}[^\\n]{0,200}?(\\d{1,3})\\s*%`, 'i'),
+          new RegExp(`(\\d{1,3})\\s*%[^\\n]{0,100}?${escaped}`, 'i'),
+          // "keyword ... Score: NN"
+          new RegExp(`${escaped}[^\\n]{0,200}?score[^\\d]{0,20}(\\d{1,3})`, 'i'),
+        ];
 
-      for (const pattern of patterns) {
-        const match = html.match(pattern);
-        if (match) {
-          const score = parseInt(match[1], 10);
-          if (score >= 0 && score <= 100) {
-            // Avoid duplicates
-            if (!scores.find(s => s.id === strategy.id)) {
+        let found = false;
+        for (const pattern of patterns) {
+          const match = textBlocks.match(pattern);
+          if (match) {
+            const score = parseInt(match[1], 10);
+            if (score >= 0 && score <= 100 && !scores.find(s => s.id === strategy.id)) {
               scores.push({
                 id: strategy.id,
                 guru: strategy.guru,
                 name: strategy.name,
                 score,
-                interest: score >= 90 ? 'Strong Interest' : score >= 80 ? 'Some Interest' : score >= 60 ? 'Neutral' : 'Fail',
+                interest: this._scoreToInterest(score),
               });
+              found = true;
+              break;
             }
-            break;
           }
+        }
+        if (found) break;
+      }
+    }
+
+    return scores;
+  }
+
+  /**
+   * Strategy 3: Broader pattern — find percentages in score-like contexts.
+   */
+  _parseFromBroadPatterns(html) {
+    const scores = [];
+
+    // Look for table rows or divs with clear score patterns
+    // Pattern: "Something Investor" or "Something Strategy" near NN%
+    const investorPattern = /([A-Z][a-z]+(?:\s+[A-Za-z/']+){0,4}\s+(?:Investor|Strategy))[^%]{0,100}?(\d{1,3})\s*%/g;
+    let match;
+    while ((match = investorPattern.exec(html)) !== null) {
+      const name = match[1].trim();
+      const score = parseInt(match[2], 10);
+      if (score >= 0 && score <= 100) {
+        const matchedStrategy = this._matchStrategy(name);
+        const id = matchedStrategy?.id || `broad_${scores.length}`;
+        if (!scores.find(s => s.id === id)) {
+          scores.push({
+            id,
+            guru: matchedStrategy?.guru || 'Unknown',
+            name: matchedStrategy?.name || name,
+            score,
+            interest: this._scoreToInterest(score),
+          });
         }
       }
     }
 
-    // Strategy 2: Broader pattern — find all "NN%" patterns in score-like contexts
-    // This catches scores we might miss with name-based matching
+    // Fallback: any NN% near "score", "rating", "grade" keywords
     if (scores.length === 0) {
-      // Look for table rows or divs with percentage scores
-      const broadPattern = /(?:score|rating|grade)[^%]*?(\d{1,3})\s*%/gi;
-      let match;
+      const broadPattern = /(?:score|rating|grade)[^%]{0,50}?(\d{1,3})\s*%/gi;
       while ((match = broadPattern.exec(html)) !== null) {
         const score = parseInt(match[1], 10);
         if (score >= 0 && score <= 100) {
@@ -170,7 +500,7 @@ class ValideaService {
             guru: 'Unknown',
             name: `Strategy ${scores.length + 1}`,
             score,
-            interest: score >= 90 ? 'Strong Interest' : score >= 80 ? 'Some Interest' : score >= 60 ? 'Neutral' : 'Fail',
+            interest: this._scoreToInterest(score),
           });
         }
       }
@@ -179,8 +509,30 @@ class ValideaService {
     return scores;
   }
 
+  /**
+   * Match a text string to a known guru strategy.
+   */
+  _matchStrategy(text) {
+    if (!text) return null;
+    const lower = text.toLowerCase();
+    for (const strategy of GURU_STRATEGIES) {
+      for (const keyword of strategy.keywords) {
+        if (lower.includes(keyword)) return strategy;
+      }
+    }
+    return null;
+  }
+
+  _scoreToInterest(score) {
+    if (score >= 90) return 'Strong Interest';
+    if (score >= 80) return 'Some Interest';
+    if (score >= 60) return 'Neutral';
+    return 'Fail';
+  }
+
+  // ── Result Builders ─────────────────────────────────────────────────
+
   _buildResult(symbol, scores) {
-    // Sort by score descending
     scores.sort((a, b) => b.score - a.score);
 
     const strongCount = scores.filter(s => s.score >= 90).length;
@@ -218,12 +570,11 @@ class ValideaService {
     };
   }
 
+  // ── Pipeline Integration ────────────────────────────────────────────
+
   /**
-   * Get a simple score summary for use in the SHARK trading pipeline.
+   * Get a simple score summary for the SHARK trading pipeline.
    * Returns a normalized 0-1 "fundamental score" based on Validea data.
-   *
-   * @param {string} symbol
-   * @returns {{ score: number, label: string, topGuru: string|null, strategies: number, error?: string }}
    */
   async getScore(symbol) {
     const result = await this.analyze(symbol);
@@ -238,7 +589,6 @@ class ValideaService {
       };
     }
 
-    // Normalize: avgScore (0-100) → 0.0-1.0
     const normalized = result.avgScore / 100;
     const label = normalized >= 0.8 ? 'Strong' : normalized >= 0.6 ? 'Moderate' : normalized >= 0.4 ? 'Weak' : 'Poor';
 
@@ -257,7 +607,16 @@ class ValideaService {
     this._cache.clear();
   }
 
-  // ── Discord Formatting ────────────────────────────────────────────
+  /**
+   * Force re-login on next request.
+   */
+  resetSession() {
+    this._sessionCookies = null;
+    this._sessionExpiry = 0;
+    this._loginAttempted = false;
+  }
+
+  // ── Discord Formatting ──────────────────────────────────────────────
 
   formatForDiscord(result) {
     if (!result) return '_Could not fetch Validea data._';
@@ -272,7 +631,7 @@ class ValideaService {
     }
 
     // Summary bar
-    const scoreBar = '█'.repeat(Math.round(result.avgScore / 10)) + '░'.repeat(10 - Math.round(result.avgScore / 10));
+    const scoreBar = '\u2588'.repeat(Math.round(result.avgScore / 10)) + '\u2591'.repeat(10 - Math.round(result.avgScore / 10));
     lines.push(`**Overall Score:** \`${result.avgScore}%\` [${scoreBar}]`);
     lines.push(`**Strategies Evaluated:** ${result.totalStrategies}`);
     lines.push(`**Strong Interest (90%+):** ${result.strongCount} | **Some Interest (80%+):** ${result.someCount}`);
@@ -283,8 +642,8 @@ class ValideaService {
       lines.push('__Top Guru Strategies__');
       const topScores = result.scores.slice(0, 8);
       for (const s of topScores) {
-        const emoji = s.score >= 90 ? '🟢' : s.score >= 80 ? '🟡' : s.score >= 60 ? '🟠' : '🔴';
-        lines.push(`${emoji} **${s.guru}** (${s.name}): \`${s.score}%\` — ${s.interest}`);
+        const indicator = s.score >= 90 ? '[++]' : s.score >= 80 ? '[+ ]' : s.score >= 60 ? '[ +]' : '[--]';
+        lines.push(`${indicator} **${s.guru}** (${s.name}): \`${s.score}%\` — ${s.interest}`);
       }
 
       if (result.scores.length > 8) {
