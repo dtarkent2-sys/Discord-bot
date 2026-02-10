@@ -163,26 +163,32 @@ class AgentSwarm {
     }
 
     // AInvest enrichment — news, analyst ratings, fundamentals for detected tickers
+    // Calls are staggered to avoid AInvest rate limits
     if (ainvest && ainvest.enabled && tickers.length > 0) {
       const ainvestParts = [];
-      const ainvestFetches = tickers.slice(0, 3).map(async (ticker) => {
-        try {
-          const [news, analysts, financials] = await Promise.allSettled([
-            ainvest.getNews({ tickers: [ticker], limit: 5 }),
-            ainvest.getAnalystConsensus(ticker),
-            ainvest.getFinancials(ticker),
-          ]);
+      const staggerDelay = (ms) => new Promise(r => setTimeout(r, ms));
+      const STAGGER_MS = 350;
 
+      for (const ticker of tickers.slice(0, 3)) {
+        try {
           const lines = [`AINVEST DATA FOR ${ticker}:`];
 
-          if (analysts.status === 'fulfilled' && analysts.value) {
-            const a = analysts.value;
+          // Sequential calls with stagger to respect rate limits
+          let analysts, financials, news;
+          try { analysts = await ainvest.getAnalystConsensus(ticker); } catch { analysts = null; }
+          await staggerDelay(STAGGER_MS);
+          try { financials = await ainvest.getFinancials(ticker); } catch { financials = null; }
+          await staggerDelay(STAGGER_MS);
+          try { news = await ainvest.getNews({ tickers: [ticker], limit: 5 }); } catch { news = null; }
+
+          if (analysts) {
+            const a = analysts;
             lines.push(`  Analyst Consensus (${a.totalAnalysts} analysts): Buy ${a.strongBuy + a.buy} | Hold ${a.hold} | Sell ${a.sell + a.strongSell}`);
             if (a.targetAvg != null) lines.push(`  Price Target: $${a.targetLow}–$${a.targetHigh} (avg $${a.targetAvg})`);
           }
 
-          if (financials.status === 'fulfilled' && financials.value) {
-            const f = financials.value;
+          if (financials) {
+            const f = financials;
             const fParts = [];
             if (f.peTTM != null) fParts.push(`P/E: ${f.peTTM.toFixed(1)}`);
             if (f.epsTTM != null) fParts.push(`EPS: $${f.epsTTM.toFixed(2)}`);
@@ -191,19 +197,19 @@ class AgentSwarm {
             if (fParts.length > 0) lines.push(`  Fundamentals: ${fParts.join(' | ')}`);
           }
 
-          if (news.status === 'fulfilled' && news.value && news.value.length > 0) {
+          if (news && news.length > 0) {
             lines.push(`  Recent News:`);
-            for (const n of news.value.slice(0, 3)) {
+            for (const n of news.slice(0, 3)) {
               lines.push(`    • ${n.title} (${n.source || 'AInvest'})`);
             }
           }
 
           if (lines.length > 1) ainvestParts.push(lines.join('\n'));
+          if (tickers.indexOf(ticker) < tickers.length - 1) await staggerDelay(STAGGER_MS);
         } catch (err) {
           console.warn(`[AgentSwarm] AInvest data for ${ticker} failed:`, err.message);
         }
-      });
-      await Promise.allSettled(ainvestFetches);
+      }
       if (ainvestParts.length > 0) {
         parts.push(`AINVEST FUNDAMENTALS & NEWS (real-time):\n${ainvestParts.join('\n\n')}`);
       }
