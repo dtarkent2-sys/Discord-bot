@@ -127,7 +127,9 @@ class AInvestService {
       try {
         const result = await mcp.callTool(mcpToolName, mcpArgs);
         if (result != null) {
-          console.log(`[AInvest] ${mcpToolName} via MCP OK`);
+          // Debug: log the shape of MCP data so we can fix parsing
+          const preview = JSON.stringify(result).slice(0, 300);
+          console.log(`[AInvest] ${mcpToolName} via MCP OK (type=${typeof result}, isArray=${Array.isArray(result)}, keys=${typeof result === 'object' && !Array.isArray(result) ? Object.keys(result).join(',') : 'N/A'}) preview=${preview}`);
           return result;
         }
         console.warn(`[AInvest] MCP tool ${mcpToolName} returned null, falling back to REST`);
