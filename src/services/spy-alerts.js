@@ -63,6 +63,15 @@ function setCache(key, data) {
   }
 }
 
+// ── Conviction → Grade mapping ──────────────────────────────────────────
+function convictionToGrade(conviction) {
+  if (conviction >= 9) return 'A+';
+  if (conviction >= 8) return 'A';
+  if (conviction >= 7) return 'B+';
+  if (conviction >= 5) return 'C';
+  return 'F';
+}
+
 // ── Alert Rate Limiter ──────────────────────────────────────────────────
 const alertTimestamps = [];
 const MAX_ALERTS_PER_MINUTE = 5;
@@ -473,17 +482,20 @@ async function runFastAnalysis(alert, priceData, newsData) {
     }
 
     // If no JSON found, return a default
-    log.warn('Fast analysis returned non-JSON, using defaults');
+    log.warn('Fast analysis returned non-JSON, using defaults (will be filtered as SKIP)');
     return {
-      action: alert.action,
-      conviction: 5,
+      action: 'SKIP',
+      conviction: 3,
+      grade: 'F',
       bullScore: 5,
       bearScore: 5,
       riskLevel: 'MEDIUM',
+      riskReward: 'N/A',
       stopLoss: 'N/A',
       target: 'N/A',
       timeframe: 'EOD',
-      mood: 'Neutral',
+      mood: 'Skeptical',
+      whyNot: 'AI analysis failed to produce structured output',
       summary: result.slice(0, 300),
     };
   } catch (err) {
@@ -541,21 +553,22 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
   const convictionBar = '█'.repeat(conviction) + '░'.repeat(10 - conviction);
   const convictionLevel = conviction >= 7 ? 'high' : conviction >= 4 ? 'medium' : 'low';
   const convEmoji = CONVICTION_EMOJIS[convictionLevel] || '';
+  const grade = analysis.grade || convictionToGrade(conviction);
 
   const botMood = mood.getMood();
   const moodEmoji = MOOD_EMOJIS[botMood] || '😐';
 
   // High conviction flair
   let titleFlair = '';
-  if (conviction >= 8 && botMood === 'Euphoric') {
-    titleFlair = ' 🚀🚀🚀';
+  if (conviction >= 9) {
+    titleFlair = ' // A+ SETUP';
   } else if (conviction >= 8) {
-    titleFlair = ' 🔥';
-  } else if (conviction >= 6 && (botMood === 'Euphoric' || botMood === 'Optimistically Bullish')) {
-    titleFlair = ' 🚀';
+    titleFlair = ' // A SETUP';
+  } else if (conviction >= 7) {
+    titleFlair = ' // SOLID';
   }
 
-  const titleParts = [`${actionEmoji[analysis.action] || '⚪'} Enhanced 0DTE Alert: ${alert.action} ${alert.ticker}`];
+  const titleParts = [`${actionEmoji[analysis.action] || '⚪'} ${alert.action} ${alert.ticker}`];
   if (alert.price) titleParts.push(`@ $${alert.price}`);
   if (alert.interval) titleParts.push(`(${alert.interval})`);
   titleParts.push(titleFlair);
@@ -570,21 +583,21 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
     embed.setDescription(`> ${analysis.summary}`);
   }
 
-  // Scores
+  // Scores — grade + conviction + R:R on the top row
   embed.addFields(
     {
-      name: `${convEmoji} Conviction`,
+      name: 'Grade',
+      value: `**${grade}** ${convEmoji}`,
+      inline: true,
+    },
+    {
+      name: 'Conviction',
       value: `**${conviction}/10** [${convictionBar}]`,
       inline: true,
     },
     {
-      name: '🐂 Bull Score',
-      value: `**${analysis.bullScore || 'N/A'}/10**`,
-      inline: true,
-    },
-    {
-      name: '🐻 Bear Score',
-      value: `**${analysis.bearScore || 'N/A'}/10**`,
+      name: 'R:R',
+      value: `**${analysis.riskReward || 'N/A'}**`,
       inline: true,
     },
   );
@@ -647,7 +660,7 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
   }
 
   embed.setFooter({
-    text: `Sprocket 0DTE Pipeline • Model: ${config.alertOllamaModel} • ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York' })} ET`,
+    text: `Sprocket A+ Pipeline • Grade ${grade} • ${config.alertOllamaModel} • ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York' })} ET`,
   });
 
   return embed;
@@ -862,6 +875,29 @@ async function handleWebhookAlert(message) {
     // Run fast Ollama analysis
     const analysis = await runFastAnalysis(alert, priceData, enrichedNews);
 
+    // ── Conviction Gate: Only post A+ setups ──
+    const minConviction = config.alertMinConviction || 7;
+    const conviction = analysis.conviction || 5;
+    if (conviction < minConviction) {
+      const grade = analysis.grade || convictionToGrade(conviction);
+      const reason = analysis.whyNot || analysis.summary || 'Below threshold';
+      log.info(`SKIPPED alert: ${alert.action} ${alert.ticker} — conviction ${conviction}/10 (${grade}), need ${minConviction}+. Reason: ${reason}`);
+
+      // Replace ack with a minimal "filtered out" notice (so users know the bot is working)
+      try {
+        const skipEmbed = new EmbedBuilder()
+          .setTitle(`Filtered: ${alert.action} ${alert.ticker} [${grade}]`)
+          .setDescription(`Conviction **${conviction}/10** — below A-setup threshold (${minConviction}+)\n> _${reason.slice(0, 200)}_`)
+          .setColor(0x555555)
+          .setFooter({ text: 'Sprocket filtered this alert — only A+ setups get posted' })
+          .setTimestamp();
+        await ackMessage.edit({ embeds: [skipEmbed] });
+        // Auto-delete the skip notice after 30s to keep the channel clean
+        setTimeout(() => ackMessage.delete().catch(() => {}), 30000);
+      } catch { /* ack might already be gone */ }
+      return;
+    }
+
     // Generate chart URL (non-blocking, don't fail if chart fails)
     const chartUrl = await generateChartUrl().catch(() => null);
 
@@ -968,6 +1004,16 @@ async function handleHttpAlert(channel, body) {
       await channel.send({ embeds: [buildErrorEmbed(alert, err.message)] });
     } catch { /* nothing */ }
     return { ok: false, reason: 'analysis_failed', error: err.message };
+  }
+
+  // ── Conviction Gate: Only post A+ setups ──
+  const minConviction = config.alertMinConviction || 7;
+  const conviction = analysis.conviction || 5;
+  if (conviction < minConviction) {
+    const grade = analysis.grade || convictionToGrade(conviction);
+    const reason = analysis.whyNot || analysis.summary || 'Below threshold';
+    log.info(`SKIPPED HTTP alert: ${alert.action} ${alert.ticker} — conviction ${conviction}/10 (${grade}), need ${minConviction}+. Reason: ${reason}`);
+    return { ok: true, filtered: true, conviction, grade, reason: reason.slice(0, 200) };
   }
 
   // ── Step 2: Build finished embed ──
