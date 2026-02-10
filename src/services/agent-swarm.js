@@ -46,6 +46,15 @@ class AgentSwarm {
     this.model = config.ollamaModel;
   }
 
+  /** Update the model used for research (called when user switches via /model) */
+  setModel(modelName) {
+    this.model = modelName;
+  }
+
+  getModel() {
+    return this.model;
+  }
+
   /**
    * Run a full agent swarm research query.
    * @param {string} query — the user's research question
@@ -85,7 +94,7 @@ class AgentSwarm {
       const results = await Promise.all(
         tickers.slice(0, 5).map(async (ticker) => {
           try {
-            const context = await getMarketContext(ticker);
+            const context = await getMarketContext(ticker, { skipAlpaca: true });
             if (context?.snapshot) return this._formatSnapshot(context.snapshot);
             return null;
           } catch (err) {

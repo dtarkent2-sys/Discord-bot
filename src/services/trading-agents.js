@@ -42,6 +42,15 @@ class TradingAgents {
     this.model = config.ollamaModel;
   }
 
+  /** Update the model used for analysis (called when user switches via /model) */
+  setModel(modelName) {
+    this.model = modelName;
+  }
+
+  getModel() {
+    return this.model;
+  }
+
   // ── Main entry point ──────────────────────────────────────────────────
 
   /**
@@ -57,7 +66,7 @@ class TradingAgents {
 
     // ── Stage 0: Fetch market data ──
     progress('data', `Fetching market data for ${upper}...`);
-    const context = await getMarketContext(upper);
+    const context = await getMarketContext(upper, { skipAlpaca: true });
     if (context.error) {
       throw new Error(`Cannot fetch data for ${upper}: ${context.message}`);
     }

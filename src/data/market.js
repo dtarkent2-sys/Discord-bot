@@ -17,13 +17,16 @@ const FRESHNESS = {
 /**
  * Fetch market context for a ticker via Alpaca (preferred) or FMP.
  * Returns structured data for the AI, or { error: true, missing: [...] }.
+ * @param {string} ticker
+ * @param {{ skipAlpaca?: boolean }} [opts] — pass { skipAlpaca: true } to bypass Alpaca
+ *   (useful when the caller enriches with AInvest, which provides richer fundamentals)
  */
-async function getMarketContext(ticker) {
+async function getMarketContext(ticker, opts = {}) {
   // Resolve crypto shorthand: BTC → BTC-USD, ETH → ETH-USD, etc.
   const resolvedTicker = yahoo.resolveTicker(ticker);
   const missing = [];
   const context = { ticker: resolvedTicker, fetchedAt: new Date().toISOString() };
-  const useAlpaca = alpaca.enabled && !yahoo.isCrypto(resolvedTicker);
+  const useAlpaca = !opts.skipAlpaca && alpaca.enabled && !yahoo.isCrypto(resolvedTicker);
   context.source = useAlpaca ? 'Alpaca' : 'FMP';
 
   // ── Ticker Snapshot (fundamentals + technicals) ──

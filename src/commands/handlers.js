@@ -157,8 +157,10 @@ async function handleModel(interaction) {
     const modelName = interaction.options.getString('name');
     const oldModel = ai.getModel();
     ai.setModel(modelName);
+    tradingAgents.setModel(modelName);
+    agentSwarm.setModel(modelName);
 
-    await interaction.reply(`Switched AI model: **${oldModel}** → **${modelName}**`);
+    await interaction.reply(`Switched AI model: **${oldModel}** → **${modelName}** (chat + deep analysis + research)`);
   } catch (err) {
     console.error('[Model] Error:', err);
     await interaction.reply({ content: 'Failed to switch model.', flags: MessageFlags.Ephemeral }).catch(() => {});
