@@ -220,6 +220,7 @@ async function tryAInvestNews(query, num) {
     });
 
     if (!articles || articles.length === 0) {
+      console.warn(`[WebSearch] AInvest News returned 0 articles for tab="${tab}" tickers=[${tickers}]`);
       return { ok: false, error: 'AInvest News returned no articles' };
     }
 
@@ -233,6 +234,7 @@ async function tryAInvestNews(query, num) {
 
     return { ok: true, data: { results, infobox: null } };
   } catch (err) {
+    console.warn(`[WebSearch] AInvest News failed: ${err.message}`);
     return { ok: false, error: `AInvest News: ${err.message}` };
   }
 }
