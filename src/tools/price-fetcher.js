@@ -2,10 +2,11 @@
  * Real-time price fetcher with multi-source fallback.
  *
  * Source priority:
- *   1. yahoo-finance2 (free, no API key)
+ *   1. AInvest — candle-based quotes (needs AINVEST_API_KEY, MCP + REST)
  *   2. FMP — Financial Modeling Prep (needs FMP_API_KEY, very reliable)
  *   3. Alpaca — real-time IEX data (needs ALPACA_API_KEY, stocks only)
- *   4. Stale cache (better than nothing)
+ *   4. yahoo-finance2 (free, no API key, unreliable from datacenter)
+ *   5. Stale cache (better than nothing)
  *
  * Features:
  * - In-memory cache (60s TTL) to avoid redundant lookups
@@ -209,7 +210,7 @@ async function _tryAInvest(ticker) {
 
 /**
  * Fetch current price data for a ticker.
- * Tries yahoo-finance2 → FMP → Alpaca → AInvest → stale cache.
+ * Priority: AInvest → FMP → Alpaca → yahoo-finance2 → stale cache.
  * @param {string} ticker — e.g. "TSLA", "AAPL", "BTC-USD", "ETH-USD"
  * @returns {{ ticker, price, changePercent, change, volume, marketCap, lastUpdated, source }} or { ticker, error, message }
  */
@@ -230,8 +231,8 @@ async function getCurrentPrice(ticker) {
 
   recordCall();
 
-  // Try yahoo-finance2 first (free, no key)
-  let data = await _tryYahoo(upper);
+  // PRIORITY: AInvest (paid API, most reliable, best data)
+  let data = await _tryAInvest(upper);
 
   // Fallback to FMP (API key, reliable from servers)
   if (!data) {
@@ -243,9 +244,9 @@ async function getCurrentPrice(ticker) {
     data = await _tryAlpaca(upper);
   }
 
-    // Fallback to AInvest (API key, candles-based, stocks + ETFs)
+  // Fallback to yahoo-finance2 (free, no key, unreliable from datacenter)
   if (!data) {
-    data = await _tryAInvest(upper);
+    data = await _tryYahoo(upper);
   }
 
   if (data) {

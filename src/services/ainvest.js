@@ -1,33 +1,70 @@
 /**
- * AInvest API Client — News, Candles, Fundamentals, Analyst Ratings, Earnings.
+ * AInvest API Client — PRIORITY data source for the entire bot.
  *
- * Base URL: https://openapi.ainvest.com/open
+ * Dual transport:
+ *   1. MCP (Model Context Protocol) — via https://docsmcp.ainvest.com
+ *   2. REST fallback — via https://openapi.ainvest.com/open
+ *
+ * All 23 endpoints:
+ *   Candles, Trades, News Wires, Wire Content, Articles, Article Content,
+ *   Analyst Consensus, Analyst History, Financials, Earnings, Financial Statements,
+ *   Dividends, Insider Trades, Congress Trades, ETF Profile, ETF Holdings,
+ *   Economic Calendar, Earnings Calendar, Dividends Calendar, Splits Calendar,
+ *   IPO Calendar, Earnings Backtesting, Securities Search
+ *
  * Auth: Authorization: Bearer <AINVEST_API_KEY>
- * Response envelope: { data, status_code, status_msg } where status_code 0 = success
- *
  * Docs: https://docs.ainvest.com
- *
- * Endpoints implemented:
- *   - GET /marketdata/candles         — OHLCV candles (min/day/week/month)
- *   - GET /news/v1/wire/page/history  — News wire with filters
- *   - GET /analysis-ratings/consensus — Analyst buy/hold/sell consensus + target price
- *   - GET /securities/stock/financials — EPS, P/E, margins, dividend yield, etc.
- *   - GET /securities/stock/financials/earnings — Earnings history + surprise %
- *   - GET /calendar/economics         — Economic calendar events
  */
 
 const config = require('../config');
 
 const BASE_URL = config.ainvestBaseUrl || 'https://openapi.ainvest.com/open';
 
+// MCP client — loaded defensively (non-blocking if MCP fails)
+let mcp = null;
+let mcpReady = false;
+
 class AInvestService {
   constructor() {
     this._headers = null;
+    this._mcpInitPromise = null;
   }
 
   get enabled() {
     return !!config.ainvestApiKey;
   }
+
+  // ── MCP initialization (background, non-blocking) ─────────────────────
+
+  /**
+   * Initialize the MCP connection in the background.
+   * Call this once at startup. Does NOT block — the REST API works immediately.
+   */
+  async initMCP() {
+    if (!this.enabled) return;
+    if (this._mcpInitPromise) return this._mcpInitPromise;
+
+    this._mcpInitPromise = (async () => {
+      try {
+        mcp = require('./ainvest-mcp');
+        await mcp.initialize();
+        mcpReady = true;
+        console.log(`[AInvest] MCP connected — ${mcp.getToolNames().length} tools available`);
+      } catch (err) {
+        console.warn(`[AInvest] MCP init failed (using REST fallback): ${err.message}`);
+        mcpReady = false;
+      }
+    })();
+
+    return this._mcpInitPromise;
+  }
+
+  /** Whether MCP transport is available */
+  get mcpEnabled() {
+    return mcpReady && mcp;
+  }
+
+  // ── REST helpers ──────────────────────────────────────────────────────
 
   _getHeaders() {
     if (!this._headers) {
@@ -38,8 +75,6 @@ class AInvestService {
     }
     return this._headers;
   }
-
-  // ── Generic fetch helper ──────────────────────────────────────────────
 
   async _fetch(path, params = {}, timeoutMs = 15000) {
     if (!this.enabled) throw new Error('AINVEST_API_KEY not configured');
@@ -61,7 +96,6 @@ class AInvestService {
 
     const json = await res.json();
 
-    // AInvest envelope: { data, status_code, status_msg }
     if (json.status_code !== undefined && json.status_code !== 0) {
       throw new Error(`AInvest API error ${json.status_code}: ${json.status_msg || 'unknown'}`);
     }
@@ -69,26 +103,49 @@ class AInvestService {
     return json.data !== undefined ? json.data : json;
   }
 
-  // ── Candles (OHLCV) ──────────────────────────────────────────────────
+  /**
+   * Try MCP first, fall back to REST.
+   * @param {string} mcpToolName — MCP tool name
+   * @param {object} mcpArgs — MCP tool arguments
+   * @param {string} restPath — REST endpoint path
+   * @param {object} restParams — REST query params
+   */
+  async _mcpOrRest(mcpToolName, mcpArgs, restPath, restParams) {
+    // Try MCP first (faster, single connection, richer data)
+    if (mcpReady && mcp) {
+      try {
+        const result = await mcp.callTool(mcpToolName, mcpArgs);
+        if (result != null) return result;
+      } catch (err) {
+        console.warn(`[AInvest] MCP tool ${mcpToolName} failed, falling back to REST: ${err.message}`);
+      }
+    }
+
+    // REST fallback
+    return this._fetch(restPath, restParams);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  MARKET DATA
+  // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Fetch OHLCV candles for a ticker.
-   *
-   * @param {string} ticker - Stock symbol (e.g. "SPY", "AAPL")
+   * Fetch OHLCV candles.
+   * @param {string} ticker
    * @param {object} [opts]
    * @param {string} [opts.interval='day'] - 'min' | 'day' | 'week' | 'month'
-   * @param {number} [opts.count=20] - Number of candles
-   * @returns {Array<{ open, high, low, close, volume, timestamp }>}
+   * @param {number} [opts.count=20]
    */
   async getCandles(ticker, { interval = 'day', count = 20 } = {}) {
-    const data = await this._fetch('/marketdata/candles', {
-      symbol: ticker.toUpperCase(),
-      period_type: interval,
-      count,
-    });
+    const symbol = ticker.toUpperCase();
+    const data = await this._mcpOrRest(
+      'get_candles',
+      { symbol, period_type: interval, count },
+      '/marketdata/candles',
+      { symbol, period_type: interval, count },
+    );
 
     if (!Array.isArray(data)) return [];
-
     return data.map(c => ({
       open: c.open,
       high: c.high,
@@ -101,8 +158,7 @@ class AInvestService {
   }
 
   /**
-   * Get the latest price for a ticker from the most recent candle.
-   * Returns a normalized object compatible with price-fetcher.
+   * Get normalized price quote from latest candles (compatible with price-fetcher).
    */
   async getQuote(ticker) {
     const candles = await this.getCandles(ticker, { interval: 'day', count: 2 });
@@ -133,31 +189,43 @@ class AInvestService {
     };
   }
 
-  // ── News Wire ─────────────────────────────────────────────────────────
+  /**
+   * Fetch current-day tick trades for a ticker.
+   */
+  async getTrades(ticker) {
+    const symbol = ticker.toUpperCase();
+    const data = await this._mcpOrRest(
+      'get_trades', { symbol },
+      '/marketdata/trades', { symbol },
+    );
+    return Array.isArray(data) ? data : (data?.list || []);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  NEWS & CONTENT
+  // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Fetch news articles from AInvest wire.
-   *
+   * Fetch news wire articles.
    * @param {object} [opts]
-   * @param {string} [opts.tab='all'] - 'all' | 'important' | 'earnings' | 'insider_trades' | 'technical'
-   * @param {string[]} [opts.tickers] - Filter by ticker symbols
-   * @param {number} [opts.limit=10] - Max articles (up to 50)
-   * @returns {Array<{ title, summary, url, source, timestamp, tickers }>}
+   * @param {string} [opts.tab='all'] - 'all'|'important'|'earnings'|'insider_trades'|'technical'
+   * @param {string[]} [opts.tickers]
+   * @param {number} [opts.limit=10]
    */
   async getNews({ tab = 'all', tickers = [], limit = 10 } = {}) {
-    const params = {
-      tab,
-      page_size: Math.min(Math.max(limit, 1), 50),
-    };
+    const params = { tab, page_size: Math.min(Math.max(limit, 1), 50) };
+    const mcpArgs = { ...params };
     if (tickers.length > 0) {
       params.symbols = tickers.join(',');
+      mcpArgs.symbols = tickers.join(',');
     }
 
-    const data = await this._fetch('/news/v1/wire/page/history', params);
+    const data = await this._mcpOrRest(
+      'get_news_wires', mcpArgs,
+      '/news/v1/wire/page/history', params,
+    );
 
-    // data is { list: [...], has_next: bool } or just an array
     const articles = Array.isArray(data) ? data : (data?.list || []);
-
     return articles.slice(0, limit).map(a => ({
       title: a.title || a.headline || '',
       summary: (a.summary || a.description || '').slice(0, 500),
@@ -169,21 +237,54 @@ class AInvestService {
     }));
   }
 
-  // ── Analyst Ratings Consensus ─────────────────────────────────────────
+  /**
+   * Fetch full wire content by content ID.
+   */
+  async getWireContent(contentId) {
+    return this._mcpOrRest(
+      'get_wire_content', { content_id: contentId },
+      `/news/v1/wire/info/${contentId}`, {},
+    );
+  }
 
   /**
-   * Get analyst consensus for a ticker.
-   *
-   * @param {string} ticker
-   * @returns {{ buy, hold, sell, strongBuy, strongSell, avgRating, targetHigh, targetLow, targetAvg, totalAnalysts }}
+   * Fetch articles (longer-form analysis pieces).
+   */
+  async getArticles({ tickers = [], limit = 10 } = {}) {
+    const params = { page_size: Math.min(limit, 50) };
+    if (tickers.length > 0) params.symbols = tickers.join(',');
+
+    const data = await this._mcpOrRest(
+      'get_articles', params,
+      '/news/v1/article/page/history', params,
+    );
+
+    const articles = Array.isArray(data) ? data : (data?.list || []);
+    return articles.slice(0, limit).map(a => ({
+      title: a.title || '',
+      summary: (a.summary || a.description || '').slice(0, 500),
+      url: a.url || '',
+      source: a.source || 'AInvest',
+      timestamp: a.published_at || a.created_at || '',
+      contentId: a.content_id || a.id || null,
+    }));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  ANALYST RATINGS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get analyst consensus (buy/hold/sell + price targets).
    */
   async getAnalystConsensus(ticker) {
-    const data = await this._fetch('/analysis-ratings/consensus', {
-      symbol: ticker.toUpperCase(),
-    });
+    const symbol = ticker.toUpperCase();
+    const data = await this._mcpOrRest(
+      'get_analyst_consensus', { symbol },
+      '/analysis-ratings/consensus', { symbol },
+    );
 
     if (!data) return null;
-
     return {
       buy: data.buy || 0,
       hold: data.hold || 0,
@@ -198,21 +299,43 @@ class AInvestService {
     };
   }
 
-  // ── Stock Financials ──────────────────────────────────────────────────
+  /**
+   * Get full analyst ratings history (individual firm ratings).
+   */
+  async getAnalystHistory(ticker, limit = 10) {
+    const symbol = ticker.toUpperCase();
+    const data = await this._mcpOrRest(
+      'get_analyst_ratings', { symbol },
+      '/analysis-ratings/history', { symbol },
+    );
+
+    const list = Array.isArray(data) ? data : (data?.list || []);
+    return list.slice(0, limit).map(r => ({
+      date: r.date || r.published_at || '',
+      firm: r.firm || r.analyst_firm || '',
+      action: r.action || r.rating_action || '',
+      rating: r.rating || r.current_rating || '',
+      targetPrice: r.target_price ?? r.price_target ?? null,
+      previousRating: r.previous_rating || null,
+      previousTarget: r.previous_target_price ?? null,
+    }));
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  SECURITIES & COMPANY DATA
+  // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Get fundamental financial data for a ticker.
-   *
-   * @param {string} ticker
-   * @returns {{ epsTTM, peTTM, pb, roeTTM, grossMargin, operatingMargin, netMargin, debtRatio, dividendYield, marketCap, ... }}
+   * Get fundamental financial data (P/E, EPS, margins, etc.).
    */
   async getFinancials(ticker) {
-    const data = await this._fetch('/securities/stock/financials', {
-      symbol: ticker.toUpperCase(),
-    });
+    const symbol = ticker.toUpperCase();
+    const data = await this._mcpOrRest(
+      'get_company_financials', { symbol },
+      '/securities/stock/financials', { symbol },
+    );
 
     if (!data) return null;
-
     return {
       epsTTM: data.eps_ttm ?? null,
       peTTM: data.pe_ttm ?? null,
@@ -229,23 +352,18 @@ class AInvestService {
     };
   }
 
-  // ── Earnings ──────────────────────────────────────────────────────────
-
   /**
-   * Get earnings history (actual vs forecast) for a ticker.
-   *
-   * @param {string} ticker
-   * @param {number} [limit=4] - Number of quarters
-   * @returns {Array<{ date, epsActual, epsForecast, epsSurprise, revenueActual, revenueForecast }>}
+   * Get earnings history (actual vs forecast).
    */
   async getEarnings(ticker, limit = 4) {
-    const data = await this._fetch('/securities/stock/financials/earnings', {
-      symbol: ticker.toUpperCase(),
-    });
+    const symbol = ticker.toUpperCase();
+    const data = await this._mcpOrRest(
+      'get_stock_earnings', { symbol },
+      '/securities/stock/financials/earnings', { symbol },
+    );
 
     if (!data) return [];
     const list = Array.isArray(data) ? data : (data.list || data.earnings || []);
-
     return list.slice(0, limit).map(e => ({
       date: e.report_date || e.date || '',
       epsActual: e.eps_actual ?? e.actual_eps ?? null,
@@ -257,26 +375,109 @@ class AInvestService {
     }));
   }
 
-  // ── Economic Calendar ─────────────────────────────────────────────────
+  /**
+   * Get financial statements (income, balance sheet, cash flow).
+   */
+  async getFinancialStatements(ticker, { type = 'income', period = 'annual' } = {}) {
+    const symbol = ticker.toUpperCase();
+    return this._mcpOrRest(
+      'get_financial_statements', { symbol, statement_type: type, period },
+      '/securities/stock/financials/statements', { symbol, statement_type: type, period },
+    );
+  }
 
   /**
-   * Get upcoming economic events.
-   *
-   * @param {object} [opts]
-   * @param {string} [opts.date] - Specific date (YYYY-MM-DD), defaults to today
-   * @param {string} [opts.importance] - 'high' | 'medium' | 'low'
-   * @returns {Array<{ event, date, importance, actual, forecast, previous }>}
+   * Get stock dividend history.
+   */
+  async getStockDividends(ticker) {
+    const symbol = ticker.toUpperCase();
+    return this._mcpOrRest(
+      'get_stock_dividends', { symbol },
+      '/securities/stock/financials/dividends', { symbol },
+    );
+  }
+
+  /**
+   * Search securities by ticker or name.
+   */
+  async searchSecurities(query) {
+    return this._mcpOrRest(
+      'search_securities', { query },
+      '/securities/search', { query },
+    );
+  }
+
+  // ── ETF Data ──────────────────────────────────────────────────────────
+
+  /**
+   * Get ETF profile (expense ratio, AUM, etc.).
+   */
+  async getETFProfile(ticker) {
+    const symbol = ticker.toUpperCase();
+    return this._mcpOrRest(
+      'get_etf_profile', { symbol },
+      '/securities/etf/profile', { symbol },
+    );
+  }
+
+  /**
+   * Get top ETF holdings.
+   */
+  async getETFHoldings(ticker) {
+    const symbol = ticker.toUpperCase();
+    return this._mcpOrRest(
+      'get_etf_holdings', { symbol },
+      '/securities/etf/holdings', { symbol },
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  OWNERSHIP & TRADING
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get insider trades for a ticker.
+   */
+  async getInsiderTrades(ticker) {
+    const symbol = ticker.toUpperCase();
+    const data = await this._mcpOrRest(
+      'get_insider_trades', { symbol },
+      '/ownership/insider', { symbol },
+    );
+    return Array.isArray(data) ? data : (data?.list || []);
+  }
+
+  /**
+   * Get US Congress member trades.
+   */
+  async getCongressTrades(ticker) {
+    const symbol = ticker.toUpperCase();
+    const data = await this._mcpOrRest(
+      'get_congress_trades', { symbol },
+      '/ownership/congress', { symbol },
+    );
+    return Array.isArray(data) ? data : (data?.list || []);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  CALENDARS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Get economic calendar events.
    */
   async getEconomicCalendar({ date, importance } = {}) {
     const params = {};
     if (date) params.date = date;
     if (importance) params.importance = importance;
 
-    const data = await this._fetch('/calendar/economics', params);
+    const data = await this._mcpOrRest(
+      'get_economic_events', params,
+      '/calendar/economics', params,
+    );
 
     if (!data) return [];
     const list = Array.isArray(data) ? data : (data.list || data.events || []);
-
     return list.map(e => ({
       event: e.event || e.title || e.name || '',
       date: e.date || e.time || '',
@@ -288,22 +489,90 @@ class AInvestService {
     }));
   }
 
-  // ── Format for AI Prompts ─────────────────────────────────────────────
+  /**
+   * Get earnings calendar for a date.
+   */
+  async getEarningsCalendar(date) {
+    const params = {};
+    if (date) params.date = date;
+
+    return this._mcpOrRest(
+      'get_earnings_calendar', params,
+      '/calendar/earnings', params,
+    );
+  }
 
   /**
-   * Format analyst + financial data as context string for LLM prompts.
+   * Get dividends calendar.
+   */
+  async getDividendsCalendar(date) {
+    const params = {};
+    if (date) params.date = date;
+
+    return this._mcpOrRest(
+      'get_dividends_calendar', params,
+      '/calendar/dividends', params,
+    );
+  }
+
+  /**
+   * Get stock splits calendar.
+   */
+  async getSplitsCalendar(date) {
+    const params = {};
+    if (date) params.date = date;
+
+    return this._mcpOrRest(
+      'get_splits_calendar', params,
+      '/calendar/corporateactions', params,
+    );
+  }
+
+  /**
+   * Get IPO calendar.
+   */
+  async getIPOCalendar(date) {
+    const params = {};
+    if (date) params.date = date;
+
+    return this._mcpOrRest(
+      'get_ipo_calendar', params,
+      '/calendar/ipo', params,
+    );
+  }
+
+  /**
+   * Get earnings backtesting data.
+   */
+  async getEarningsBacktesting(ticker) {
+    const symbol = ticker.toUpperCase();
+    return this._mcpOrRest(
+      'get_earnings_backtesting', { symbol },
+      '/calendar/earnings/backtesting', { symbol },
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  FORMATTED CONTEXT FOR AI PROMPTS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a comprehensive fundamental context block for LLM prompts.
+   * Fetches analyst ratings, financials, earnings, insider trades, and economic events.
    *
    * @param {string} ticker
-   * @returns {string} Formatted fundamental data block
+   * @returns {string} Formatted multi-section context
    */
   async getFundamentalContext(ticker) {
     const sections = [];
 
-    // Fetch all fundamental data in parallel
-    const [analysts, financials, earnings] = await Promise.allSettled([
+    // Fetch all data in parallel
+    const [analysts, financials, earnings, insiders, econ] = await Promise.allSettled([
       this.getAnalystConsensus(ticker),
       this.getFinancials(ticker),
       this.getEarnings(ticker, 2),
+      this.getInsiderTrades(ticker).then(t => t.slice(0, 3)),
+      this.getEconomicCalendar({ importance: 'high' }).then(e => e.slice(0, 3)),
     ]);
 
     // Analyst ratings
@@ -327,6 +596,7 @@ class AInvestService {
       if (f.dividendYield != null) parts.push(`Div Yield: ${(f.dividendYield * 100).toFixed(2)}%`);
       if (f.netMargin != null) parts.push(`Net Margin: ${(f.netMargin * 100).toFixed(1)}%`);
       if (f.debtRatio != null) parts.push(`Debt Ratio: ${f.debtRatio.toFixed(2)}`);
+      if (f.marketCap != null) parts.push(`Mkt Cap: $${(f.marketCap / 1e9).toFixed(1)}B`);
       if (parts.length > 0) {
         sections.push(`FUNDAMENTALS: ${parts.join(' | ')}`);
       }
@@ -338,6 +608,28 @@ class AInvestService {
       for (const e of earnings.value) {
         const surprise = e.epsSurprise != null ? ` (${e.epsSurprise > 0 ? '+' : ''}${e.epsSurprise}% surprise)` : '';
         sections.push(`  ${e.date}: EPS $${e.epsActual ?? 'N/A'} vs est $${e.epsForecast ?? 'N/A'}${surprise}`);
+      }
+    }
+
+    // Insider trades (smart money signal)
+    if (insiders.status === 'fulfilled' && insiders.value && insiders.value.length > 0) {
+      sections.push('RECENT INSIDER TRADES:');
+      for (const t of insiders.value) {
+        const name = t.name || t.insider_name || 'Unknown';
+        const type = t.trade_type || t.transaction_type || t.type || '?';
+        const shares = t.shares || t.quantity || '?';
+        const price = t.price ? `@ $${t.price}` : '';
+        sections.push(`  ${name}: ${type} ${shares} shares ${price}`);
+      }
+    }
+
+    // Economic calendar (macro context)
+    if (econ.status === 'fulfilled' && econ.value && econ.value.length > 0) {
+      sections.push('HIGH-IMPACT ECONOMIC EVENTS TODAY:');
+      for (const e of econ.value) {
+        const actual = e.actual != null ? `Actual: ${e.actual}` : '';
+        const forecast = e.forecast != null ? `Est: ${e.forecast}` : '';
+        sections.push(`  ${e.event} — ${[actual, forecast].filter(Boolean).join(' | ') || 'Pending'}`);
       }
     }
 

@@ -2,12 +2,15 @@
  * Web Search — Multi-source search with automatic fallback.
  *
  * Source priority:
- *   1. SearXNG instances (configured primary + public fallbacks)
- *   2. DuckDuckGo HTML (scrapes lite.duckduckgo.com — no API key)
+ *   1. AInvest News Wire (paid API, best for financial/market queries)
+ *   2. SearXNG instances (configured primary + public fallbacks)
+ *   3. DuckDuckGo HTML (scrapes lite.duckduckgo.com — no API key)
+ *   4. Alpaca News (stocks only, reliable from Railway)
  *
  * Setup (optional — works out of the box with fallbacks):
- *   1. Add SEARXNG_URL=https://your-instance.com to .env for a custom instance
- *   2. Or just use it — public SearXNG instances and DuckDuckGo are tried automatically
+ *   1. Add AINVEST_API_KEY for priority financial news
+ *   2. Add SEARXNG_URL=https://your-instance.com to .env for a custom instance
+ *   3. Or just use it — all fallbacks are tried automatically
  */
 
 const config = require('../config');
@@ -290,7 +293,7 @@ function _decodeHtml(text) {
 
 /**
  * Search the web using multiple sources with automatic fallback.
- * Tries SearXNG instances first, then DuckDuckGo HTML.
+ * Priority: AInvest News → SearXNG → DuckDuckGo HTML → Alpaca News.
  *
  * @param {string} query — The search query
  * @param {number} [numResults=3] — Number of results to return (max 10)
@@ -309,16 +312,35 @@ async function webSearch(query, numResults = 3) {
   }
 
   const num = Math.min(Math.max(numResults, 1), 10);
+  const errors = [];
 
-  // Build ordered list of SearXNG instances to try
+  // PRIORITY: AInvest News (paid API, best quality, most reliable)
+  const ainvestAttempt = await tryAInvestNews(query, num);
+
+  if (ainvestAttempt.ok) {
+    const result = {
+      ...ainvestAttempt.data,
+      query: query.trim(),
+      resultCount: ainvestAttempt.data.results.length,
+      timestamp: new Date().toISOString(),
+      instance: 'ainvest',
+    };
+
+    cache.set(cacheKey, { data: result, timestamp: Date.now() });
+    _pruneCache();
+    console.log(`[WebSearch] AInvest returned ${result.resultCount} articles for "${query}"`);
+    return result;
+  }
+
+  errors.push(ainvestAttempt.error);
+
+  // Fallback: SearXNG instances (general web search)
   const instances = [];
   if (config.searxngUrl) instances.push(config.searxngUrl);
   for (const fb of FALLBACK_INSTANCES) {
     if (!instances.includes(fb)) instances.push(fb);
   }
 
-  // Try each SearXNG instance in order
-  const errors = [];
   for (const instanceUrl of instances) {
     const attempt = await tryInstance(instanceUrl, query, num);
 
@@ -340,29 +362,8 @@ async function webSearch(query, numResults = 3) {
     console.warn(`[WebSearch] SearXNG failed: ${instanceUrl} — ${attempt.error}`);
   }
 
-  // All SearXNG instances failed — try AInvest News (great for market queries)
-  console.log(`[WebSearch] All SearXNG instances failed, trying AInvest News...`);
-  const ainvestAttempt = await tryAInvestNews(query, num);
-
-  if (ainvestAttempt.ok) {
-    const result = {
-      ...ainvestAttempt.data,
-      query: query.trim(),
-      resultCount: ainvestAttempt.data.results.length,
-      timestamp: new Date().toISOString(),
-      instance: 'ainvest',
-    };
-
-    cache.set(cacheKey, { data: result, timestamp: Date.now() });
-    _pruneCache();
-    console.log(`[WebSearch] AInvest returned ${result.resultCount} articles for "${query}"`);
-    return result;
-  }
-
-  errors.push(ainvestAttempt.error);
-
-  // AInvest failed — try DuckDuckGo HTML
-  console.log(`[WebSearch] AInvest failed, trying DuckDuckGo HTML...`);
+  // Fallback: DuckDuckGo HTML
+  console.log(`[WebSearch] AInvest + SearXNG failed, trying DuckDuckGo HTML...`);
   const ddgAttempt = await tryDuckDuckGo(query, num);
 
   if (ddgAttempt.ok) {
