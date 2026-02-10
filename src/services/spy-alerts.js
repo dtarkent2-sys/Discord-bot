@@ -870,11 +870,12 @@ async function handleWebhookAlert(message) {
   }
 }
 
-// ── HTTP Webhook Handler (TradingView → Express → Discord) ──────────────
+// ── HTTP Webhook Handler (TradingView → Express → AI → Discord) ─────────
 
 /**
  * Handle an alert received via HTTP POST (from TradingView directly).
- * Posts the ack embed to the SPY channel, then processes async.
+ * Runs AI analysis FIRST, then posts the finished embed to Discord.
+ * Nothing appears in the channel until analysis is complete.
  *
  * @param {import('discord.js').TextChannel} channel — The Discord channel to post in
  * @param {object|string} body — Raw request body (JSON object or string)
@@ -888,38 +889,53 @@ async function handleHttpAlert(channel, body) {
   recordAlert();
 
   const alert = parseAlert(body);
-  log.info(`HTTP alert received: ${alert.action} ${alert.ticker} @ $${alert.price || 'N/A'}`);
+  log.info(`HTTP alert received: ${alert.action} ${alert.ticker} @ $${alert.price || 'N/A'} [${alert.interval || 'no tf'}] [${alert.confidence || 'no conf'}]`);
+  log.info(`Signal text: ${alert.reason}`);
 
-  // ── Step 1: Instant ack ──
-  let ackMessage;
+  // ── Step 1: Fetch data + AI analysis (before posting anything) ──
+  let analysis, chartUrl, priceData;
   try {
-    ackMessage = await channel.send({ embeds: [buildAckEmbed(alert)] });
+    // Fetch all data in parallel
+    const [price, news, chart] = await Promise.all([
+      fetchSPYPrice(),
+      fetchSPYNews(),
+      generateChartUrl().catch(() => null),
+    ]);
+    priceData = price;
+    chartUrl = chart;
+
+    // Run AI analysis with all the data
+    analysis = await runFastAnalysis(alert, priceData, news);
   } catch (err) {
-    log.error(`Failed to send ack to channel: ${err.message}`);
+    log.error(`HTTP alert analysis failed: ${err.message}`);
+    // Post error embed so the alert isn't silently lost
+    try {
+      await channel.send({ embeds: [buildErrorEmbed(alert, err.message)] });
+    } catch { /* nothing */ }
+    return { ok: false, reason: 'analysis_failed', error: err.message };
+  }
+
+  // ── Step 2: Build finished embed ──
+  const embed = buildEnhancedEmbed(alert, analysis, priceData);
+  if (chartUrl) embed.setImage(chartUrl);
+
+  // ── Step 3: Post to Discord (one clean message, no ack→edit flicker) ──
+  let postedMessage;
+  try {
+    postedMessage = await channel.send({ embeds: [embed] });
+  } catch (err) {
+    log.error(`Failed to post alert to channel: ${err.message}`);
     return { ok: false, reason: 'discord_send_failed' };
   }
 
-  // ── Step 2: Async processing (don't block the HTTP response) ──
+  // ── Step 4: Thread + reactions (non-blocking) ──
   (async () => {
     try {
-      const [priceData, newsData] = await Promise.all([
-        fetchSPYPrice(),
-        fetchSPYNews(),
-      ]);
-
-      const analysis = await runFastAnalysis(alert, priceData, newsData);
-      const chartUrl = await generateChartUrl().catch(() => null);
-
-      const embed = buildEnhancedEmbed(alert, analysis, priceData);
-      if (chartUrl) embed.setImage(chartUrl);
-
-      await ackMessage.edit({ embeds: [embed] });
-
       // Thread
       let thread;
       try {
-        thread = await ackMessage.startThread({
-          name: `${alert.action} ${alert.ticker} — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET`,
+        thread = await postedMessage.startThread({
+          name: `${alert.action} ${alert.ticker}${alert.interval ? ' ' + alert.interval : ''} — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET`,
           autoArchiveDuration: 60,
         });
       } catch (err) {
@@ -928,8 +944,8 @@ async function handleHttpAlert(channel, body) {
 
       // Reactions
       try {
-        await ackMessage.react('👍');
-        await ackMessage.react('👎');
+        await postedMessage.react('👍');
+        await postedMessage.react('👎');
       } catch (err) {
         log.warn(`Could not add reactions: ${err.message}`);
       }
@@ -938,17 +954,13 @@ async function handleHttpAlert(channel, body) {
       if (thread && alert.price) {
         scheduleFollowUp(thread, alert, analysis);
       }
-
-      log.info(`HTTP alert processed: ${alert.action} ${alert.ticker} — conviction ${analysis.conviction}/10`);
     } catch (err) {
-      log.error(`HTTP alert processing error: ${err.message}`);
-      try {
-        await ackMessage.edit({ embeds: [buildErrorEmbed(alert, err.message)] });
-      } catch { /* nothing */ }
+      log.warn(`Post-alert extras failed: ${err.message}`);
     }
   })();
 
-  return { ok: true, alert: { action: alert.action, ticker: alert.ticker, price: alert.price } };
+  log.info(`HTTP alert posted: ${alert.action} ${alert.ticker} — conviction ${analysis.conviction}/10`);
+  return { ok: true, alert: { action: alert.action, ticker: alert.ticker, price: alert.price, conviction: analysis.conviction } };
 }
 
 module.exports = {
