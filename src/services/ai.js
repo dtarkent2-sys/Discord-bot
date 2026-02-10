@@ -390,11 +390,16 @@ ${mood.buildMoodContext()}
     if (this.kimiEnabled) {
       try {
         const assistantMessage = await this._kimiAgentChat(chatMessages);
-        history.push({ role: 'assistant', content: assistantMessage });
-        if (assistantMessage.length > 1990) {
-          return assistantMessage.slice(0, 1990) + '...';
+        if (!assistantMessage || !assistantMessage.trim()) {
+          console.warn('[AI] Kimi returned empty response, falling back to Ollama');
+          // Fall through to Ollama
+        } else {
+          history.push({ role: 'assistant', content: assistantMessage });
+          if (assistantMessage.length > 1990) {
+            return assistantMessage.slice(0, 1990) + '...';
+          }
+          return assistantMessage;
         }
-        return assistantMessage;
       } catch (err) {
         console.error(`[AI] Kimi agent error: ${err.message}`);
         console.log('[AI] Falling back to Ollama...');
@@ -413,6 +418,11 @@ ${mood.buildMoodContext()}
       let assistantMessage = '';
       for await (const part of stream) {
         assistantMessage += part.message.content;
+      }
+
+      if (!assistantMessage || !assistantMessage.trim()) {
+        console.warn('[AI] Ollama returned empty response');
+        return "Hmm, I blanked out for a second there. What were you saying?";
       }
 
       history.push({ role: 'assistant', content: assistantMessage });
