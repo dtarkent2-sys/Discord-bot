@@ -12,6 +12,14 @@
 
 const config = require('../config');
 
+// AInvest news — high-quality financial news (paid API, very reliable)
+let ainvestClient;
+try {
+  ainvestClient = require('../services/ainvest');
+} catch {
+  ainvestClient = null;
+}
+
 // Alpaca news as final fallback for market-related queries
 let alpacaClient;
 try {
@@ -180,6 +188,53 @@ async function tryDuckDuckGo(query, num) {
 }
 
 /**
+ * Fallback: Search via AInvest News Wire API.
+ * High-quality financial news with ticker filtering. Paid API, very reliable.
+ * @returns {{ ok: true, data: object } | { ok: false, error: string }}
+ */
+async function tryAInvestNews(query, num) {
+  if (!ainvestClient || !ainvestClient.enabled) {
+    return { ok: false, error: 'AInvest not configured' };
+  }
+
+  try {
+    // Extract potential ticker symbols from the query
+    const tickerMatch = query.match(/\b[A-Z]{1,5}\b/g) || [];
+    const stopWords = ['THE', 'FOR', 'AND', 'NOT', 'YOU', 'ALL', 'CAN', 'ARE',
+      'HAS', 'HOW', 'NOW', 'NEW', 'WAS', 'WHO', 'DID', 'GET', 'SAY', 'TOO', 'TOP',
+      'WHAT', 'WITH', 'THAT', 'THIS', 'WILL', 'FROM', 'HAVE', 'MANY', 'SOME',
+      'BUY', 'SELL', 'HOLD', 'IPO', 'ETF', 'GDP', 'FED', 'SEC', 'DOW', 'TODAY',
+      'NEWS', 'MARKET'];
+    const tickers = tickerMatch.filter(t => !stopWords.includes(t));
+
+    // Use 'important' tab for general market queries, 'all' if ticker-specific
+    const tab = tickers.length > 0 ? 'all' : 'important';
+
+    const articles = await ainvestClient.getNews({
+      tab,
+      tickers: tickers.slice(0, 3),
+      limit: Math.min(num, 10),
+    });
+
+    if (!articles || articles.length === 0) {
+      return { ok: false, error: 'AInvest News returned no articles' };
+    }
+
+    const results = articles.slice(0, num).map((article, i) => ({
+      title: article.title || '',
+      link: article.url || '',
+      snippet: article.summary || '',
+      engine: 'ainvest',
+      position: i + 1,
+    }));
+
+    return { ok: true, data: { results, infobox: null } };
+  } catch (err) {
+    return { ok: false, error: `AInvest News: ${err.message}` };
+  }
+}
+
+/**
  * Fallback: Search via Alpaca News API.
  * Only useful for market/finance queries, but very reliable from Railway.
  * @returns {{ ok: true, data: object } | { ok: false, error: string }}
@@ -285,8 +340,29 @@ async function webSearch(query, numResults = 3) {
     console.warn(`[WebSearch] SearXNG failed: ${instanceUrl} — ${attempt.error}`);
   }
 
-  // All SearXNG instances failed — try DuckDuckGo HTML as last resort
-  console.log(`[WebSearch] All SearXNG instances failed, trying DuckDuckGo HTML...`);
+  // All SearXNG instances failed — try AInvest News (great for market queries)
+  console.log(`[WebSearch] All SearXNG instances failed, trying AInvest News...`);
+  const ainvestAttempt = await tryAInvestNews(query, num);
+
+  if (ainvestAttempt.ok) {
+    const result = {
+      ...ainvestAttempt.data,
+      query: query.trim(),
+      resultCount: ainvestAttempt.data.results.length,
+      timestamp: new Date().toISOString(),
+      instance: 'ainvest',
+    };
+
+    cache.set(cacheKey, { data: result, timestamp: Date.now() });
+    _pruneCache();
+    console.log(`[WebSearch] AInvest returned ${result.resultCount} articles for "${query}"`);
+    return result;
+  }
+
+  errors.push(ainvestAttempt.error);
+
+  // AInvest failed — try DuckDuckGo HTML
+  console.log(`[WebSearch] AInvest failed, trying DuckDuckGo HTML...`);
   const ddgAttempt = await tryDuckDuckGo(query, num);
 
   if (ddgAttempt.ok) {

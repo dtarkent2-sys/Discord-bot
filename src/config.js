@@ -58,4 +58,8 @@ module.exports = {
   alertCacheTtl: parseInt(process.env.ALERT_CACHE_TTL, 10) || 60000, // 60s default
   alertFollowUpMs: parseInt(process.env.ALERT_FOLLOWUP_MS, 10) || 5 * 60 * 1000, // 5min default
   webhookSecret: process.env.WEBHOOK_SECRET || '', // Optional auth for TradingView webhook
+
+  // AInvest API (news, candles, fundamentals, analyst ratings, earnings)
+  ainvestApiKey: process.env.AINVEST_API_KEY || '',
+  ainvestBaseUrl: process.env.AINVEST_BASE_URL || 'https://openapi.ainvest.com/open',
 };

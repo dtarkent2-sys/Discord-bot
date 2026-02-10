@@ -20,6 +20,14 @@ const { getMarketContext, formatContextForAI } = require('../data/market');
 const { todayString, ragEnforcementBlock, ragReminder, MODEL_CUTOFF } = require('../date-awareness');
 const priceFetcher = require('../tools/price-fetcher');
 
+// AInvest — analyst ratings, financials, earnings (optional enrichment)
+let ainvest;
+try {
+  ainvest = require('./ainvest');
+} catch {
+  ainvest = null;
+}
+
 class TradingAgents {
   constructor() {
     const opts = { host: config.ollamaHost };
@@ -51,18 +59,35 @@ class TradingAgents {
     let marketData = formatContextForAI(context);
     const snapshot = context.snapshot || {};
 
-    // Enrich with yahoo-finance2 real-time price as cross-reference
+    // Enrich with real-time price cross-reference + AInvest fundamentals
+    const enrichPromises = [];
+
     if (priceFetcher.isAvailable()) {
-      try {
-        const livePrice = await priceFetcher.getCurrentPrice(upper);
-        if (!livePrice.error) {
-          marketData += `\n\nYAHOO FINANCE CROSS-REFERENCE (fetched ${livePrice.lastUpdated}):\n` +
-            priceFetcher.formatForPrompt([livePrice]);
-        }
-      } catch {
-        // Non-critical — continue without cross-reference
-      }
+      enrichPromises.push(
+        priceFetcher.getCurrentPrice(upper)
+          .then(livePrice => {
+            if (!livePrice.error) {
+              marketData += `\n\nLIVE PRICE CROSS-REFERENCE (fetched ${livePrice.lastUpdated}):\n` +
+                priceFetcher.formatForPrompt([livePrice]);
+            }
+          })
+          .catch(() => {})
+      );
     }
+
+    if (ainvest && ainvest.enabled) {
+      enrichPromises.push(
+        ainvest.getFundamentalContext(upper)
+          .then(ctx => {
+            if (ctx) {
+              marketData += `\n\n=== AINVEST FUNDAMENTALS (live) ===\n${ctx}`;
+            }
+          })
+          .catch(() => {})
+      );
+    }
+
+    await Promise.all(enrichPromises);
 
     // ── Stage 1: Four analysts in parallel ──
     progress('analysts', 'Running analyst agents (market, fundamentals, sentiment, news)...');

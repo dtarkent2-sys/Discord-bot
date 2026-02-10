@@ -42,6 +42,16 @@ try {
   console.warn(`[PriceFetcher] Alpaca client failed to load: ${err.message}`);
 }
 
+// AInvest client (uses AINVEST_API_KEY, candles-based quotes)
+let ainvestClient;
+try {
+  ainvestClient = require('../services/ainvest');
+  console.log(`[PriceFetcher] AInvest client loaded OK (enabled=${ainvestClient.enabled})`);
+} catch (err) {
+  ainvestClient = null;
+  console.warn(`[PriceFetcher] AInvest client failed to load: ${err.message}`);
+}
+
 // ── Cache: ticker → { data, fetchedAt } ────────────────────────────────
 const cache = new Map();
 const CACHE_TTL_MS = 60 * 1000; // 60 seconds
@@ -178,8 +188,28 @@ async function _tryAlpaca(ticker) {
 }
 
 /**
+ * Try fetching a quote via AInvest (candles-based, stocks + ETFs).
+ * @returns {object|null} Normalized price data or null on failure.
+ */
+async function _tryAInvest(ticker) {
+  if (!ainvestClient || !ainvestClient.enabled) return null;
+
+  // AInvest only supports stocks/ETFs — skip crypto tickers
+  if (ticker.includes('-') || /^[A-Z]{3,5}USD$/.test(ticker)) return null;
+
+  try {
+    const quote = await ainvestClient.getQuote(ticker);
+    if (!quote || quote.price == null) return null;
+    return quote;
+  } catch (err) {
+    console.warn(`[PriceFetcher] AInvest failed for ${ticker}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Fetch current price data for a ticker.
- * Tries yahoo-finance2 → FMP → Alpaca → stale cache.
+ * Tries yahoo-finance2 → FMP → Alpaca → AInvest → stale cache.
  * @param {string} ticker — e.g. "TSLA", "AAPL", "BTC-USD", "ETH-USD"
  * @returns {{ ticker, price, changePercent, change, volume, marketCap, lastUpdated, source }} or { ticker, error, message }
  */
@@ -211,6 +241,11 @@ async function getCurrentPrice(ticker) {
   // Fallback to Alpaca (API key, stocks only, proven from Railway)
   if (!data) {
     data = await _tryAlpaca(upper);
+  }
+
+    // Fallback to AInvest (API key, candles-based, stocks + ETFs)
+  if (!data) {
+    data = await _tryAInvest(upper);
   }
 
   if (data) {
@@ -263,7 +298,7 @@ function formatForPrompt(prices) {
  * Check if any price source is available.
  */
 function isAvailable() {
-  return !!yahooFinance || !!(fmpClient && fmpClient.enabled) || !!(alpacaClient && alpacaClient.enabled);
+  return !!yahooFinance || !!(fmpClient && fmpClient.enabled) || !!(alpacaClient && alpacaClient.enabled) || !!(ainvestClient && ainvestClient.enabled);
 }
 
 module.exports = {

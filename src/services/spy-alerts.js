@@ -31,6 +31,14 @@ const { buildFast0DTEPrompt } = require('../trading/fast-0dte-prompt');
 const { ragEnforcementBlock, todayString } = require('../date-awareness');
 const log = require('../logger')('SPYAlerts');
 
+// AInvest — fundamentals, analyst ratings, earnings (optional)
+let ainvest;
+try {
+  ainvest = require('./ainvest');
+} catch {
+  ainvest = null;
+}
+
 // ── In-memory cache (SPY price + news) ──────────────────────────────────
 const alertCache = new Map();
 
@@ -391,6 +399,22 @@ async function fetchSPYPrice() {
     return formatted;
   } catch (err) {
     return `SPY price fetch failed: ${err.message}`;
+  }
+}
+
+async function fetchFundamentals(ticker = 'SPY') {
+  const cached = getCached(`fundamentals_${ticker}`);
+  if (cached) return cached;
+
+  if (!ainvest || !ainvest.enabled) return '';
+
+  try {
+    const ctx = await ainvest.getFundamentalContext(ticker);
+    if (ctx) setCache(`fundamentals_${ticker}`, ctx);
+    return ctx || '';
+  } catch (err) {
+    log.warn(`Fundamentals fetch failed for ${ticker}: ${err.message}`);
+    return '';
   }
 }
 
@@ -848,14 +872,20 @@ async function handleWebhookAlert(message) {
 
   // ── Step 2: Async processing ──
   try {
-    // Fetch price + news in parallel (both cached 60s)
-    const [priceData, newsData] = await Promise.all([
+    // Fetch price + news + fundamentals in parallel (all cached 60s)
+    const [priceData, newsData, fundamentals] = await Promise.all([
       fetchSPYPrice(),
       fetchSPYNews(),
+      fetchFundamentals(alert.ticker || 'SPY'),
     ]);
 
+    // Enrich news with fundamentals from AInvest if available
+    const enrichedNews = fundamentals
+      ? `${newsData}\n\n=== FUNDAMENTALS (AInvest) ===\n${fundamentals}`
+      : newsData;
+
     // Run fast Ollama analysis
-    const analysis = await runFastAnalysis(alert, priceData, newsData);
+    const analysis = await runFastAnalysis(alert, priceData, enrichedNews);
 
     // Generate chart URL (non-blocking, don't fail if chart fails)
     const chartUrl = await generateChartUrl().catch(() => null);
@@ -932,17 +962,23 @@ async function handleHttpAlert(channel, body) {
   // ── Step 1: Fetch data + AI analysis (before posting anything) ──
   let analysis, chartUrl, priceData;
   try {
-    // Fetch all data in parallel
-    const [price, news, chart] = await Promise.all([
+    // Fetch all data in parallel (including fundamentals from AInvest)
+    const [price, news, fundamentals, chart] = await Promise.all([
       fetchSPYPrice(),
       fetchSPYNews(),
+      fetchFundamentals(alert.ticker || 'SPY'),
       generateChartUrl().catch(() => null),
     ]);
     priceData = price;
     chartUrl = chart;
 
+    // Append fundamentals to news context if available
+    const enrichedNews = fundamentals
+      ? `${news}\n\n=== FUNDAMENTALS (AInvest) ===\n${fundamentals}`
+      : news;
+
     // Run AI analysis with all the data
-    analysis = await runFastAnalysis(alert, priceData, news);
+    analysis = await runFastAnalysis(alert, priceData, enrichedNews);
   } catch (err) {
     log.error(`HTTP alert analysis failed: ${err.message}`);
     // Post error embed so the alert isn't silently lost
