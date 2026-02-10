@@ -127,12 +127,30 @@ class AInvestService {
       try {
         const result = await mcp.callTool(mcpToolName, mcpArgs);
         if (result != null) {
-          // Debug: log the shape of MCP data so we can fix parsing
-          const preview = JSON.stringify(result).slice(0, 300);
-          console.log(`[AInvest] ${mcpToolName} via MCP OK (type=${typeof result}, isArray=${Array.isArray(result)}, keys=${typeof result === 'object' && !Array.isArray(result) ? Object.keys(result).join(',') : 'N/A'}) preview=${preview}`);
-          return result;
+          // Detect MCP error responses (404, 500, etc. returned as "data")
+          if (result.error || (result.status && result.status >= 400)) {
+            console.warn(`[AInvest] MCP ${mcpToolName} returned error: ${result.status || ''} ${result.error || ''} — falling back to REST`);
+            // Fall through to REST below
+          }
+          // Unwrap REST envelope: MCP returns the full {data, status_code, status_msg} wrapper
+          // that REST's _fetch() automatically strips. Unwrap it here for consistency.
+          else if (result.status_code !== undefined) {
+            if (result.status_code !== 0) {
+              console.warn(`[AInvest] MCP ${mcpToolName} API error ${result.status_code}: ${result.status_msg || ''} — falling back to REST`);
+              // Fall through to REST below
+            } else {
+              const unwrapped = result.data !== undefined ? result.data : result;
+              console.log(`[AInvest] ${mcpToolName} via MCP OK`);
+              return unwrapped;
+            }
+          } else {
+            // No envelope — return as-is (some tools may return raw data)
+            console.log(`[AInvest] ${mcpToolName} via MCP OK (raw)`);
+            return result;
+          }
+        } else {
+          console.warn(`[AInvest] MCP tool ${mcpToolName} returned null, falling back to REST`);
         }
-        console.warn(`[AInvest] MCP tool ${mcpToolName} returned null, falling back to REST`);
       } catch (err) {
         console.warn(`[AInvest] MCP tool ${mcpToolName} failed, falling back to REST: ${err.message}`);
       }
@@ -181,8 +199,17 @@ class AInvestService {
       restArgs,
     );
 
-    if (!Array.isArray(data)) return [];
-    return data.map(c => ({
+    // Candles endpoint nests the array: {data: [candles]} inside the envelope
+    // After envelope unwrapping, we may get {data: [...]} or directly [...]
+    let candles = data;
+    if (!Array.isArray(candles) && candles?.data && Array.isArray(candles.data)) {
+      candles = candles.data;
+    }
+    if (!Array.isArray(candles)) {
+      console.warn(`[AInvest] getCandles(${tkr}): unexpected data shape — ${typeof candles}, keys=${candles && typeof candles === 'object' ? Object.keys(candles).join(',') : 'N/A'}`);
+      return [];
+    }
+    return candles.map(c => ({
       open: c.open ?? c.o,
       high: c.high ?? c.h,
       low: c.low ?? c.l,
@@ -235,7 +262,11 @@ class AInvestService {
       'get-marketdata-trades', { ticker: tkr, count, to: now },
       '/marketdata/trades', { ticker: tkr, count, to: now },
     );
-    return Array.isArray(data) ? data : (data?.list || []);
+    let payload = data;
+    if (!Array.isArray(payload) && !payload?.list && payload?.data) {
+      payload = payload.data;
+    }
+    return Array.isArray(payload) ? payload : (payload?.list || []);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -264,7 +295,15 @@ class AInvestService {
       '/news/v1/wire/page/history', restParams,
     );
 
-    const articles = Array.isArray(data) ? data : (data?.list || []);
+    // Unwrap nested data: some endpoints return {data: [...]} inside the payload
+    let payload = data;
+    if (!Array.isArray(payload) && !payload?.list && payload?.data) {
+      payload = payload.data;
+    }
+    const articles = Array.isArray(payload) ? payload : (payload?.list || []);
+    if (articles.length === 0) {
+      console.warn(`[AInvest] getNews: 0 articles — data shape: ${typeof data}, keys=${data && typeof data === 'object' ? Object.keys(data).join(',') : 'N/A'}`);
+    }
     return articles.slice(0, limit).map(a => ({
       title: a.title || a.headline || '',
       summary: (a.summary || a.description || '').slice(0, 500),
@@ -318,10 +357,16 @@ class AInvestService {
 
     if (!data) return null;
 
+    // Unwrap nested data if present
+    let payload = data;
+    if (!payload.analysts_ratings && !payload.buy && payload.data) {
+      payload = payload.data;
+    }
+
     // REST response is nested: { analysts_ratings: {...}, target_price: {...} }
     // MCP may return flat or nested — handle both
-    const ratings = data.analysts_ratings || data;
-    const targets = data.target_price || data;
+    const ratings = payload.analysts_ratings || payload;
+    const targets = payload.target_price || payload;
 
     return {
       buy: ratings.buy || 0,
@@ -347,7 +392,11 @@ class AInvestService {
       '/analysis-ratings/history', { ticker: tkr },
     );
 
-    const list = Array.isArray(data) ? data : (data?.list || []);
+    let payload = data;
+    if (!Array.isArray(payload) && !payload?.list && payload?.data) {
+      payload = payload.data;
+    }
+    const list = Array.isArray(payload) ? payload : (payload?.list || []);
     return list.slice(0, limit).map(r => ({
       date: r.date || r.published_at || '',
       firm: r.firm || r.analyst_firm || '',
@@ -475,7 +524,11 @@ class AInvestService {
       'get-ownership-insider', { ticker: tkr },
       '/ownership/insider', { ticker: tkr },
     );
-    return Array.isArray(data) ? data : (data?.list || []);
+    let payload = data;
+    if (!Array.isArray(payload) && !payload?.list && payload?.data) {
+      payload = payload.data;
+    }
+    return Array.isArray(payload) ? payload : (payload?.list || []);
   }
 
   /**
@@ -487,7 +540,11 @@ class AInvestService {
       'get-ownership-congress', { ticker: tkr },
       '/ownership/congress', { ticker: tkr },
     );
-    return Array.isArray(data) ? data : (data?.list || []);
+    let payload = data;
+    if (!Array.isArray(payload) && !payload?.list && payload?.data) {
+      payload = payload.data;
+    }
+    return Array.isArray(payload) ? payload : (payload?.list || []);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
