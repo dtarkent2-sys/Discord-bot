@@ -12,6 +12,14 @@
 
 const config = require('../config');
 
+// Alpaca news as final fallback for market-related queries
+let alpacaClient;
+try {
+  alpacaClient = require('../services/alpaca');
+} catch {
+  alpacaClient = null;
+}
+
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const cache = new Map();
 
@@ -171,6 +179,47 @@ async function tryDuckDuckGo(query, num) {
   }
 }
 
+/**
+ * Fallback: Search via Alpaca News API.
+ * Only useful for market/finance queries, but very reliable from Railway.
+ * @returns {{ ok: true, data: object } | { ok: false, error: string }}
+ */
+async function tryAlpacaNews(query, num) {
+  if (!alpacaClient || !alpacaClient.enabled) {
+    return { ok: false, error: 'Alpaca not configured' };
+  }
+
+  try {
+    // Extract potential ticker symbols from the query for targeted news
+    const tickerMatch = query.match(/\b[A-Z]{1,5}\b/g) || [];
+    const symbols = tickerMatch.filter(t => !['THE', 'FOR', 'AND', 'NOT', 'YOU', 'ALL', 'CAN', 'ARE',
+      'HAS', 'HOW', 'NOW', 'NEW', 'WAS', 'WHO', 'DID', 'GET', 'SAY', 'TOO', 'TOP',
+      'WHAT', 'WITH', 'THAT', 'THIS', 'WILL', 'FROM', 'HAVE', 'MANY', 'SOME',
+      'BUY', 'SELL', 'HOLD', 'IPO', 'ETF', 'GDP', 'FED', 'SEC', 'DOW', 'TODAY'].includes(t));
+
+    const articles = await alpacaClient.getNews({
+      symbols: symbols.slice(0, 3),
+      limit: Math.min(num, 10),
+    });
+
+    if (!articles || articles.length === 0) {
+      return { ok: false, error: 'Alpaca News returned no articles' };
+    }
+
+    const results = articles.slice(0, num).map((article, i) => ({
+      title: article.headline || article.title || '',
+      link: article.url || '',
+      snippet: (article.summary || '').slice(0, 300),
+      engine: 'alpaca-news',
+      position: i + 1,
+    }));
+
+    return { ok: true, data: { results, infobox: null } };
+  } catch (err) {
+    return { ok: false, error: `Alpaca News: ${err.message}` };
+  }
+}
+
 /** Decode basic HTML entities. */
 function _decodeHtml(text) {
   return text
@@ -256,8 +305,29 @@ async function webSearch(query, numResults = 3) {
   }
 
   errors.push(ddgAttempt.error);
+
+  // Last resort: Alpaca News (only covers market/finance, but reliable from Railway)
+  console.log(`[WebSearch] DuckDuckGo failed too, trying Alpaca News...`);
+  const alpacaAttempt = await tryAlpacaNews(query, num);
+
+  if (alpacaAttempt.ok) {
+    const result = {
+      ...alpacaAttempt.data,
+      query: query.trim(),
+      resultCount: alpacaAttempt.data.results.length,
+      timestamp: new Date().toISOString(),
+      instance: 'alpaca-news',
+    };
+
+    cache.set(cacheKey, { data: result, timestamp: Date.now() });
+    _pruneCache();
+    console.log(`[WebSearch] Alpaca News returned ${result.resultCount} articles for "${query}"`);
+    return result;
+  }
+
+  errors.push(alpacaAttempt.error);
   console.error(`[WebSearch] ALL search sources failed for "${query}": ${errors.join(' | ')}`);
-  return { error: `All search sources failed. Errors: ${errors.slice(-2).join('; ')}`, query };
+  return { error: `All search sources failed. Errors: ${errors.slice(-3).join('; ')}`, query };
 }
 
 function _pruneCache() {

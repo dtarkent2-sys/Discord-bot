@@ -31,7 +31,8 @@ class AIService {
     }
 
     // Log data source availability at startup
-    console.log(`[AI] Data sources: yahoo-finance2=${priceFetcher.isAvailable() ? 'YES' : 'NO'}, FMP=${config.fmpApiKey ? 'YES (key set)' : 'NO (no key)'}, SearXNG=${config.searxngUrl || 'fallbacks only'}, DuckDuckGo=YES (always available)`);
+    console.log(`[AI] Price sources: yahoo-finance2=${priceFetcher.isAvailable() ? 'YES' : 'NO'}, FMP=${config.fmpApiKey ? 'YES' : 'NO'}, Alpaca=${config.alpacaApiKey ? 'YES' : 'NO'}`);
+    console.log(`[AI] Search sources: SearXNG=${config.searxngUrl || 'fallbacks only'}, DuckDuckGo=YES, AlpacaNews=${config.alpacaApiKey ? 'YES' : 'NO'}`);
 
   }
 

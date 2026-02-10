@@ -4,7 +4,8 @@
  * Source priority:
  *   1. yahoo-finance2 (free, no API key)
  *   2. FMP — Financial Modeling Prep (needs FMP_API_KEY, very reliable)
- *   3. Stale cache (better than nothing)
+ *   3. Alpaca — real-time IEX data (needs ALPACA_API_KEY, stocks only)
+ *   4. Stale cache (better than nothing)
  *
  * Features:
  * - In-memory cache (60s TTL) to avoid redundant lookups
@@ -21,7 +22,7 @@ try {
   console.warn(`[PriceFetcher] yahoo-finance2 failed to load: ${err.message}`);
 }
 
-// FMP client (already exists in the codebase — uses API key)
+// FMP client (uses FMP_API_KEY)
 let fmpClient;
 try {
   fmpClient = require('../services/yahoo');
@@ -29,6 +30,16 @@ try {
 } catch (err) {
   fmpClient = null;
   console.warn(`[PriceFetcher] FMP client failed to load: ${err.message}`);
+}
+
+// Alpaca client (uses ALPACA_API_KEY + ALPACA_API_SECRET, stocks only)
+let alpacaClient;
+try {
+  alpacaClient = require('../services/alpaca');
+  console.log(`[PriceFetcher] Alpaca client loaded OK (enabled=${alpacaClient.enabled})`);
+} catch (err) {
+  alpacaClient = null;
+  console.warn(`[PriceFetcher] Alpaca client failed to load: ${err.message}`);
 }
 
 // ── Cache: ticker → { data, fetchedAt } ────────────────────────────────
@@ -130,8 +141,45 @@ async function _tryFMP(ticker) {
 }
 
 /**
+ * Try fetching a quote via Alpaca (stocks only, not crypto).
+ * Uses the /v2/stocks/{ticker}/snapshot endpoint.
+ * @returns {object|null} Normalized price data or null on failure.
+ */
+async function _tryAlpaca(ticker) {
+  if (!alpacaClient || !alpacaClient.enabled) return null;
+
+  // Alpaca only supports stocks — skip crypto tickers
+  if (ticker.includes('-') || /^[A-Z]{3,5}USD$/.test(ticker)) return null;
+
+  try {
+    const snap = await alpacaClient.getSnapshot(ticker);
+    if (!snap || snap.price == null) return null;
+
+    return {
+      ticker,
+      symbol: snap.ticker,
+      price: snap.price,
+      change: snap.change ?? null,
+      changePercent: snap.changePercent ?? null,
+      volume: snap.volume ?? null,
+      marketCap: null, // Alpaca snapshots don't include market cap
+      dayHigh: snap.high ?? null,
+      dayLow: snap.low ?? null,
+      previousClose: snap.prevClose ?? null,
+      fiftyTwoWeekHigh: null,
+      fiftyTwoWeekLow: null,
+      lastUpdated: new Date().toISOString(),
+      source: 'alpaca',
+    };
+  } catch (err) {
+    console.warn(`[PriceFetcher] Alpaca failed for ${ticker}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Fetch current price data for a ticker.
- * Tries yahoo-finance2 first, then FMP, then stale cache.
+ * Tries yahoo-finance2 → FMP → Alpaca → stale cache.
  * @param {string} ticker — e.g. "TSLA", "AAPL", "BTC-USD", "ETH-USD"
  * @returns {{ ticker, price, changePercent, change, volume, marketCap, lastUpdated, source }} or { ticker, error, message }
  */
@@ -155,9 +203,14 @@ async function getCurrentPrice(ticker) {
   // Try yahoo-finance2 first (free, no key)
   let data = await _tryYahoo(upper);
 
-  // Fallback to FMP (API key, more reliable from servers)
+  // Fallback to FMP (API key, reliable from servers)
   if (!data) {
     data = await _tryFMP(upper);
+  }
+
+  // Fallback to Alpaca (API key, stocks only, proven from Railway)
+  if (!data) {
+    data = await _tryAlpaca(upper);
   }
 
   if (data) {
@@ -173,7 +226,7 @@ async function getCurrentPrice(ticker) {
   }
 
   console.error(`[PriceFetcher] All sources failed for ${upper}, no cache available`);
-  return { ticker: upper, error: true, message: `No price data for ${upper} (yahoo-finance2 and FMP both failed)` };
+  return { ticker: upper, error: true, message: `No price data for ${upper} (all sources failed)` };
 }
 
 /**
@@ -207,10 +260,10 @@ function formatForPrompt(prices) {
 }
 
 /**
- * Check if any price source is available (yahoo-finance2 OR FMP).
+ * Check if any price source is available.
  */
 function isAvailable() {
-  return !!yahooFinance || !!(fmpClient && fmpClient.enabled);
+  return !!yahooFinance || !!(fmpClient && fmpClient.enabled) || !!(alpacaClient && alpacaClient.enabled);
 }
 
 module.exports = {
