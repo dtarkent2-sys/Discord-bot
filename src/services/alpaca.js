@@ -69,7 +69,7 @@ class AlpacaService {
    */
   async getSnapshot(ticker) {
     const upper = ticker.toUpperCase();
-    const data = await this._fetch(`/v2/stocks/${upper}/snapshot`);
+    const data = await this._fetch(`/v2/stocks/${upper}/snapshot`, { feed: config.alpacaFeed });
 
     const quote = data.latestQuote || {};
     const trade = data.latestTrade || {};
@@ -103,7 +103,7 @@ class AlpacaService {
 
   async getSnapshots(tickers) {
     const symbols = tickers.map(t => t.toUpperCase()).join(',');
-    const data = await this._fetch('/v2/stocks/snapshots', { symbols });
+    const data = await this._fetch('/v2/stocks/snapshots', { symbols, feed: config.alpacaFeed });
 
     return Object.entries(data).map(([sym, snap]) => {
       const trade = snap.latestTrade || {};
@@ -300,7 +300,7 @@ class AlpacaService {
 
   async getLatestTrade(ticker) {
     const upper = ticker.toUpperCase();
-    const data = await this._fetch(`/v2/stocks/${upper}/trades/latest`);
+    const data = await this._fetch(`/v2/stocks/${upper}/trades/latest`, { feed: config.alpacaFeed });
     return {
       price: data.trade?.p,
       size: data.trade?.s,
