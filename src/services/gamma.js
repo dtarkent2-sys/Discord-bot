@@ -39,6 +39,7 @@ if (!process.env.FONTCONFIG_PATH) {
 
 const config = require('../config');
 const alpaca = require('./alpaca');
+const priceFetcher = require('../tools/price-fetcher');
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
@@ -707,11 +708,19 @@ class GammaService {
 
         const [options, snapshot] = await Promise.all([
           alpaca.getOptionsSnapshots(upper, targetExp),
-          alpaca.getSnapshot(upper),
+          alpaca.getSnapshot(upper).catch(() => ({})),
         ]);
 
-        if (options.length > 0 && snapshot.price) {
-          const spotPrice = snapshot.price;
+        // Get spot price from snapshot, or fall back to price fetcher
+        let alpacaSpot = snapshot.price;
+        if (!alpacaSpot && options.length > 0) {
+          console.log(`[Gamma] Alpaca snapshot missing price for ${upper}, trying price fetcher...`);
+          const pf = await priceFetcher.getCurrentPrice(upper);
+          if (!pf.error) alpacaSpot = pf.price;
+        }
+
+        if (options.length > 0 && alpacaSpot) {
+          const spotPrice = alpacaSpot;
           // Use the actual expiration from returned data (may differ slightly)
           const expiration = this._pickAlpacaExpiration(options) || targetExp;
 
@@ -735,7 +744,9 @@ class GammaService {
 
     let spotPrice = yahooSpot;
     if (!spotPrice) {
-      spotPrice = await this._fmpSpotPrice(upper);
+      // Try all price sources (FMP, Alpaca, yahoo-finance2)
+      const pf = await priceFetcher.getCurrentPrice(upper);
+      if (!pf.error) spotPrice = pf.price;
     }
     if (!spotPrice) throw new Error(`Could not determine spot price for ${upper}`);
 
