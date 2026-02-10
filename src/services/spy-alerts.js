@@ -170,9 +170,16 @@ function parseAlert(content) {
       const reason = _firstOf(flat,
         'reason', 'message', 'note', 'comment', 'description', 'alert_message'
       );
+      const confidence = _firstOf(flat, 'confidence', 'conviction') || null;
+
+      // Map signal words to standard actions (PUMP→BUY, TANK→SELL, etc.)
+      let normalizedAction = action ? action.toUpperCase() : 'ALERT';
+      if (/pump|bullish/i.test(normalizedAction)) normalizedAction = 'BUY';
+      else if (/tank|bearish/i.test(normalizedAction)) normalizedAction = 'SELL';
+      else if (/take.?profit|tp/i.test(normalizedAction)) normalizedAction = 'TAKE_PROFIT';
 
       return {
-        action: action ? action.toUpperCase() : 'ALERT',
+        action: normalizedAction,
         ticker: ticker ? ticker.toUpperCase() : 'SPY',
         type: type || 'SPY 0DTE',
         price,
@@ -182,9 +189,9 @@ function parseAlert(content) {
         low: _firstNum(flat, 'low') ?? null,
         volume: _firstNum(flat, 'volume') ?? null,
         interval: _firstOf(flat, 'interval', 'timeframe', 'resolution') || null,
-        confidence: null,
+        confidence: confidence ? confidence.toUpperCase() : null,
         time: _firstOf(flat, 'time', 'timestamp', 'timenow') || null,
-        reason: reason || '',
+        reason: reason || action || '',
         raw: rawStr,
         extra: json, // keep full original for the AI prompt
       };
