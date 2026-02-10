@@ -21,8 +21,13 @@ const policy = require('../services/policy');
 const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
+const { instrumentInteraction } = require('../utils/safe-send');
 
 async function handleCommand(interaction) {
+  // Instrument all outbound interaction methods (reply, editReply, followUp, deferReply)
+  // with diagnostic logging so we can trace send failures.
+  instrumentInteraction(interaction);
+
   const { commandName } = interaction;
   stats.recordCommand();
 

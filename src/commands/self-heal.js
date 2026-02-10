@@ -1,6 +1,7 @@
 const config = require('../config');
 const aicoder = require('../ai-coder.js');
 const github = require('../github-client.js');
+const { instrumentMessage } = require('../utils/safe-send');
 
 // Cooldown: prevent selfheal recursion. Max 1 selfheal per file per 30 minutes.
 const SELFHEAL_COOLDOWN_MS = 30 * 60 * 1000;
@@ -10,6 +11,9 @@ module.exports = {
     name: 'selfheal',
     description: 'Bot automatically finds and fixes bugs in a file. Usage: !selfheal <file_path>',
     async execute(message, args) {
+        // Instrument all outbound sends/replies for diagnostics
+        instrumentMessage(message);
+
         // 1. Owner check
         if (!config.botOwnerId || message.author.id !== config.botOwnerId) {
             return message.reply('Restricted to owner.');

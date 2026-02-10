@@ -31,6 +31,7 @@ const { registerCommands } = require('./src/commands/register');
 const AutonomousBehaviorEngine = require('./src/services/autonomous');
 const { handlePrefixCommand } = require('./src/commands/prefix');
 const stream = require('./src/services/stream');
+const { instrumentMessage } = require('./src/utils/safe-send');
 
 // SPY 0DTE alert handler — loaded defensively so a failure here never crashes the bot
 let spyAlerts = null;
@@ -66,6 +67,11 @@ const client = new Client({
     GatewayIntentBits.DirectMessageReactions,
   ],
   partials: [Partials.Message, Partials.Reaction, Partials.Channel],
+});
+
+// ── Global Discord client error handler ──────────────────────────────
+client.on('error', (err) => {
+  console.error('[Discord Client Error]', err);
 });
 
 // Track recent bot replies so we can link reactions to original messages
@@ -133,6 +139,9 @@ client.on(Events.MessageCreate, async (message) => {
   // Ignore bots and system messages
   if (message.author.bot) return;
   if (!message.content && message.attachments.size === 0) return;
+
+  // Instrument all outbound sends/replies on this message for diagnostics
+  instrumentMessage(message);
 
   // Check for prefix commands (!update, !suggest, !autoedit) first
   if (message.content.startsWith(config.botPrefix)) {
