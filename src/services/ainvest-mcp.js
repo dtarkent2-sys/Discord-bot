@@ -78,15 +78,22 @@ class AInvestMCP {
       throw new Error(`MCP ${res.status}: ${text.slice(0, 300)}`);
     }
 
+    // Handle empty responses (e.g. 202 Accepted for notifications)
     const ct = res.headers.get('content-type') || '';
+    const text = await res.text();
+    if (!text || !text.trim()) return null;
 
     // Handle SSE responses (server may stream)
     if (ct.includes('text/event-stream')) {
-      return this._parseSSE(await res.text());
+      return this._parseSSE(text);
     }
 
     // Standard JSON response
-    return res.json();
+    try {
+      return JSON.parse(text);
+    } catch (err) {
+      throw new Error(`MCP JSON parse error: ${err.message} (body: ${text.slice(0, 200)})`);
+    }
   }
 
   /** Parse SSE text and extract JSON-RPC messages */
@@ -110,6 +117,8 @@ class AInvestMCP {
         messages.push(JSON.parse(currentData));
       } catch { /* skip */ }
     }
+
+    if (messages.length === 0) return null;
 
     // Return the last JSON-RPC response (skip notifications)
     const responses = messages.filter(m => m.id !== undefined);
@@ -146,10 +155,16 @@ class AInvestMCP {
         throw new Error(`MCP init error: ${JSON.stringify(initResp.error)}`);
       }
 
-      console.log(`[AInvest MCP] Initialized — server: ${initResp?.result?.serverInfo?.name || 'unknown'}`);
+      const serverName = initResp?.result?.serverInfo?.name || 'unknown';
+      const serverVersion = initResp?.result?.serverInfo?.version || '';
+      console.log(`[AInvest MCP] Initialized — server: ${serverName} ${serverVersion}`.trim());
 
-      // Step 2: Send initialized notification
-      await this._post(this._makeNotification('notifications/initialized'));
+      // Step 2: Send initialized notification (response may be empty — that's fine)
+      try {
+        await this._post(this._makeNotification('notifications/initialized'));
+      } catch {
+        // Notifications don't require responses — ignore errors
+      }
 
       // Step 3: Discover tools
       const toolsResp = await this._post(this._makeRequest('tools/list'));

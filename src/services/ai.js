@@ -30,9 +30,9 @@ class AIService {
       console.log(`[AI] Kimi agent mode ENABLED (${config.kimiBaseUrl}, model: ${config.kimiModel})`);
     }
 
-    // Log data source availability at startup
-    console.log(`[AI] Price sources: yahoo-finance2=${priceFetcher.isAvailable() ? 'YES' : 'NO'}, FMP=${config.fmpApiKey ? 'YES' : 'NO'}, Alpaca=${config.alpacaApiKey ? 'YES' : 'NO'}`);
-    console.log(`[AI] Search sources: SearXNG=${config.searxngUrl || 'fallbacks only'}, DuckDuckGo=YES, AlpacaNews=${config.alpacaApiKey ? 'YES' : 'NO'}`);
+    // Log data source availability at startup (priority order)
+    console.log(`[AI] Price sources (priority order): AInvest=${config.ainvestApiKey ? 'YES' : 'NO'}, FMP=${config.fmpApiKey ? 'YES' : 'NO'}, Alpaca=${config.alpacaApiKey ? 'YES' : 'NO'}, yahoo-finance2=${priceFetcher.isAvailable() ? 'YES' : 'NO'}`);
+    console.log(`[AI] Search sources (priority order): AInvest=${config.ainvestApiKey ? 'YES' : 'NO'}, SearXNG=${config.searxngUrl || 'fallbacks only'}, DuckDuckGo=YES, AlpacaNews=${config.alpacaApiKey ? 'YES' : 'NO'}`);
 
   }
 
