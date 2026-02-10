@@ -188,7 +188,7 @@ function parseAlert(content) {
         high: _firstNum(flat, 'high') ?? null,
         low: _firstNum(flat, 'low') ?? null,
         volume: _firstNum(flat, 'volume') ?? null,
-        interval: _firstOf(flat, 'interval', 'timeframe', 'resolution') || null,
+        interval: _normalizeInterval(_firstOf(flat, 'interval', 'timeframe', 'resolution')),
         confidence: confidence ? confidence.toUpperCase() : null,
         time: _firstOf(flat, 'time', 'timestamp', 'timenow') || null,
         reason: reason || action || '',
@@ -322,6 +322,13 @@ function _flattenObject(obj, prefix = '', result = {}) {
     }
   }
   return result;
+}
+
+/** Normalize interval: TradingView {{interval}} returns "1", "5", "15" — append "m" if bare number. */
+function _normalizeInterval(val) {
+  if (!val) return null;
+  const s = String(val).trim();
+  return /^\d+$/.test(s) ? `${s}m` : s;
 }
 
 /** Return the first non-empty string value found for any of the given keys. */
