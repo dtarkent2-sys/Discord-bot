@@ -183,12 +183,18 @@ client.on(Events.MessageCreate, async (message) => {
     await message.channel.sendTyping();
 
     // Get AI response
-    const response = await ai.chat(
+    let response = await ai.chat(
       message.author.id,
       message.author.username,
       content,
       { sentiment: sentimentResult, imageDescription }
     );
+
+    // Guard against empty responses (Discord rejects empty messages)
+    if (!response || !response.trim()) {
+      console.warn('[Bot] AI returned empty response, sending fallback');
+      response = "Hmm, I blanked out for a second. What's up?";
+    }
 
     // Send reply and track for reaction learning
     const reply = await message.reply(response);
