@@ -29,6 +29,10 @@ class AIService {
     if (this.kimiEnabled) {
       console.log(`[AI] Kimi agent mode ENABLED (${config.kimiBaseUrl}, model: ${config.kimiModel})`);
     }
+
+    // Log data source availability at startup
+    console.log(`[AI] Data sources: yahoo-finance2=${priceFetcher.isAvailable() ? 'YES' : 'NO'}, FMP=${config.fmpApiKey ? 'YES (key set)' : 'NO (no key)'}, SearXNG=${config.searxngUrl || 'fallbacks only'}, DuckDuckGo=YES (always available)`);
+
   }
 
   async initialize() {
@@ -307,7 +311,7 @@ ${mood.buildMoodContext()}
     const tickers = this._extractTickers(userMessage);
     if (tickers.length > 0) {
       if (!priceFetcher.isAvailable()) {
-        console.warn(`[AI] yahoo-finance2 not available — cannot fetch prices for: ${tickers.join(', ')}`);
+        console.warn(`[AI] No price sources available (yahoo-finance2 + FMP both unavailable) — cannot fetch: ${tickers.join(', ')}`);
       } else {
         try {
           const prices = await priceFetcher.getMultiplePrices(tickers);
@@ -327,18 +331,21 @@ ${mood.buildMoodContext()}
     }
 
     // ── Auto-search for real-time questions ──
-    // Skip when Kimi agent mode handles search natively
+    // Skip when Kimi agent mode handles search natively.
+    // Also search when tickers were found but prices failed (belt-and-suspenders).
     let searchResults = null;
-    if (!this.kimiEnabled && !liveData && this._needsWebSearch(userMessage)) {
+    const needsSearch = this._needsWebSearch(userMessage);
+    const pricesFailed = tickers.length > 0 && !livePrices;
+    if (!this.kimiEnabled && !liveData && (needsSearch || pricesFailed)) {
       try {
         const query = this._buildSearchQuery(userMessage);
-        console.log(`[AI] Auto-searching: "${query}"`);
+        console.log(`[AI] Auto-searching: "${query}" (trigger: ${needsSearch ? 'heuristic' : 'price-fallback'})`);
         const result = await webSearch(query, 3);
         if (result.error) {
           console.warn(`[AI] Web search error: ${result.error}`);
         } else if (result.results && result.results.length > 0) {
           searchResults = formatResultsForAI(result);
-          console.log(`[AI] Search returned ${result.results.length} results${result.instance ? ` via ${result.instance}` : ''}`);
+          console.log(`[AI] Search returned ${result.results.length} results via ${result.instance || 'unknown'}`);
         } else {
           console.warn('[AI] Web search returned zero results');
         }

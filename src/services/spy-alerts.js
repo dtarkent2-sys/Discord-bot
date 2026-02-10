@@ -154,7 +154,7 @@ async function fetchSPYPrice() {
   const cached = getCached('spy_price');
   if (cached) return cached;
 
-  if (!priceFetcher.isAvailable()) return 'SPY price data unavailable (yahoo-finance2 not loaded)';
+  if (!priceFetcher.isAvailable()) return 'SPY price data unavailable (no price sources loaded)';
 
   try {
     const data = await priceFetcher.getCurrentPrice('SPY');
@@ -171,8 +171,7 @@ async function fetchSPYNews() {
   const cached = getCached('spy_news');
   if (cached) return cached;
 
-  if (!config.searxngUrl) return 'News unavailable (SearXNG not configured)';
-
+  // No gatekeeper — webSearch() has its own fallbacks (SearXNG + DuckDuckGo)
   try {
     const result = await webSearch('SPY S&P 500 market news today', 3);
     if (result.error) return `News unavailable: ${result.error}`;
