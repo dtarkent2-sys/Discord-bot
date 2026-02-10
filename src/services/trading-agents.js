@@ -700,10 +700,17 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
         let result = '';
         for await (const part of stream) {
           if (controller.signal.aborted) break;
-          result += part.message.content;
+          const content = part.message?.content;
+          if (content) result += content;
         }
 
         clearTimeout(timeout);
+
+        // Strip thinking tags (qwen3, deepseek, etc. wrap responses in <think> blocks)
+        result = result
+          .replace(/<think>[\s\S]*?<\/think>/gi, '')
+          .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
+          .trim();
 
         // Validate response quality
         if (!result || result.trim().length < 30) {
