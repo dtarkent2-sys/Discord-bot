@@ -2,10 +2,11 @@
  * Real-time price fetcher with multi-source fallback.
  *
  * Source priority:
- *   1. yahoo-finance2 (free, no API key)
+ *   1. AInvest — candle-based quotes (needs AINVEST_API_KEY, MCP + REST)
  *   2. FMP — Financial Modeling Prep (needs FMP_API_KEY, very reliable)
  *   3. Alpaca — real-time IEX data (needs ALPACA_API_KEY, stocks only)
- *   4. Stale cache (better than nothing)
+ *   4. yahoo-finance2 (free, no API key, unreliable from datacenter)
+ *   5. Stale cache (better than nothing)
  *
  * Features:
  * - In-memory cache (60s TTL) to avoid redundant lookups
@@ -52,6 +53,16 @@ try {
 } catch (err) {
   alpacaClient = null;
   console.warn(`[PriceFetcher] Alpaca client failed to load: ${err.message}`);
+}
+
+// AInvest client (uses AINVEST_API_KEY, candles-based quotes)
+let ainvestClient;
+try {
+  ainvestClient = require('../services/ainvest');
+  console.log(`[PriceFetcher] AInvest client loaded OK (enabled=${ainvestClient.enabled})`);
+} catch (err) {
+  ainvestClient = null;
+  console.warn(`[PriceFetcher] AInvest client failed to load: ${err.message}`);
 }
 
 // ── Cache: ticker → { data, fetchedAt } ────────────────────────────────
@@ -191,8 +202,28 @@ async function _tryAlpaca(ticker) {
 }
 
 /**
+ * Try fetching a quote via AInvest (candles-based, stocks + ETFs).
+ * @returns {object|null} Normalized price data or null on failure.
+ */
+async function _tryAInvest(ticker) {
+  if (!ainvestClient || !ainvestClient.enabled) return null;
+
+  // AInvest only supports stocks/ETFs — skip crypto tickers
+  if (ticker.includes('-') || /^[A-Z]{3,5}USD$/.test(ticker)) return null;
+
+  try {
+    const quote = await ainvestClient.getQuote(ticker);
+    if (!quote || quote.price == null) return null;
+    return quote;
+  } catch (err) {
+    console.warn(`[PriceFetcher] AInvest failed for ${ticker}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Fetch current price data for a ticker.
- * Tries yahoo-finance2 → FMP → Alpaca → stale cache.
+ * Priority: AInvest → FMP → Alpaca → yahoo-finance2 → stale cache.
  * @param {string} ticker — e.g. "TSLA", "AAPL", "BTC-USD", "ETH-USD"
  * @returns {{ ticker, price, changePercent, change, volume, marketCap, lastUpdated, source }} or { ticker, error, message }
  */
@@ -213,8 +244,8 @@ async function getCurrentPrice(ticker) {
 
   recordCall();
 
-  // Try yahoo-finance2 first (free, no key)
-  let data = await _tryYahoo(upper);
+  // PRIORITY: AInvest (paid API, most reliable, best data)
+  let data = await _tryAInvest(upper);
 
   // Fallback to FMP (API key, reliable from servers)
   if (!data) {
@@ -224,6 +255,11 @@ async function getCurrentPrice(ticker) {
   // Fallback to Alpaca (API key, stocks only, proven from Railway)
   if (!data) {
     data = await _tryAlpaca(upper);
+  }
+
+  // Fallback to yahoo-finance2 (free, no key, unreliable from datacenter)
+  if (!data) {
+    data = await _tryYahoo(upper);
   }
 
   if (data) {
@@ -276,7 +312,7 @@ function formatForPrompt(prices) {
  * Check if any price source is available.
  */
 function isAvailable() {
-  return !!yahooFinance || !!(fmpClient && fmpClient.enabled) || !!(alpacaClient && alpacaClient.enabled);
+  return !!yahooFinance || !!(fmpClient && fmpClient.enabled) || !!(alpacaClient && alpacaClient.enabled) || !!(ainvestClient && ainvestClient.enabled);
 }
 
 module.exports = {

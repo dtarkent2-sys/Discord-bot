@@ -40,6 +40,19 @@ try {
   console.warn('[Bot] SPY alerts module failed to load (non-critical):', err.message);
 }
 
+// AInvest — priority data source (MCP + REST). Init MCP in background.
+let ainvest = null;
+try {
+  ainvest = require('./src/services/ainvest');
+  if (ainvest.enabled) {
+    ainvest.initMCP().catch(err => {
+      console.warn('[Bot] AInvest MCP init failed (REST fallback active):', err.message);
+    });
+  }
+} catch (err) {
+  console.warn('[Bot] AInvest module failed to load (non-critical):', err.message);
+}
+
 log.info('Health server started, all modules loaded');
 
 // ── Discord Client Setup ─────────────────────────────────────────────
