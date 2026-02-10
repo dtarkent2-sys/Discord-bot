@@ -14,13 +14,25 @@
  * - Automatic fallback through multiple data sources
  */
 
+// yahoo-finance2 v2.x is ESM-only; use dynamic import() instead of require()
 let yahooFinance;
-try {
-  yahooFinance = require('yahoo-finance2').default;
-  console.log('[PriceFetcher] yahoo-finance2 loaded OK');
-} catch (err) {
-  yahooFinance = null;
-  console.warn(`[PriceFetcher] yahoo-finance2 failed to load: ${err.message}`);
+let yahooFinanceLoaded = false;
+async function loadYahooFinance() {
+  if (yahooFinanceLoaded) return yahooFinance;
+  yahooFinanceLoaded = true;
+  try {
+    const mod = await import('yahoo-finance2');
+    // ESM dynamic import can double-wrap: mod.default.default vs mod.default
+    const candidate = mod.default || mod;
+    yahooFinance = (typeof candidate.quote === 'function') ? candidate
+                 : (candidate.default && typeof candidate.default.quote === 'function') ? candidate.default
+                 : candidate;
+    console.log('[PriceFetcher] yahoo-finance2 loaded OK');
+  } catch (err) {
+    yahooFinance = null;
+    console.warn(`[PriceFetcher] yahoo-finance2 failed to load: ${err.message}`);
+  }
+  return yahooFinance;
 }
 
 // FMP client (uses FMP_API_KEY)
@@ -78,6 +90,7 @@ function recordCall() {
  * @returns {object|null} Normalized price data or null on failure.
  */
 async function _tryYahoo(ticker) {
+  await loadYahooFinance();
   if (!yahooFinance) return null;
 
   let symbol = ticker;
