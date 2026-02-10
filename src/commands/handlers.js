@@ -648,6 +648,7 @@ async function handleGEX(interaction) {
 
   const rawTicker = interaction.options.getString('ticker');
   const ticker = yahoo.sanitizeTicker(rawTicker);
+  const expirationPref = interaction.options.getString('expiration') || '0dte';
   if (!ticker) {
     return interaction.editReply('Invalid ticker symbol. Use 1-12 alphanumeric characters (e.g. SPY, AAPL).');
   }
@@ -657,9 +658,10 @@ async function handleGEX(interaction) {
   }
 
   try {
-    await interaction.editReply(`**${ticker} — Gamma Exposure**\n⏳ Fetching options chain & calculating GEX...`);
+    const expLabel = expirationPref === '0dte' ? '0DTE' : expirationPref === 'weekly' ? 'Weekly' : 'Monthly OPEX';
+    await interaction.editReply(`**${ticker} — Gamma Exposure (${expLabel})**\n⏳ Fetching options chain & calculating GEX...`);
 
-    const result = await gamma.analyze(ticker);
+    const result = await gamma.analyze(ticker, expirationPref);
 
     // Build the text summary
     const summary = gamma.formatForDiscord(result);
