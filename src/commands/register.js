@@ -146,6 +146,16 @@ const commands = [
       opt.setName('ticker')
         .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY, QQQ)')
         .setRequired(true)
+    )
+    .addStringOption(opt =>
+      opt.setName('expiration')
+        .setDescription('Expiration to analyze (default: 0DTE)')
+        .setRequired(false)
+        .addChoices(
+          { name: '0DTE (today)', value: '0dte' },
+          { name: 'Weekly (this Friday)', value: 'weekly' },
+          { name: 'Monthly OPEX (3rd Friday)', value: 'monthly' },
+        )
     ),
 
   new SlashCommandBuilder()

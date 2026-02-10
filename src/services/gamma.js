@@ -227,10 +227,11 @@ class GammaService {
   /**
    * Fetch the full options chain for a ticker.
    * First call gets available expirations + first expiration's chain.
-   * Prefers the nearest monthly OPEX (3rd Friday) since that's where
-   * gamma exposure is most concentrated and meaningful.
+   *
+   * @param {string} ticker - Stock symbol
+   * @param {string} [expirationPref='0dte'] - '0dte', 'weekly', or 'monthly'
    */
-  async fetchOptionsChain(ticker) {
+  async fetchOptionsChain(ticker, expirationPref = '0dte') {
     const upper = ticker.toUpperCase();
 
     // First fetch — gets list of all expirations + data for the nearest one
@@ -243,24 +244,44 @@ class GammaService {
     }
 
     const now = Date.now() / 1000;
+    const targetDate = this._computeTargetDate(expirationPref);
+    const targetEpoch = new Date(targetDate + 'T00:00:00Z').getTime() / 1000;
 
-    // Find monthly OPEX dates (3rd Friday of each month = day 15-21 and Friday)
-    const monthlyExps = expirations.filter(epoch => {
-      const d = new Date(epoch * 1000);
-      const dayOfWeek = d.getUTCDay(); // 5 = Friday
-      const dayOfMonth = d.getUTCDate();
-      return dayOfWeek === 5 && dayOfMonth >= 15 && dayOfMonth <= 21;
-    });
-
-    // Pick the nearest upcoming monthly OPEX (at least 2 days out)
     let bestExp;
-    const upcomingMonthly = monthlyExps.filter(e => (e - now) / 86400 >= 2);
-    if (upcomingMonthly.length > 0) {
-      bestExp = upcomingMonthly[0]; // nearest monthly
+
+    if (expirationPref === '0dte') {
+      // Look for today's expiration
+      const todayMatch = expirations.find(e => {
+        const d = new Date(e * 1000);
+        return this._formatDate(d) === targetDate;
+      });
+      if (todayMatch) {
+        bestExp = todayMatch;
+      } else {
+        // No 0DTE — pick nearest future expiration
+        const future = expirations.filter(e => e >= now);
+        bestExp = future[0] || expirations[0];
+        console.log(`[Gamma] No 0DTE available for ${upper}, using nearest: ${new Date(bestExp * 1000).toISOString().slice(0, 10)}`);
+      }
+    } else if (expirationPref === 'weekly') {
+      // Find closest to this week's Friday
+      bestExp = expirations.reduce((best, e) =>
+        Math.abs(e - targetEpoch) < Math.abs(best - targetEpoch) ? e : best
+      );
     } else {
-      // No monthly OPEX found — fall back to nearest future expiration with decent time
-      const fallbacks = expirations.filter(e => (e - now) / 86400 >= 2);
-      bestExp = fallbacks[0] || expirations[0];
+      // Monthly — find 3rd Friday OPEX dates
+      const monthlyExps = expirations.filter(epoch => {
+        const d = new Date(epoch * 1000);
+        return d.getUTCDay() === 5 && d.getUTCDate() >= 15 && d.getUTCDate() <= 21;
+      });
+      const upcomingMonthly = monthlyExps.filter(e => e >= now);
+      if (upcomingMonthly.length > 0) {
+        bestExp = upcomingMonthly[0];
+      } else {
+        bestExp = expirations.reduce((best, e) =>
+          Math.abs(e - targetEpoch) < Math.abs(best - targetEpoch) ? e : best
+        );
+      }
     }
 
     // Fetch that specific expiration's chain
@@ -633,56 +654,90 @@ class GammaService {
   }
 
   /**
-   * Pick the best monthly OPEX from Alpaca options data.
+   * Pick the best expiration from Alpaca options data based on user preference.
+   * @param {Array} options - options snapshots from Alpaca
+   * @param {string} pref - '0dte', 'weekly', or 'monthly'
    */
-  _pickAlpacaExpiration(options) {
-    const now = Date.now();
+  _pickAlpacaExpiration(options, pref = '0dte') {
     const expirations = [...new Set(options.map(o => o.expiration).filter(Boolean))].sort();
+    if (expirations.length === 0) return null;
 
-    // Find monthly OPEX dates (3rd Friday)
-    const monthlyExps = expirations.filter(exp => {
-      const d = new Date(exp + 'T00:00:00Z');
-      return d.getUTCDay() === 5 && d.getUTCDate() >= 15 && d.getUTCDate() <= 21;
-    });
+    const today = this._todayString();
+    const targetDate = this._computeTargetDate(pref);
 
-    const upcoming = monthlyExps.filter(exp => new Date(exp + 'T00:00:00Z') - now > 2 * 86400000);
-    if (upcoming.length > 0) return upcoming[0];
+    // For 0DTE, look for today's expiration first
+    if (pref === '0dte') {
+      if (expirations.includes(today)) return today;
+      // If no 0DTE available, pick the nearest future expiration
+      const future = expirations.filter(e => e >= today);
+      return future[0] || expirations[expirations.length - 1];
+    }
 
-    // Fallback: nearest future expiration
-    const futureExps = expirations.filter(exp => new Date(exp + 'T00:00:00Z') - now > 2 * 86400000);
-    return futureExps[0] || expirations[0];
+    // For weekly/monthly, find the closest match to the target date
+    if (targetDate && expirations.includes(targetDate)) return targetDate;
+
+    // Fallback: nearest expiration to the target
+    if (targetDate) {
+      const closest = expirations.reduce((best, e) =>
+        Math.abs(new Date(e) - new Date(targetDate)) < Math.abs(new Date(best) - new Date(targetDate)) ? e : best
+      );
+      return closest;
+    }
+
+    return expirations[0];
   }
 
   /**
-   * Pre-compute the next monthly OPEX date without fetching any data.
-   * Returns YYYY-MM-DD string for the 3rd Friday of the current or next month.
+   * Compute the target expiration date based on user preference.
+   * @param {string} pref - '0dte', 'weekly', or 'monthly'
+   * @returns {string} YYYY-MM-DD
    */
-  _computeNextMonthlyOPEX() {
+  _computeTargetDate(pref = '0dte') {
     const now = new Date();
 
-    // Check current month and next 2 months
-    for (let offset = 0; offset <= 2; offset++) {
-      const year = now.getFullYear();
-      const month = now.getMonth() + offset;
-      const d = new Date(year, month, 1);
+    if (pref === '0dte') {
+      return this._todayString();
+    }
 
-      // Find 3rd Friday: first Friday + 14 days
-      const firstDay = d.getDay(); // 0=Sun
+    if (pref === 'weekly') {
+      // This week's Friday
+      const dayOfWeek = now.getDay(); // 0=Sun
+      const daysUntilFriday = dayOfWeek <= 5 ? (5 - dayOfWeek) : (5 + 7 - dayOfWeek);
+      const friday = new Date(now);
+      friday.setDate(now.getDate() + (daysUntilFriday === 0 ? 0 : daysUntilFriday));
+      return this._formatDate(friday);
+    }
+
+    // monthly — 3rd Friday of current or next month
+    for (let offset = 0; offset <= 2; offset++) {
+      const d = new Date(now.getFullYear(), now.getMonth() + offset, 1);
+      const firstDay = d.getDay();
       const firstFriday = firstDay <= 5 ? (5 - firstDay + 1) : (5 + 7 - firstDay + 1);
       const thirdFriday = firstFriday + 14;
-
       const opex = new Date(d.getFullYear(), d.getMonth(), thirdFriday);
 
-      // Must be at least 2 days out
-      if (opex.getTime() - now.getTime() > 2 * 86400000) {
-        const yyyy = opex.getFullYear();
-        const mm = String(opex.getMonth() + 1).padStart(2, '0');
-        const dd = String(opex.getDate()).padStart(2, '0');
-        return `${yyyy}-${mm}-${dd}`;
+      if (opex >= now) {
+        return this._formatDate(opex);
       }
     }
 
-    return null; // shouldn't happen
+    return this._todayString();
+  }
+
+  /** Today's date as YYYY-MM-DD (ET timezone for market hours) */
+  _todayString() {
+    const now = new Date();
+    // Use ET for US markets
+    const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    return this._formatDate(et);
+  }
+
+  /** Format a Date to YYYY-MM-DD */
+  _formatDate(d) {
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
   }
 
   // ── Full analysis (single entry point) ───────────────────────────────
@@ -691,20 +746,21 @@ class GammaService {
    * Run full GEX analysis for a ticker.
    * Prefers Alpaca (pre-calculated greeks, more reliable) → falls back to Yahoo Finance.
    *
+   * @param {string} ticker - Stock symbol
+   * @param {string} [expirationPref='0dte'] - '0dte', 'weekly', or 'monthly'
    * @returns {{ gexData, flip, spotPrice, expiration, chartBuffer, ticker, source }}
    */
-  async analyze(ticker) {
+  async analyze(ticker, expirationPref = '0dte') {
     const upper = ticker.toUpperCase();
 
     // ── Try Alpaca first (pre-calculated greeks, no auth headaches) ──
     if (alpaca.enabled) {
       try {
-        console.log(`[Gamma] Trying Alpaca for ${upper}...`);
+        console.log(`[Gamma] Trying Alpaca for ${upper} (pref: ${expirationPref})...`);
 
-        // Pre-compute the monthly OPEX so we only fetch one expiration's options
-        // (SPY/QQQ have daily expirations — fetching all = 10k+ contracts = timeout)
-        const targetExp = this._computeNextMonthlyOPEX();
-        console.log(`[Gamma] Target OPEX: ${targetExp}`);
+        // Compute target expiration based on user preference
+        const targetExp = this._computeTargetDate(expirationPref);
+        console.log(`[Gamma] Target expiration: ${targetExp}`);
 
         const [options, snapshot] = await Promise.all([
           alpaca.getOptionsSnapshots(upper, targetExp),
@@ -722,7 +778,7 @@ class GammaService {
         if (options.length > 0 && alpacaSpot) {
           const spotPrice = alpacaSpot;
           // Use the actual expiration from returned data (may differ slightly)
-          const expiration = this._pickAlpacaExpiration(options) || targetExp;
+          const expiration = this._pickAlpacaExpiration(options, expirationPref) || targetExp;
 
           const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
           if (gexData.strikes.length > 0) {
@@ -740,7 +796,7 @@ class GammaService {
     }
 
     // ── Fallback: Yahoo Finance ──
-    const { chain, spotPrice: yahooSpot, expiration } = await this.fetchOptionsChain(upper);
+    const { chain, spotPrice: yahooSpot, expiration } = await this.fetchOptionsChain(upper, expirationPref);
 
     let spotPrice = yahooSpot;
     if (!spotPrice) {
