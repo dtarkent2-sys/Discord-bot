@@ -15,7 +15,13 @@
  *   7. Generate QuickChart.io candlestick image
  */
 
-const { Ollama } = require('ollama');
+let Ollama;
+try {
+  Ollama = require('ollama').Ollama;
+} catch {
+  // ollama package not available — module degrades gracefully
+  Ollama = null;
+}
 const { EmbedBuilder } = require('discord.js');
 const config = require('../config');
 const priceFetcher = require('../tools/price-fetcher');
@@ -68,6 +74,7 @@ function recordAlert() {
 // ── Ollama client for alerts (lighter model) ────────────────────────────
 let alertOllama;
 function getAlertOllama() {
+  if (!Ollama) return null;
   if (!alertOllama) {
     const opts = { host: config.ollamaHost };
     if (config.ollamaApiKey) {
@@ -80,9 +87,13 @@ function getAlertOllama() {
 
 // ── Pre-warm Ollama on startup ──────────────────────────────────────────
 async function prewarmOllama() {
+  const ollama = getAlertOllama();
+  if (!ollama) {
+    log.warn('Ollama pre-warm skipped (ollama package not available)');
+    return;
+  }
   try {
     log.info(`Pre-warming Ollama model: ${config.alertOllamaModel}`);
-    const ollama = getAlertOllama();
     await ollama.chat({
       model: config.alertOllamaModel,
       messages: [{ role: 'user', content: 'Hello. Respond with OK.' }],
@@ -185,6 +196,9 @@ async function runFastAnalysis(alert, priceData, newsData) {
   });
 
   const ollama = getAlertOllama();
+  if (!ollama) {
+    throw new Error('Ollama not available — cannot run analysis');
+  }
   const systemMsg = `${ragEnforcementBlock()}\n\nYou are analyzing a LIVE 0DTE options alert as of ${todayString()}. Respond with ONLY valid JSON.`;
 
   try {
