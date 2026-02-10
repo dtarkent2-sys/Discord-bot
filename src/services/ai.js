@@ -250,8 +250,35 @@ ${mood.buildMoodContext()}
   /**
    * Extract potential stock/crypto tickers from a message.
    * Returns uppercase symbols like ['TSLA', 'AAPL', 'BTC'].
+   * Also resolves common market names like "dow", "nasdaq", "s&p" to tickers.
    */
   _extractTickers(message) {
+    // Common market names → actual tickers (case-insensitive lookup)
+    const MARKET_ALIASES = {
+      'dow': 'DIA', 'djia': 'DIA', 'dow jones': 'DIA',
+      'nasdaq': 'QQQ', 'naz': 'QQQ', 'nazzy': 'QQQ',
+      's&p': 'SPY', 's&p 500': 'SPY', 's&p500': 'SPY', 'sp500': 'SPY',
+      'spy': 'SPY', 'spx': 'SPY',
+      'russell': 'IWM', 'russell 2000': 'IWM', 'small caps': 'IWM',
+      'vix': 'VIX', 'volatility': 'VIX',
+      'bitcoin': 'BTC-USD', 'btc': 'BTC-USD',
+      'ethereum': 'ETH-USD', 'eth': 'ETH-USD',
+      'gold': 'GLD', 'oil': 'USO', 'bonds': 'TLT', 'treasuries': 'TLT',
+    };
+
+    // Check for common market names (case-insensitive) in the message
+    const lower = message.toLowerCase();
+    const aliasTickers = [];
+    for (const [alias, ticker] of Object.entries(MARKET_ALIASES)) {
+      // Use word boundary matching for short aliases, substring for multi-word
+      const pattern = alias.includes(' ')
+        ? alias
+        : new RegExp(`\\b${alias.replace(/[&]/g, '\\$&')}\\b`);
+      if (typeof pattern === 'string' ? lower.includes(pattern) : pattern.test(lower)) {
+        aliasTickers.push(ticker);
+      }
+    }
+
     // Match $TICKER format or standalone uppercase 1-5 char words
     const dollarTickers = (message.match(/\$([A-Za-z]{1,5})\b/g) || [])
       .map(t => t.slice(1).toUpperCase());
@@ -269,7 +296,7 @@ ${mood.buildMoodContext()}
     ]);
     const filtered = upperWords.filter(w => !stopWords.has(w));
 
-    return [...new Set([...dollarTickers, ...filtered])].slice(0, 5);
+    return [...new Set([...aliasTickers, ...dollarTickers, ...filtered])].slice(0, 5);
   }
 
   async chat(userId, username, userMessage, options = {}) {
@@ -303,9 +330,13 @@ ${mood.buildMoodContext()}
         const query = this._buildSearchQuery(userMessage);
         console.log(`[AI] Auto-searching: "${query}"`);
         const result = await webSearch(query, 3);
-        if (!result.error && result.results && result.results.length > 0) {
+        if (result.error) {
+          console.warn(`[AI] Web search error: ${result.error}`);
+        } else if (result.results && result.results.length > 0) {
           searchResults = formatResultsForAI(result);
-          console.log(`[AI] Search returned ${result.results.length} results`);
+          console.log(`[AI] Search returned ${result.results.length} results${result.instance ? ` via ${result.instance}` : ''}`);
+        } else {
+          console.warn('[AI] Web search returned zero results');
         }
       } catch (err) {
         console.error('[AI] Web search failed, continuing without:', err.message);

@@ -22,8 +22,79 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 // Simple in-memory cache to avoid duplicate queries
 const cache = new Map();
 
+// ── Fallback SearXNG instances (tried in order if primary fails) ─────────
+// Public instances rotate — update this list if one goes down permanently.
+const FALLBACK_INSTANCES = [
+  'https://search.ononoki.org',
+  'https://search.sapti.me',
+  'https://searxng.site',
+  'https://search.bus-hit.me',
+];
+
+/**
+ * Attempt a search against a single SearXNG instance.
+ * @returns {{ ok: true, data: object } | { ok: false, error: string }}
+ */
+async function tryInstance(instanceUrl, query, num) {
+  const url = new URL('/search', instanceUrl);
+  url.searchParams.set('q', query.trim());
+  url.searchParams.set('format', 'json');
+  url.searchParams.set('categories', 'general');
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000); // 10s per instance
+
+  try {
+    const response = await fetch(url.toString(), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      return { ok: false, error: `${response.status} ${response.statusText}${text ? ` — ${text.slice(0, 100)}` : ''}` };
+    }
+
+    const data = await response.json();
+    const rawResults = data.results || [];
+
+    // If zero results, this instance might be broken — try the next one
+    if (rawResults.length === 0 && !data.infoboxes?.length) {
+      return { ok: false, error: 'Zero results returned' };
+    }
+
+    const results = rawResults.slice(0, num).map((item, i) => ({
+      title: item.title || '',
+      link: item.url || '',
+      snippet: item.content || '',
+      engine: item.engine || '',
+      position: i + 1,
+    }));
+
+    let infobox = null;
+    if (data.infoboxes && data.infoboxes.length > 0) {
+      const ib = data.infoboxes[0];
+      infobox = {
+        title: ib.infobox || '',
+        content: ib.content || '',
+        urls: (ib.urls || []).map(u => ({ title: u.title, url: u.url })),
+      };
+    }
+
+    return { ok: true, data: { results, infobox } };
+  } catch (err) {
+    clearTimeout(timeout);
+    const msg = err.name === 'AbortError' ? 'timeout' : (err.message || String(err));
+    return { ok: false, error: msg };
+  }
+}
+
 /**
  * Search the web using a SearXNG instance.
+ * Tries the configured primary instance first, then falls back to public instances.
  *
  * @param {string} query — The search query
  * @param {number} [numResults=3] — Number of results to return (max 10)
@@ -32,14 +103,6 @@ const cache = new Map();
 async function webSearch(query, numResults = 3) {
   if (!query || typeof query !== 'string' || query.trim().length === 0) {
     return { error: 'Search query is required.', query };
-  }
-
-  const baseUrl = config.searxngUrl;
-  if (!baseUrl) {
-    return {
-      error: 'SEARXNG_URL is not configured. Set it to a SearXNG instance URL (e.g. https://search.ononoki.org).',
-      query,
-    };
   }
 
   // Check cache first
@@ -51,88 +114,52 @@ async function webSearch(query, numResults = 3) {
 
   const num = Math.min(Math.max(numResults, 1), 10);
 
-  // Build the SearXNG search URL with JSON format
-  const url = new URL('/search', baseUrl);
-  url.searchParams.set('q', query.trim());
-  url.searchParams.set('format', 'json');
-  url.searchParams.set('categories', 'general');
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-
-    const response = await fetch(url.toString(), {
-      method: 'GET',
-      headers: { Accept: 'application/json' },
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      if (response.status === 429) {
-        return { error: 'SearXNG rate limit hit. Try again in a moment.', query };
-      }
-      return { error: `SearXNG error: ${response.status} ${response.statusText}${text ? ` — ${text.slice(0, 200)}` : ''}`, query };
-    }
-
-    const data = await response.json();
-
-    // Parse organic results
-    const rawResults = data.results || [];
-    const results = rawResults.slice(0, num).map((item, i) => ({
-      title: item.title || '',
-      link: item.url || '',
-      snippet: item.content || '',
-      engine: item.engine || '',
-      position: i + 1,
-    }));
-
-    // Include infobox if available (SearXNG equivalent of knowledge graph)
-    let infobox = null;
-    if (data.infoboxes && data.infoboxes.length > 0) {
-      const ib = data.infoboxes[0];
-      infobox = {
-        title: ib.infobox || '',
-        content: ib.content || '',
-        urls: (ib.urls || []).map(u => ({ title: u.title, url: u.url })),
-      };
-    }
-
-    const result = {
-      results,
-      infobox,
-      query: query.trim(),
-      resultCount: results.length,
-      timestamp: new Date().toISOString(),
-    };
-
-    // Cache the result
-    cache.set(cacheKey, { data: result, timestamp: Date.now() });
-
-    // Prune old cache entries
-    if (cache.size > 100) {
-      const now = Date.now();
-      for (const [key, val] of cache) {
-        if (now - val.timestamp > CACHE_TTL) cache.delete(key);
-      }
-    }
-
-    return result;
-  } catch (err) {
-    const msg = err.message || String(err);
-
-    if (err.name === 'AbortError' || msg.includes('abort')) {
-      return { error: 'SearXNG request timed out (15s). The instance may be slow — try again or use a different instance.', query };
-    }
-
-    if (msg.includes('fetch failed') || msg.includes('ECONNREFUSED') || msg.includes('ENOTFOUND')) {
-      return { error: `Cannot reach SearXNG at ${baseUrl}. Check SEARXNG_URL and ensure the instance is running.`, query };
-    }
-
-    return { error: `Web search failed: ${msg}`, query };
+  // Build ordered list of instances to try: configured primary + fallbacks
+  const instances = [];
+  if (config.searxngUrl) instances.push(config.searxngUrl);
+  for (const fb of FALLBACK_INSTANCES) {
+    if (!instances.includes(fb)) instances.push(fb);
   }
+
+  if (instances.length === 0) {
+    return { error: 'No SearXNG instances available. Set SEARXNG_URL in your .env.', query };
+  }
+
+  // Try each instance in order until one succeeds
+  const errors = [];
+  for (const instanceUrl of instances) {
+    const attempt = await tryInstance(instanceUrl, query, num);
+
+    if (attempt.ok) {
+      const result = {
+        ...attempt.data,
+        query: query.trim(),
+        resultCount: attempt.data.results.length,
+        timestamp: new Date().toISOString(),
+        instance: instanceUrl,
+      };
+
+      // Cache the result
+      cache.set(cacheKey, { data: result, timestamp: Date.now() });
+
+      // Prune old cache entries
+      if (cache.size > 100) {
+        const now = Date.now();
+        for (const [key, val] of cache) {
+          if (now - val.timestamp > CACHE_TTL) cache.delete(key);
+        }
+      }
+
+      return result;
+    }
+
+    errors.push(`${instanceUrl}: ${attempt.error}`);
+    console.warn(`[WebSearch] Instance failed: ${instanceUrl} — ${attempt.error}`);
+  }
+
+  // All instances failed
+  console.error(`[WebSearch] All ${instances.length} SearXNG instances failed for "${query}": ${errors.join(' | ')}`);
+  return { error: `All SearXNG instances failed. Last errors: ${errors.slice(-2).join('; ')}`, query };
 }
 
 /**
