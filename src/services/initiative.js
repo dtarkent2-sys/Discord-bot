@@ -51,7 +51,7 @@ const TUNING_BOUNDS = {
   options_scalp_stop_loss_pct:    { min: 0.10, max: 0.40 },
   options_swing_take_profit_pct:  { min: 0.40, max: 1.50 },
   options_swing_stop_loss_pct:    { min: 0.20, max: 0.60 },
-  options_min_conviction:         { min: 5, max: 9 },
+  options_min_conviction:         { min: 4, max: 8 },
   options_max_premium_per_trade:  { min: 200, max: 2000 },
   options_cooldown_minutes:       { min: 2, max: 15 },
   scan_interval_minutes:          { min: 2, max: 15 },

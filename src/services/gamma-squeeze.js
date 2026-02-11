@@ -102,7 +102,11 @@ class GammaSqueezeEngine {
 
     // Alert cooldowns: alertKey → timestamp
     this._alertCooldowns = new Map();
-    this._alertCooldownMs = 15 * 60 * 1000; // 15 min cooldown per alert type
+    this._alertCooldownMs = 30 * 60 * 1000; // 30 min cooldown per alert
+
+    // Hysteresis: require 2 consecutive polls to agree on a new state before transitioning
+    // Prevents flapping between states which causes alert spam
+    this._pendingTransitions = new Map(); // ticker → { state, count }
 
     // Watchlist for squeeze monitoring (main indices + actively traded)
     this._watchlist = ['SPY', 'QQQ', 'IWM'];
@@ -199,17 +203,32 @@ class GammaSqueezeEngine {
     const prevState = this._squeezeStates.get(ticker) || { state: SQUEEZE_STATE.NORMAL };
     const newState = this._evaluateSqueezeState(ticker, snapshot, oiChanges, ivDynamics, prevState);
 
-    // 7. Emit alerts on state transitions
+    // 7. State transition with hysteresis to prevent flapping/spam
+    //    Require 2 consecutive polls to agree on a new state before transitioning.
     if (newState.state !== prevState.state) {
-      this._onStateTransition(ticker, prevState, newState, snapshot);
+      const pending = this._pendingTransitions.get(ticker);
+      if (pending && pending.state === newState.state) {
+        // Second consecutive poll confirms the new state → transition
+        this._onStateTransition(ticker, prevState, newState, snapshot);
+        this._pendingTransitions.delete(ticker);
+        this._squeezeStates.set(ticker, newState);
+      } else {
+        // First detection of new state → store as pending, keep current state
+        this._pendingTransitions.set(ticker, { state: newState.state, since: Date.now() });
+        // Don't update squeezeStates yet — keep previous state
+        this._squeezeStates.set(ticker, prevState);
+      }
+    } else {
+      // State unchanged — clear any pending transition and update
+      this._pendingTransitions.delete(ticker);
+      this._squeezeStates.set(ticker, newState);
     }
 
     // 8. Check for knife-fight conditions even within same state
-    if (newState.state === SQUEEZE_STATE.ACTIVE || newState.state === SQUEEZE_STATE.KNIFE_FIGHT) {
-      this._checkKnifeFight(ticker, snapshot, newState);
+    const currentState = this._squeezeStates.get(ticker);
+    if (currentState.state === SQUEEZE_STATE.ACTIVE || currentState.state === SQUEEZE_STATE.KNIFE_FIGHT) {
+      this._checkKnifeFight(ticker, snapshot, currentState);
     }
-
-    this._squeezeStates.set(ticker, newState);
 
     // 9. Store previous OI for next comparison
     this._storePrevOI(ticker, gexSummary);
@@ -500,7 +519,8 @@ class GammaSqueezeEngine {
   // ── State Transition Alerts ───────────────────────────────────────
 
   _onStateTransition(ticker, prevState, newState, snapshot) {
-    const alertKey = `${ticker}:state:${newState.state}`;
+    // Per-ticker cooldown (not per-state) prevents rapid-fire alerts from state flapping
+    const alertKey = `${ticker}:squeeze_alert`;
     if (this._isAlertCoolingDown(alertKey)) return;
 
     auditLog.log('gamma_squeeze', `${ticker}: ${prevState.state} → ${newState.state} — ${newState.reason}`);

@@ -19,6 +19,9 @@ const crypto = require('crypto');
 const config = require('../config');
 const Storage = require('./storage');
 
+// Config version — increment when defaults change to trigger migration
+const CONFIG_VERSION = 2;
+
 // Default configuration — tunable via /agent set or runtime
 const DEFAULT_CONFIG = {
   max_positions: 5,
@@ -45,10 +48,10 @@ const DEFAULT_CONFIG = {
   options_scalp_stop_loss_pct: 0.25,    // 25% stop loss for scalps
   options_swing_take_profit_pct: 0.75,  // 75% profit target for swings
   options_swing_stop_loss_pct: 0.40,    // 40% stop loss for swings
-  options_min_conviction: 7,            // min AI conviction (1-10) to enter a trade
+  options_min_conviction: 5,            // min AI conviction (1-10) to enter a trade
   options_close_before_minutes: 30,     // close 0DTE positions X min before market close
-  options_min_delta: 0.25,              // min option delta for contract selection
-  options_max_delta: 0.60,              // max option delta for contract selection
+  options_min_delta: 0.15,              // min option delta for contract selection (widened for 0DTE)
+  options_max_delta: 0.75,              // max option delta for contract selection (widened for late-day 0DTE)
   options_max_spread_pct: 0.10,         // max bid-ask spread as % of mid price
   options_underlyings: ['SPY', 'QQQ'],  // default underlyings to scan
   options_cooldown_minutes: 5,          // cooldown between options trades on same underlying
@@ -84,6 +87,14 @@ class PolicyEngine {
     this._storage = new Storage('policy-config.json');
     const saved = this._storage.get('config', {});
     this.config = { ...DEFAULT_CONFIG, ...saved };
+
+    // Migrate stored config when code defaults change
+    const savedVersion = this._storage.get('configVersion', 0);
+    if (savedVersion < CONFIG_VERSION) {
+      this._migrateConfig(savedVersion);
+      this._storage.set('configVersion', CONFIG_VERSION);
+    }
+
     this.killSwitch = false;
     this.dailyPnL = 0;
     this.dailyStartEquity = 0;
@@ -177,6 +188,33 @@ class PolicyEngine {
 
   _persist() {
     this._storage.set('config', { ...this.config });
+  }
+
+  /**
+   * Migrate stored config when code defaults change.
+   * Only resets keys that were at old defaults — preserves user overrides
+   * by checking against known old default values.
+   */
+  _migrateConfig(fromVersion) {
+    console.log(`[Policy] Migrating config from v${fromVersion} to v${CONFIG_VERSION}`);
+
+    if (fromVersion < 2) {
+      // v0/v1 → v2: conviction lowered (7→5), delta range widened (0.25-0.60 → 0.15-0.75)
+      if (this.config.options_min_conviction === 7) {
+        this.config.options_min_conviction = DEFAULT_CONFIG.options_min_conviction;
+        console.log(`[Policy] Migrated options_min_conviction: 7 → ${DEFAULT_CONFIG.options_min_conviction}`);
+      }
+      if (this.config.options_min_delta === 0.25) {
+        this.config.options_min_delta = DEFAULT_CONFIG.options_min_delta;
+        console.log(`[Policy] Migrated options_min_delta: 0.25 → ${DEFAULT_CONFIG.options_min_delta}`);
+      }
+      if (this.config.options_max_delta === 0.60) {
+        this.config.options_max_delta = DEFAULT_CONFIG.options_max_delta;
+        console.log(`[Policy] Migrated options_max_delta: 0.60 → ${DEFAULT_CONFIG.options_max_delta}`);
+      }
+    }
+
+    this._persist();
   }
 
   // ── Kill Switch ───────────────────────────────────────────────────

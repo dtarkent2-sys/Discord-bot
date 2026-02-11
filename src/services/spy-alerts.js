@@ -69,8 +69,10 @@ function convictionToGrade(conviction) {
   if (conviction >= 9) return 'A+';
   if (conviction >= 8) return 'A';
   if (conviction >= 7) return 'B+';
-  if (conviction >= 5) return 'C';
-  return 'F';
+  if (conviction >= 5) return 'B';
+  if (conviction >= 4) return 'C+';
+  if (conviction >= 3) return 'C';
+  return 'D';
 }
 
 // ── Alert Rate Limiter ──────────────────────────────────────────────────
@@ -526,8 +528,28 @@ const CONVICTION_EMOJIS = {
 /**
  * Build the "processing" ack embed.
  */
+function directionDot(action) {
+  if (action === 'BUY') return '🟢';
+  if (action === 'SELL') return '🔴';
+  return '🟡';
+}
+
+function directionLabel(action) {
+  if (action === 'BUY') return 'Call';
+  if (action === 'SELL') return 'Put';
+  return 'Neutral';
+}
+
+function directionColor(action) {
+  if (action === 'BUY') return 0x00CC66;   // green
+  if (action === 'SELL') return 0xDD3333;   // red
+  return 0xDDAA00;                           // yellow
+}
+
 function buildAckEmbed(alert) {
-  const parts = [`**${alert.action}** ${alert.ticker}`];
+  const dot = directionDot(alert.action);
+  const label = directionLabel(alert.action);
+  const parts = [`${dot} **${label}** ${alert.ticker}`];
   if (alert.price) parts.push(`@ $${alert.price}`);
   if (alert.interval) parts.push(`(${alert.interval})`);
   if (alert.confidence) parts.push(`[${alert.confidence}]`);
@@ -536,9 +558,9 @@ function buildAckEmbed(alert) {
   }
 
   return new EmbedBuilder()
-    .setTitle('⏳ Alert Received! Processing...')
+    .setTitle(`${dot} Alert Received! Processing...`)
     .setDescription(parts.join(' '))
-    .setColor(0xFFAA00)
+    .setColor(directionColor(alert.action))
     .setFooter({ text: 'Sprocket 0DTE Pipeline • Analyzing...' })
     .setTimestamp();
 }
@@ -547,7 +569,6 @@ function buildAckEmbed(alert) {
  * Build the full enhanced embed with analysis results.
  */
 function buildEnhancedEmbed(alert, analysis, priceData) {
-  const actionEmoji = { BUY: '🟢', SELL: '🔴', SKIP: '🟡' };
   const riskColor = { LOW: 0x00FF00, MEDIUM: 0xFFAA00, HIGH: 0xFF6600, EXTREME: 0xFF0000 };
 
   const conviction = analysis.conviction || 5;
@@ -559,6 +580,10 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
   const botMood = mood.getMood();
   const moodEmoji = MOOD_EMOJIS[botMood] || '😐';
 
+  // Direction dot based on the ALERT direction (call/put/neutral)
+  const dot = directionDot(alert.action);
+  const label = directionLabel(alert.action);
+
   // High conviction flair
   let titleFlair = '';
   if (conviction >= 9) {
@@ -569,14 +594,14 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
     titleFlair = ' // SOLID';
   }
 
-  const titleParts = [`${actionEmoji[analysis.action] || '⚪'} ${alert.action} ${alert.ticker}`];
+  const titleParts = [`${dot} ${label} ${alert.ticker}`];
   if (alert.price) titleParts.push(`@ $${alert.price}`);
   if (alert.interval) titleParts.push(`(${alert.interval})`);
   titleParts.push(titleFlair);
 
   const embed = new EmbedBuilder()
     .setTitle(titleParts.join(' ').trim())
-    .setColor(riskColor[analysis.riskLevel] || 0x5865F2)
+    .setColor(directionColor(alert.action))
     .setTimestamp();
 
   // Summary
@@ -635,8 +660,8 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
       inline: true,
     },
     {
-      name: '📊 Action',
-      value: `**${analysis.action || alert.action}**`,
+      name: `${dot} Play`,
+      value: `**${label}** (${analysis.action || alert.action})`,
       inline: true,
     },
   );
@@ -671,9 +696,10 @@ function buildEnhancedEmbed(alert, analysis, priceData) {
  * Build an error embed when processing fails.
  */
 function buildErrorEmbed(alert, errorMsg) {
+  const dot = directionDot(alert.action);
   return new EmbedBuilder()
-    .setTitle('❌ Alert Processing Failed')
-    .setDescription(`Could not analyze: **${alert.action} ${alert.type}**\n\nError: ${errorMsg}`)
+    .setTitle(`${dot} Alert Processing Failed`)
+    .setDescription(`Could not analyze: **${directionLabel(alert.action)} ${alert.ticker}**\n\nError: ${errorMsg}`)
     .setColor(0xFF0000)
     .setFooter({ text: 'Sprocket 0DTE Pipeline' })
     .setTimestamp();
@@ -812,8 +838,9 @@ function scheduleFollowUp(thread, alert, analysis) {
         ? `✅ High conviction alert — ${favorable ? 'trade moving in favor' : 'watch closely'}`
         : `⚠️ Moderate conviction — ${favorable ? 'holding direction' : 'consider exit'}`;
 
+      const dot = directionDot(alert.action);
       const followUpEmbed = new EmbedBuilder()
-        .setTitle(`⏰ 5-Min Follow-Up: ${alert.type}`)
+        .setTitle(`${dot} 5-Min Follow-Up: ${directionLabel(alert.action)} ${alert.ticker}`)
         .setDescription(convictionStatus)
         .addFields(
           { name: 'Alert Price', value: `$${alertPrice || 'N/A'}`, inline: true },
@@ -893,11 +920,13 @@ async function handleWebhookAlert(message) {
 
       // Replace ack with a minimal "filtered out" notice (so users know the bot is working)
       try {
+        const dot = directionDot(alert.action);
+        const label = directionLabel(alert.action);
         const skipEmbed = new EmbedBuilder()
-          .setTitle(`Filtered: ${alert.action} ${alert.ticker} [${grade}]`)
-          .setDescription(`Conviction **${conviction}/10** — below A-setup threshold (${minConviction}+)\n> _${reason.slice(0, 200)}_`)
-          .setColor(0x555555)
-          .setFooter({ text: 'Sprocket filtered this alert — only A+ setups get posted' })
+          .setTitle(`${dot} Filtered: ${label} ${alert.ticker} [${grade}]`)
+          .setDescription(`Conviction **${conviction}/10** — below threshold (${minConviction}+)\n> _${reason.slice(0, 200)}_`)
+          .setColor(directionColor(alert.action))
+          .setFooter({ text: 'Sprocket filtered this alert — bump /agent set alertMinConviction lower to see more' })
           .setTimestamp();
         await ackMessage.edit({ embeds: [skipEmbed] });
         // Auto-delete the skip notice after 30s to keep the channel clean
@@ -930,7 +959,7 @@ async function handleWebhookAlert(message) {
     let thread;
     try {
       thread = await targetMessage.startThread({
-        name: `${alert.action} ${alert.type} — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET`,
+        name: `${directionDot(alert.action)} ${directionLabel(alert.action)} ${alert.type} — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET`,
         autoArchiveDuration: 60, // Archive after 1 hour of inactivity
       });
     } catch (err) {
@@ -1053,7 +1082,7 @@ async function handleHttpAlert(channel, body) {
       let thread;
       try {
         thread = await postedMessage.startThread({
-          name: `${alert.action} ${alert.ticker}${alert.interval ? ' ' + alert.interval : ''} — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET`,
+          name: `${directionDot(alert.action)} ${directionLabel(alert.action)} ${alert.ticker}${alert.interval ? ' ' + alert.interval : ''} — ${new Date().toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit' })} ET`,
           autoArchiveDuration: 60,
         });
       } catch (err) {
