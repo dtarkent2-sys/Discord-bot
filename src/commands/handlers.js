@@ -1306,47 +1306,35 @@ async function handleWhales(interaction) {
   }
 }
 
-// ── /predict — Search Kalshi prediction markets + AI betting recs ────
+// ── /predict — Search Kalshi prediction markets + AI high-conviction play ─
 async function handlePredict(interaction) {
   await interaction.deferReply();
 
   const topic = interaction.options.getString('topic');
 
   try {
-    await interaction.editReply(`**Prediction Markets — "${topic}"**\n⏳ Searching Kalshi markets...`);
+    await interaction.editReply(`**Prediction Markets — "${topic}"**\n⏳ Searching Kalshi markets & finding the best play...`);
 
-    const markets = await kalshi.searchMarkets(topic, 8);
+    // Fetch more markets than we display so grouping works well
+    const markets = await kalshi.searchMarkets(topic, 30);
 
     if (!markets || markets.length === 0) {
       await interaction.editReply(`**Prediction Markets — "${topic}"**\nNo open markets found for "${topic}". Try broader terms like "inflation", "bitcoin", "election", "recession".`);
       return;
     }
 
-    // Show the markets immediately
+    // Show grouped markets (deduplicated by event) and kick off AI simultaneously
     const formatted = kalshi.formatMarketsForDiscord(markets, `Prediction Markets — "${topic}"`);
+    const aiPromise = kalshi.analyzeBets(markets, topic);
+
     await interaction.editReply(formatted);
 
-    // Run AI analysis in the background and post as follow-up
-    await interaction.followUp({ content: `⏳ AI is analyzing ${markets.length} markets for betting edge...`, flags: MessageFlags.Ephemeral });
-
-    const aiAnalysis = await kalshi.analyzeBets(markets, topic);
+    // AI picks the best play
+    const aiAnalysis = await aiPromise;
 
     if (aiAnalysis) {
-      // Chunk if needed
-      if (aiAnalysis.length <= 1900) {
-        await interaction.followUp(`**AI Betting Analysis — "${topic}"**\n\n${aiAnalysis}`);
-      } else {
-        const chunks = [];
-        let remaining = aiAnalysis;
-        while (remaining.length > 0) {
-          chunks.push(remaining.slice(0, 1850));
-          remaining = remaining.slice(1850);
-        }
-        await interaction.followUp(`**AI Betting Analysis — "${topic}"**\n\n${chunks[0]}${chunks.length > 1 ? '...' : ''}`);
-        for (let i = 1; i < Math.min(chunks.length, 3); i++) {
-          await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
-        }
-      }
+      const output = aiAnalysis.length <= 1900 ? aiAnalysis : aiAnalysis.slice(0, 1900) + '...';
+      await interaction.followUp(`${output}`);
     }
   } catch (err) {
     console.error('[Predict] Error:', err);
@@ -1401,25 +1389,11 @@ async function handleOdds(interaction) {
     await interaction.editReply(formatted);
 
     // Run AI deep analysis
-    await interaction.followUp({ content: `⏳ AI is running deep probability analysis on **${market.title || ticker}**...`, flags: MessageFlags.Ephemeral });
-
     const aiAnalysis = await kalshi.analyzeMarket(market, trades);
 
     if (aiAnalysis) {
-      if (aiAnalysis.length <= 1900) {
-        await interaction.followUp(`**AI Analysis — ${market.title || ticker}**\n\n${aiAnalysis}`);
-      } else {
-        const chunks = [];
-        let remaining = aiAnalysis;
-        while (remaining.length > 0) {
-          chunks.push(remaining.slice(0, 1850));
-          remaining = remaining.slice(1850);
-        }
-        await interaction.followUp(`**AI Analysis — ${market.title || ticker}**\n\n${chunks[0]}${chunks.length > 1 ? '...' : ''}`);
-        for (let i = 1; i < Math.min(chunks.length, 3); i++) {
-          await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
-        }
-      }
+      const output = aiAnalysis.length <= 1900 ? aiAnalysis : aiAnalysis.slice(0, 1900) + '...';
+      await interaction.followUp(`${output}`);
     }
   } catch (err) {
     console.error(`[Odds] Error for ${ticker}:`, err);
@@ -1427,7 +1401,7 @@ async function handleOdds(interaction) {
   }
 }
 
-// ── /bets — Browse trending/categorized Kalshi markets ───────────────
+// ── /bets — Browse trending/categorized Kalshi markets + best play ────
 async function handleBets(interaction) {
   await interaction.deferReply();
 
@@ -1437,23 +1411,25 @@ async function handleBets(interaction) {
     let markets;
     let title;
 
+    const labels = {
+      trending: 'Trending',
+      economics: 'Economics',
+      crypto: 'Crypto',
+      politics: 'Politics',
+      tech: 'Tech',
+      markets: 'Markets & Indices',
+      sports: 'Sports',
+    };
+    const label = labels[category] || category;
+
+    await interaction.editReply(`**Kalshi — ${label}**\n⏳ Finding the best plays...`);
+
     if (category === 'trending') {
-      await interaction.editReply('**Kalshi — Trending Bets**\n⏳ Fetching hottest prediction markets...');
-      markets = await kalshi.getTrendingMarkets(12);
-      title = 'Kalshi — Trending Prediction Markets';
+      markets = await kalshi.getTrendingMarkets(30);
+      title = `Kalshi — Trending Bets`;
     } else {
-      const labels = {
-        economics: 'Economics',
-        crypto: 'Crypto',
-        politics: 'Politics',
-        tech: 'Tech',
-        markets: 'Markets & Indices',
-        sports: 'Sports',
-      };
-      const label = labels[category] || category;
-      await interaction.editReply(`**Kalshi — ${label} Markets**\n⏳ Searching...`);
-      markets = await kalshi.getMarketsByCategory(category, 12);
-      title = `Kalshi — ${label} Prediction Markets`;
+      markets = await kalshi.getMarketsByCategory(category, 30);
+      title = `Kalshi — ${label} Bets`;
     }
 
     if (!markets || markets.length === 0) {
@@ -1461,17 +1437,17 @@ async function handleBets(interaction) {
       return;
     }
 
+    // Show grouped markets and kick off AI simultaneously
     const formatted = kalshi.formatMarketsForDiscord(markets, title);
+    const aiPromise = kalshi.analyzeBets(markets, category);
+
     await interaction.editReply(formatted);
 
-    // Quick AI take on the category
-    const aiTake = await kalshi.analyzeBets(markets.slice(0, 6), category);
+    // AI picks the best play from the category
+    const aiTake = await aiPromise;
     if (aiTake) {
-      if (aiTake.length <= 1900) {
-        await interaction.followUp(`**AI Quick Picks — ${category}**\n\n${aiTake}`);
-      } else {
-        await interaction.followUp(`**AI Quick Picks — ${category}**\n\n${aiTake.slice(0, 1900)}...`);
-      }
+      const output = aiTake.length <= 1900 ? aiTake : aiTake.slice(0, 1900) + '...';
+      await interaction.followUp(`${output}`);
     }
   } catch (err) {
     console.error(`[Bets] Error for ${category}:`, err);
