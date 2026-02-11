@@ -14,7 +14,7 @@ const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
 const stream = require('../services/stream');
 const kalshi = require('../services/kalshi');
-const uw = require('../services/unusual-whales');
+const ainvest = require('../services/ainvest');
 const reddit = require('../services/reddit');
 const validea = require('../services/validea');
 const macro = require('../services/macro');
@@ -92,8 +92,6 @@ async function handleCommand(interaction) {
       return handleBets(interaction);
     case 'flow':
       return handleFlow(interaction);
-    case 'darkpool':
-      return handleDarkPool(interaction);
     case 'whales':
       return handleWhales(interaction);
     default:
@@ -338,10 +336,9 @@ async function handleHelp(interaction) {
     '`/odds <ticker>` — Deep dive on a market with AI probability analysis',
     '`/bets [category]` — Browse trending/categorized prediction markets',
     '',
-    '**Unusual Whales**',
-    '`/flow [ticker]` — Unusual options flow (sweeps, big premium, smart money)',
-    '`/darkpool <ticker>` — Dark pool / off-exchange prints',
-    '`/whales <ticker>` — Full whale dashboard (flow + dark pool + shorts + insider)',
+    '**Market Intelligence (AInvest)**',
+    '`/flow <ticker>` — Smart money flow (insider + congress trades)',
+    '`/whales <ticker>` — Full intelligence dashboard (analysts + fundamentals + insider + congress)',
     '',
     '**SHARK Agent**',
     '`/agent status` — Positions, risk, P/L',
@@ -1239,99 +1236,73 @@ async function handleAgent(interaction) {
   }
 }
 
-// ── /flow — Unusual options flow (Unusual Whales) ────────────────────
+// ── /flow — Smart money flow: insider + congress trades (AInvest) ────
 async function handleFlow(interaction) {
-  await interaction.deferReply();
-
-  const ticker = interaction.options.getString('ticker');
-  const filter = interaction.options.getString('filter') || 'all';
-
-  try {
-    if (!uw.enabled) {
-      await interaction.editReply('**Options Flow** requires an Unusual Whales API key. Set `UNUSUAL_WHALES_API_KEY` in your .env file.');
-      return;
-    }
-
-    const label = ticker ? ticker.toUpperCase() : 'Market';
-    await interaction.editReply(`**Options Flow — ${label}**\n⏳ Fetching unusual activity from Unusual Whales...`);
-
-    const params = {};
-    if (ticker) params.ticker = ticker;
-    if (filter === 'calls') params.isCall = true;
-    if (filter === 'puts') params.isPut = true;
-    if (filter === 'sweeps') params.isSweep = true;
-
-    let data;
-    if (ticker) {
-      data = await uw.getTickerFlow(ticker);
-    } else {
-      data = await uw.getFlowAlerts(params);
-    }
-
-    const formatted = uw.formatFlowForDiscord(data, ticker);
-    await interaction.editReply(formatted);
-  } catch (err) {
-    console.error('[Flow] Error:', err);
-    await interaction.editReply(`**Options Flow**\n❌ ${err.message}`);
-  }
-}
-
-// ── /darkpool — Dark pool prints (Unusual Whales) ────────────────────
-async function handleDarkPool(interaction) {
   await interaction.deferReply();
 
   const ticker = interaction.options.getString('ticker').toUpperCase();
 
   try {
-    if (!uw.enabled) {
-      await interaction.editReply('**Dark Pool** requires an Unusual Whales API key. Set `UNUSUAL_WHALES_API_KEY` in your .env file.');
+    if (!ainvest.enabled) {
+      await interaction.editReply('**Smart Money Flow** requires an AInvest API key. Set `AINVEST_API_KEY` in your environment.');
       return;
     }
 
-    await interaction.editReply(`**Dark Pool — ${ticker}**\n⏳ Fetching off-exchange prints...`);
+    await interaction.editReply(`**Smart Money Flow — ${ticker}**\n⏳ Fetching insider and congress trades...`);
 
-    const data = await uw.getDarkPool(ticker, { limit: 50 });
-    const formatted = uw.formatDarkPoolForDiscord(data, ticker);
+    const [insiderResult, congressResult] = await Promise.allSettled([
+      ainvest.getInsiderTrades(ticker),
+      ainvest.getCongressTrades(ticker),
+    ]);
+
+    const formatted = ainvest.formatFlowForDiscord({
+      insider: insiderResult.status === 'fulfilled' ? insiderResult.value : [],
+      congress: congressResult.status === 'fulfilled' ? congressResult.value : [],
+    }, ticker);
+
     await interaction.editReply(formatted);
   } catch (err) {
-    console.error(`[DarkPool] Error for ${ticker}:`, err);
-    await interaction.editReply(`**Dark Pool — ${ticker}**\n❌ ${err.message}`);
+    console.error(`[Flow] Error for ${ticker}:`, err);
+    await interaction.editReply(`**Smart Money Flow — ${ticker}**\n❌ ${err.message}`);
   }
 }
 
-// ── /whales — Combined whale activity dashboard (Unusual Whales) ─────
+// ── /whales — Market intelligence dashboard (AInvest) ────────────────
 async function handleWhales(interaction) {
   await interaction.deferReply();
 
   const ticker = interaction.options.getString('ticker').toUpperCase();
 
   try {
-    if (!uw.enabled) {
-      await interaction.editReply('**Whale Dashboard** requires an Unusual Whales API key. Set `UNUSUAL_WHALES_API_KEY` in your .env file.');
+    if (!ainvest.enabled) {
+      await interaction.editReply('**Market Intelligence** requires an AInvest API key. Set `AINVEST_API_KEY` in your environment.');
       return;
     }
 
-    await interaction.editReply(`**Whale Activity — ${ticker}**\n⏳ Gathering flow, dark pool, short interest, and insider data...`);
+    await interaction.editReply(`**Market Intelligence — ${ticker}**\n⏳ Gathering analyst ratings, fundamentals, insider, and congress data...`);
 
-    // Fetch all data in parallel
-    const [flow, darkPool, shortData, insider] = await Promise.allSettled([
-      uw.getTickerFlow(ticker),
-      uw.getDarkPool(ticker, { limit: 30 }),
-      uw.getShortData(ticker),
-      uw.getInsiderTrades(ticker),
+    const [analysts, financials, earnings, insider, congress, news] = await Promise.allSettled([
+      ainvest.getAnalystConsensus(ticker),
+      ainvest.getFinancials(ticker),
+      ainvest.getEarnings(ticker, 2),
+      ainvest.getInsiderTrades(ticker),
+      ainvest.getCongressTrades(ticker),
+      ainvest.getNews({ tickers: [ticker], limit: 3 }),
     ]);
 
-    const formatted = uw.formatWhalesDashboard(ticker, {
-      flow: flow.status === 'fulfilled' ? flow.value : null,
-      darkPool: darkPool.status === 'fulfilled' ? darkPool.value : null,
-      shortData: shortData.status === 'fulfilled' ? shortData.value : null,
+    const formatted = ainvest.formatIntelDashboard(ticker, {
+      analysts: analysts.status === 'fulfilled' ? analysts.value : null,
+      financials: financials.status === 'fulfilled' ? financials.value : null,
+      earnings: earnings.status === 'fulfilled' ? earnings.value : null,
       insider: insider.status === 'fulfilled' ? insider.value : null,
+      congress: congress.status === 'fulfilled' ? congress.value : null,
+      news: news.status === 'fulfilled' ? news.value : null,
     });
 
     await interaction.editReply(formatted);
   } catch (err) {
     console.error(`[Whales] Error for ${ticker}:`, err);
-    await interaction.editReply(`**Whale Activity — ${ticker}**\n❌ ${err.message}`);
+    await interaction.editReply(`**Market Intelligence — ${ticker}**\n❌ ${err.message}`);
   }
 }
 

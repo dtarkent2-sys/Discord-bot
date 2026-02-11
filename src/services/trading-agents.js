@@ -37,14 +37,6 @@ try {
   kalshi = null;
 }
 
-// Unusual Whales — options flow, dark pool, short interest, insider, GEX
-let uw;
-try {
-  uw = require('./unusual-whales');
-} catch {
-  uw = null;
-}
-
 // LLM call timeout (90 seconds per call)
 const LLM_TIMEOUT_MS = 90000;
 
@@ -149,17 +141,17 @@ class TradingAgents {
       );
     }
 
-    // Unusual Whales — options flow, dark pool, short interest, insider, IV, max pain
-    if (uw && uw.enabled) {
+    // AInvest — analyst ratings, fundamentals, insider + congress trades
+    if (ainvest && ainvest.enabled) {
       enrichPromises.push(
-        uw.getEnrichmentForAnalysis(upper)
-          .then(uwBlock => {
-            if (uwBlock) {
-              marketData += `\n\n${uwBlock}`;
-              dataSources.push('unusual-whales');
+        ainvest.getEnrichmentForAnalysis(upper)
+          .then(block => {
+            if (block) {
+              marketData += `\n\n${block}`;
+              dataSources.push('ainvest');
             }
           })
-          .catch(err => console.warn(`[TradingAgents] Unusual Whales enrichment failed for ${upper}:`, err.message))
+          .catch(err => console.warn(`[TradingAgents] AInvest enrichment failed for ${upper}:`, err.message))
       );
     }
 
