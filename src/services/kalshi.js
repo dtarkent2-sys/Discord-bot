@@ -126,6 +126,43 @@ class KalshiService {
   // ── Search / Discovery ─────────────────────────────────────────────
 
   /**
+   * Detect if a market is a sports/game betting market.
+   * Sports dominate Kalshi by volume and drown out everything else.
+   */
+  _isSportsMarket(m) {
+    const ticker = (m.event_ticker || m.ticker || '').toUpperCase();
+    const title = (m.title || '').toLowerCase();
+
+    // Common sports series/event ticker prefixes on Kalshi
+    const sportsTickers = [
+      'NBA', 'NFL', 'MLB', 'NHL', 'MLS', 'WNBA', 'NCAAB', 'NCAAF', 'NCAAM',
+      'UFC', 'PGA', 'LIV', 'LPGA', 'ATP', 'WTA', 'F1-', 'NASCAR',
+      'EPL', 'LALIGA', 'SOCCER', 'FIFAWC', 'CHAMP',
+      'CRICKET', 'IPL', 'T20', 'CFL', 'XFL', 'CFB',
+      'BOWL', 'MARCH', 'PLAYOFF', 'FINALS', 'SERIES-',
+      'KXNBA', 'KXNFL', 'KXMLB', 'KXNHL',
+    ];
+
+    if (sportsTickers.some(s => ticker.includes(s))) return true;
+
+    // Title-based detection for edge cases
+    const sportsTerms = [
+      'touchdown', 'home run', 'three-pointer', 'quarterback', 'pitcher',
+      'assists', 'rebounds', 'strikeout', 'rushing yard', 'passing yard',
+      'field goal', 'free throw', 'penalty kick', 'hat trick',
+      'over/under', 'spread', 'moneyline',
+      ' vs ', // "Team A vs Team B" pattern
+    ];
+    if (sportsTerms.some(t => title.includes(t))) return true;
+
+    // Category field if available
+    const cat = (m.category || '').toLowerCase();
+    if (cat === 'sports' || cat === 'esports') return true;
+
+    return false;
+  }
+
+  /**
    * Build searchable text from a market object.
    * Combines all text fields for keyword matching.
    */
@@ -250,23 +287,55 @@ class KalshiService {
       }
     }
 
+    // Filter out sports unless the query is sports-related
+    const sportsQueries = ['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'pga', 'soccer', 'football', 'basketball', 'baseball', 'hockey', 'sports', 'game', 'super bowl', 'world series', 'march madness', 'playoff'];
+    const isSportsQuery = sportsQueries.some(sq => query.toLowerCase().includes(sq));
+
+    let sorted = [...allMatches.values()];
+
+    if (!isSportsQuery) {
+      sorted = sorted.filter(m => !this._isSportsMarket(m));
+    }
+
     // Sort by volume (most active first), then by 24h volume
-    const sorted = [...allMatches.values()];
     sorted.sort((a, b) => (b.volume_24h || b.volume || 0) - (a.volume_24h || a.volume || 0));
 
     return sorted.slice(0, limit);
   }
 
   /**
-   * Get trending/hot markets — most 24h volume.
+   * Get trending/hot markets — most 24h volume, diversified across categories.
+   * Sports markets dominate Kalshi by volume (10-100x other categories),
+   * so we cap sports at ~20% of results to show a diverse set.
    */
   async getTrendingMarkets(limit = 15) {
     const allMarkets = await this._fetchMarketBatch(2);
 
-    // Sort by 24h volume (most recently active), fallback to total volume
+    // Sort by 24h volume
     allMarkets.sort((a, b) => (b.volume_24h || 0) - (a.volume_24h || 0) || (b.volume || 0) - (a.volume || 0));
 
-    return allMarkets.slice(0, limit);
+    // Split into sports vs non-sports
+    const sports = [];
+    const nonSports = [];
+    for (const m of allMarkets) {
+      if (this._isSportsMarket(m)) {
+        sports.push(m);
+      } else {
+        nonSports.push(m);
+      }
+    }
+
+    // Cap sports at ~20% of results, fill rest with non-sports
+    const maxSports = Math.max(2, Math.floor(limit * 0.2));
+    const result = [
+      ...nonSports.slice(0, limit - maxSports),
+      ...sports.slice(0, maxSports),
+    ];
+
+    // Re-sort the mixed result by volume so it still feels natural
+    result.sort((a, b) => (b.volume_24h || 0) - (a.volume_24h || 0) || (b.volume || 0) - (a.volume || 0));
+
+    return result.slice(0, limit);
   }
 
   /**
@@ -286,9 +355,13 @@ class KalshiService {
 
     const keywords = categoryMap[category.toLowerCase()] || [category.toLowerCase()];
 
+    const isSportsCategory = category.toLowerCase() === 'sports';
     const allMarkets = await this._fetchMarketBatch(3);
 
     const matches = allMarkets.filter(m => {
+      // Exclude sports from non-sports categories (sports bleeds into everything via volume)
+      if (!isSportsCategory && this._isSportsMarket(m)) return false;
+
       const text = this._marketSearchText(m);
       return keywords.some(kw => text.includes(kw));
     });
