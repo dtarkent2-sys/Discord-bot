@@ -24,6 +24,7 @@ const sectors = require('../services/sectors');
 const policy = require('../services/policy');
 const optionsEngine = require('../services/options-engine');
 const initiative = require('../services/initiative');
+const gammaSqueeze = require('../services/gamma-squeeze');
 const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -102,6 +103,8 @@ async function handleCommand(interaction) {
       return handleOptions(interaction);
     case 'brain':
       return handleBrain(interaction);
+    case 'squeeze':
+      return handleSqueeze(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -1686,6 +1689,39 @@ async function handleBrain(interaction) {
   }
 
   return interaction.reply({ content: 'Unknown brain action.', flags: MessageFlags.Ephemeral });
+}
+
+async function handleSqueeze(interaction) {
+  const action = interaction.options.getString('action');
+  const ticker = interaction.options.getString('ticker');
+
+  if (action === 'status') {
+    const allStatus = gammaSqueeze.getSqueezeStatus(null);
+    const formatted = gammaSqueeze.formatStatusForDiscord(allStatus);
+    return interaction.reply(formatted.slice(0, 2000));
+  }
+
+  if (action === 'detail') {
+    if (!ticker) {
+      return interaction.reply({ content: 'Please provide a ticker for the detail view (e.g. `/squeeze detail ticker:SPY`).', flags: MessageFlags.Ephemeral });
+    }
+    const status = gammaSqueeze.getSqueezeStatus(ticker.toUpperCase());
+    const formatted = gammaSqueeze.formatStatusForDiscord(status);
+    return interaction.reply(formatted.slice(0, 2000));
+  }
+
+  if (action === 'sectors') {
+    await interaction.deferReply();
+    try {
+      const sectorData = await gammaSqueeze.analyzeSectorGEX();
+      const formatted = gammaSqueeze.formatSectorGEXForDiscord(sectorData);
+      return interaction.editReply(formatted.slice(0, 2000));
+    } catch (err) {
+      return interaction.editReply(`Sector GEX analysis failed: ${err.message}`);
+    }
+  }
+
+  return interaction.reply({ content: 'Unknown squeeze action.', flags: MessageFlags.Ephemeral });
 }
 
 module.exports = { handleCommand };

@@ -26,6 +26,7 @@ const circuitBreaker = require('./circuit-breaker');
 const alpaca = require('./alpaca');
 const macro = require('./macro');
 const ai = require('./ai');
+const gammaSqueeze = require('./gamma-squeeze');
 const config = require('../config');
 
 // How often the brain ticks (ms)
@@ -41,6 +42,7 @@ const ACTION_COOLDOWNS = {
   watchlist_scan:   60 * 60 * 1000,    // 1 hour between watchlist expansions
   trade_thread:     5 * 60 * 1000,     // 5 min between thread creations
   regime_reaction:  30 * 60 * 1000,    // 30 min between regime alerts
+  squeeze_sector_scan: 60 * 60 * 1000, // 1 hour between sector squeeze scans
 };
 
 // Safe bounds for self-tuning parameters
@@ -248,6 +250,15 @@ class InitiativeEngine {
         id: 'watchlist_scan',
         score: 2,
         execute: (c) => this._expandWatchlist(c),
+      });
+    }
+
+    // 8. Gamma squeeze sector scan (medium priority, periodic)
+    if (ctx.isMarketOpen && ctx.alpacaEnabled) {
+      actions.push({
+        id: 'squeeze_sector_scan',
+        score: 4,
+        execute: (c) => this._squeezeSectorScan(c),
       });
     }
 
@@ -473,6 +484,44 @@ class InitiativeEngine {
             ? `_Shifting to aggressive mode — wider scans, lower conviction threshold._`
             : `_Maintaining cautious positioning._`)
       );
+    }
+  }
+
+  // ── Action: Gamma Squeeze Sector Scan ──────────────────────────
+
+  async _squeezeSectorScan(ctx) {
+    if (!this._postToChannel) return;
+
+    try {
+      const sectorData = await gammaSqueeze.analyzeSectorGEX();
+      if (sectorData.length === 0) return;
+
+      // Check for any sectors in short gamma (squeeze risk)
+      const shortGamma = sectorData.filter(s => s.regime === 'Short Gamma' && s.confidence > 0.3);
+      if (shortGamma.length === 0) {
+        this._addJournalEntry('sector_gex', `Sector GEX scan: no sectors in short gamma — ${sectorData.length} sectors analyzed`);
+        return;
+      }
+
+      // Add short-gamma sectors to squeeze watchlist
+      const currentWatch = gammaSqueeze.getWatchlist();
+      for (const s of shortGamma) {
+        if (!currentWatch.includes(s.ticker)) {
+          currentWatch.push(s.ticker);
+        }
+      }
+      gammaSqueeze.setWatchlist(currentWatch);
+
+      // Post to Discord
+      const formatted = gammaSqueeze.formatSectorGEXForDiscord(sectorData);
+      await this._postToChannel(formatted);
+
+      this._addJournalEntry('sector_gex', `Sector GEX scan: ${shortGamma.length} sectors in short gamma — ${shortGamma.map(s => s.ticker).join(', ')}`);
+    } catch (err) {
+      // Non-fatal
+      if (!err.message?.includes('Too Many Requests')) {
+        console.warn(`[Initiative] Sector GEX scan error: ${err.message}`);
+      }
     }
   }
 

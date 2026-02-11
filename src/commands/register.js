@@ -382,6 +382,25 @@ const commands = [
           { name: 'tuning — self-tuning history', value: 'tuning' },
         )
     ),
+
+  new SlashCommandBuilder()
+    .setName('squeeze')
+    .setDescription('Gamma squeeze monitor — live squeeze detection, sector GEX, dealer positioning')
+    .addStringOption(opt =>
+      opt.setName('action')
+        .setDescription('What to view')
+        .setRequired(true)
+        .addChoices(
+          { name: 'status — all watched tickers', value: 'status' },
+          { name: 'detail — deep dive on one ticker', value: 'detail' },
+          { name: 'sectors — sector gamma exposure', value: 'sectors' },
+        )
+    )
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock symbol (for detail view, e.g. SPY, QQQ)')
+        .setRequired(false)
+    ),
 ];
 
 async function registerCommands() {
