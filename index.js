@@ -45,7 +45,7 @@ try {
 let ainvest = null;
 try {
   ainvest = require('./src/services/ainvest');
-  if (ainvest.enabled) {
+  if (ainvest && ainvest.enabled) {
     ainvest.initMCP().catch(err => {
       console.warn('[Bot] AInvest MCP init failed (REST fallback active):', err.message);
     });
