@@ -13,6 +13,7 @@ const technicals = require('../services/technicals');
 const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
 const stream = require('../services/stream');
+const kalshi = require('../services/kalshi');
 const reddit = require('../services/reddit');
 const validea = require('../services/validea');
 const macro = require('../services/macro');
@@ -82,6 +83,12 @@ async function handleCommand(interaction) {
       return handleAgent(interaction);
     case 'stream':
       return handleStream(interaction);
+    case 'predict':
+      return handlePredict(interaction);
+    case 'odds':
+      return handleOdds(interaction);
+    case 'bets':
+      return handleBets(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -159,8 +166,9 @@ async function handleModel(interaction) {
     ai.setModel(modelName);
     tradingAgents.setModel(modelName);
     agentSwarm.setModel(modelName);
+    kalshi.setModel(modelName);
 
-    await interaction.reply(`Switched AI model: **${oldModel}** → **${modelName}** (chat + deep analysis + research)`);
+    await interaction.reply(`Switched AI model: **${oldModel}** → **${modelName}** (chat + deep analysis + research + predictions)`);
   } catch (err) {
     console.error('[Model] Error:', err);
     await interaction.reply({ content: 'Failed to switch model.', flags: MessageFlags.Ephemeral }).catch(() => {});
@@ -317,6 +325,11 @@ async function handleHelp(interaction) {
     '`/watchlist` — Manage watchlist | `/sentiment` — Text analysis',
     '`/stream start|stop|list|status` — Live Alpaca WebSocket data',
     '`/memory` `/profile` `/stats` `/model` `/topic`',
+    '',
+    '**Prediction Markets (Kalshi)**',
+    '`/predict <topic>` — Search markets + AI betting picks',
+    '`/odds <ticker>` — Deep dive on a market with AI probability analysis',
+    '`/bets [category]` — Browse trending/categorized prediction markets',
     '',
     '**SHARK Agent**',
     '`/agent status` — Positions, risk, P/L',
@@ -1113,6 +1126,157 @@ async function handleAgent(interaction) {
   } catch (err) {
     console.error(`[Agent] Error (${action}):`, err);
     await interaction.editReply(`**SHARK — ${action}**\n❌ ${err.message}`);
+  }
+}
+
+// ── /predict — Search Kalshi prediction markets + AI betting recs ────
+async function handlePredict(interaction) {
+  await interaction.deferReply();
+
+  const topic = interaction.options.getString('topic');
+
+  try {
+    await interaction.editReply(`**Prediction Markets — "${topic}"**\n⏳ Searching Kalshi markets...`);
+
+    const markets = await kalshi.searchMarkets(topic, 8);
+
+    if (!markets || markets.length === 0) {
+      await interaction.editReply(`**Prediction Markets — "${topic}"**\nNo open markets found for "${topic}". Try broader terms like "inflation", "bitcoin", "election", "recession".`);
+      return;
+    }
+
+    // Show the markets immediately
+    const formatted = kalshi.formatMarketsForDiscord(markets, `Prediction Markets — "${topic}"`);
+    await interaction.editReply(formatted);
+
+    // Run AI analysis in the background and post as follow-up
+    await interaction.followUp({ content: `⏳ AI is analyzing ${markets.length} markets for betting edge...`, flags: MessageFlags.Ephemeral });
+
+    const aiAnalysis = await kalshi.analyzeBets(markets, topic);
+
+    if (aiAnalysis) {
+      // Chunk if needed
+      if (aiAnalysis.length <= 1900) {
+        await interaction.followUp(`**AI Betting Analysis — "${topic}"**\n\n${aiAnalysis}`);
+      } else {
+        const chunks = [];
+        let remaining = aiAnalysis;
+        while (remaining.length > 0) {
+          chunks.push(remaining.slice(0, 1850));
+          remaining = remaining.slice(1850);
+        }
+        await interaction.followUp(`**AI Betting Analysis — "${topic}"**\n\n${chunks[0]}${chunks.length > 1 ? '...' : ''}`);
+        for (let i = 1; i < Math.min(chunks.length, 3); i++) {
+          await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Predict] Error:', err);
+    await interaction.editReply(`**Prediction Markets — "${topic}"**\n❌ ${err.message}`);
+  }
+}
+
+// ── /odds — Deep dive on a specific Kalshi market ────────────────────
+async function handleOdds(interaction) {
+  await interaction.deferReply();
+
+  const ticker = interaction.options.getString('market').toUpperCase();
+
+  try {
+    await interaction.editReply(`**${ticker} — Market Deep Dive**\n⏳ Fetching market data & trades...`);
+
+    // Fetch market details and recent trades in parallel
+    const [market, trades] = await Promise.all([
+      kalshi.getMarket(ticker),
+      kalshi.getTrades(ticker, 20).catch(() => null),
+    ]);
+
+    if (!market || !market.ticker) {
+      await interaction.editReply(`**${ticker}**\n❌ Market not found. Use \`/predict <topic>\` to search for valid market tickers.`);
+      return;
+    }
+
+    // Show market details immediately
+    const formatted = kalshi.formatMarketDetailForDiscord(market, trades);
+    await interaction.editReply(formatted);
+
+    // Run AI deep analysis
+    await interaction.followUp({ content: `⏳ AI is running deep probability analysis on **${market.title || ticker}**...`, flags: MessageFlags.Ephemeral });
+
+    const aiAnalysis = await kalshi.analyzeMarket(market, trades);
+
+    if (aiAnalysis) {
+      if (aiAnalysis.length <= 1900) {
+        await interaction.followUp(`**AI Analysis — ${market.title || ticker}**\n\n${aiAnalysis}`);
+      } else {
+        const chunks = [];
+        let remaining = aiAnalysis;
+        while (remaining.length > 0) {
+          chunks.push(remaining.slice(0, 1850));
+          remaining = remaining.slice(1850);
+        }
+        await interaction.followUp(`**AI Analysis — ${market.title || ticker}**\n\n${chunks[0]}${chunks.length > 1 ? '...' : ''}`);
+        for (let i = 1; i < Math.min(chunks.length, 3); i++) {
+          await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`[Odds] Error for ${ticker}:`, err);
+    await interaction.editReply(`**${ticker} — Market Deep Dive**\n❌ ${err.message}`);
+  }
+}
+
+// ── /bets — Browse trending/categorized Kalshi markets ───────────────
+async function handleBets(interaction) {
+  await interaction.deferReply();
+
+  const category = interaction.options.getString('category') || 'trending';
+
+  try {
+    let markets;
+    let title;
+
+    if (category === 'trending') {
+      await interaction.editReply('**Kalshi — Trending Bets**\n⏳ Fetching hottest prediction markets...');
+      markets = await kalshi.getTrendingMarkets(12);
+      title = 'Kalshi — Trending Prediction Markets';
+    } else {
+      const labels = {
+        economics: 'Economics',
+        crypto: 'Crypto',
+        politics: 'Politics',
+        tech: 'Tech',
+        markets: 'Markets & Indices',
+        sports: 'Sports',
+      };
+      const label = labels[category] || category;
+      await interaction.editReply(`**Kalshi — ${label} Markets**\n⏳ Searching...`);
+      markets = await kalshi.getMarketsByCategory(category, 12);
+      title = `Kalshi — ${label} Prediction Markets`;
+    }
+
+    if (!markets || markets.length === 0) {
+      await interaction.editReply(`**${title}**\nNo open markets found in this category.`);
+      return;
+    }
+
+    const formatted = kalshi.formatMarketsForDiscord(markets, title);
+    await interaction.editReply(formatted);
+
+    // Quick AI take on the category
+    const aiTake = await kalshi.analyzeBets(markets.slice(0, 6), category);
+    if (aiTake) {
+      if (aiTake.length <= 1900) {
+        await interaction.followUp(`**AI Quick Picks — ${category}**\n\n${aiTake}`);
+      } else {
+        await interaction.followUp(`**AI Quick Picks — ${category}**\n\n${aiTake.slice(0, 1900)}...`);
+      }
+    }
+  } catch (err) {
+    console.error(`[Bets] Error for ${category}:`, err);
+    await interaction.editReply(`**Kalshi — ${category}**\n❌ ${err.message}`);
   }
 }
 

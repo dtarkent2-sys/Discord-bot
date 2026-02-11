@@ -29,6 +29,14 @@ try {
   ainvest = null;
 }
 
+// Kalshi prediction markets — optional enrichment for deep analysis
+let kalshi;
+try {
+  kalshi = require('./kalshi');
+} catch {
+  kalshi = null;
+}
+
 // LLM call timeout (90 seconds per call)
 const LLM_TIMEOUT_MS = 90000;
 
@@ -111,6 +119,26 @@ class TradingAgents {
       );
     } else {
       console.warn('[TradingAgents] AInvest not available — analysis will lack fundamentals, news, and analyst ratings');
+    }
+
+    // Kalshi prediction markets — find related contracts for context
+    if (kalshi) {
+      enrichPromises.push(
+        kalshi.searchMarkets(upper, 5)
+          .then(markets => {
+            if (markets && markets.length > 0) {
+              const lines = ['KALSHI PREDICTION MARKETS (related contracts):'];
+              for (const m of markets) {
+                const fm = kalshi.formatMarket(m);
+                lines.push(`  • "${fm.title}" — Yes: ${fm.prob} | Vol: ${fm.volume} | Closes: ${fm.closeDateStr}`);
+              }
+              lines.push('  (Prediction market odds reflect crowd consensus probability)');
+              marketData += `\n\n${lines.join('\n')}`;
+              dataSources.push('kalshi-prediction-markets');
+            }
+          })
+          .catch(err => console.warn(`[TradingAgents] Kalshi enrichment failed for ${upper}:`, err.message))
+      );
     }
 
     await Promise.all(enrichPromises);
