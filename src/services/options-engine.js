@@ -714,14 +714,27 @@ class OptionsEngine {
         return null;
       }
 
+      // Time-adaptive delta range: widen near end of day for 0DTE
+      // Late-day 0DTE deltas compress and can be extreme — rigid ranges miss contracts
+      let minDelta = cfg.options_min_delta;
+      let maxDelta = cfg.options_max_delta;
+      if (et.minutesToClose < 120) {
+        minDelta = Math.max(0.08, minDelta - 0.05);
+        maxDelta = Math.min(0.85, maxDelta + 0.05);
+      }
+      if (et.minutesToClose < 60) {
+        minDelta = Math.max(0.05, minDelta - 0.10);
+        maxDelta = Math.min(0.90, maxDelta + 0.10);
+      }
+
       // Filter to our delta range
       const candidates = options.filter(opt => {
         const absDelta = Math.abs(opt.delta || 0);
-        return absDelta >= cfg.options_min_delta && absDelta <= cfg.options_max_delta;
+        return absDelta >= minDelta && absDelta <= maxDelta;
       });
 
       if (candidates.length === 0) {
-        this._log('contract', `${underlying}: no contracts in delta range [${cfg.options_min_delta}-${cfg.options_max_delta}]`);
+        this._log('contract', `${underlying}: no contracts in delta range [${minDelta.toFixed(2)}-${maxDelta.toFixed(2)}] (${options.length} options checked)`);
         return null;
       }
 
