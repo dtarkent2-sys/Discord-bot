@@ -11,6 +11,11 @@
  *
  * API Base: https://api.elections.kalshi.com/trade-api/v2
  * Rate limit: 20 reads/sec (Basic tier, free)
+ *
+ * Important: Kalshi uses status="active" (not "open") for live markets.
+ * Market tickers look like KXBTC-26FEB14-T98000.
+ * Event tickers look like KXBTC-26FEB14.
+ * Series tickers look like KXBTC.
  */
 
 const { Ollama } = require('ollama');
@@ -72,14 +77,12 @@ class KalshiService {
   // ── Market Data Endpoints ──────────────────────────────────────────
 
   /** List events (prediction market categories) */
-  async getEvents({ status = 'open', limit = 50, cursor, seriesTicker, withMarkets = false } = {}) {
-    return this._fetch('/events', {
-      status,
-      limit,
-      cursor,
-      series_ticker: seriesTicker,
-      with_nested_markets: withMarkets,
-    });
+  async getEvents({ status, limit = 50, cursor, seriesTicker, withMarkets = false } = {}) {
+    const params = { limit, with_nested_markets: withMarkets };
+    if (status) params.status = status;
+    if (cursor) params.cursor = cursor;
+    if (seriesTicker) params.series_ticker = seriesTicker;
+    return this._fetch('/events', params);
   }
 
   /** Get a single event with its markets */
@@ -89,16 +92,14 @@ class KalshiService {
     });
   }
 
-  /** List markets with filtering */
-  async getMarkets({ status = 'open', limit = 100, cursor, eventTicker, seriesTicker, tickers } = {}) {
-    return this._fetch('/markets', {
-      status,
-      limit,
-      cursor,
-      event_ticker: eventTicker,
-      series_ticker: seriesTicker,
-      tickers,
-    });
+  /** List markets with filtering — no status filter by default to get all active markets */
+  async getMarkets({ limit = 200, cursor, eventTicker, seriesTicker, tickers } = {}) {
+    const params = { limit };
+    if (cursor) params.cursor = cursor;
+    if (eventTicker) params.event_ticker = eventTicker;
+    if (seriesTicker) params.series_ticker = seriesTicker;
+    if (tickers) params.tickers = tickers;
+    return this._fetch('/markets', params);
   }
 
   /** Get a single market by ticker */
@@ -125,17 +126,31 @@ class KalshiService {
   // ── Search / Discovery ─────────────────────────────────────────────
 
   /**
-   * Search for markets by keyword. Kalshi doesn't have a text search endpoint,
-   * so we fetch a batch of open markets and filter client-side by title/subtitle.
+   * Build searchable text from a market object.
+   * Combines all text fields for keyword matching.
    */
-  async searchMarkets(query, limit = 10) {
-    const lower = query.toLowerCase();
+  _marketSearchText(m) {
+    return [
+      m.title || '',
+      m.subtitle || '',
+      m.yes_sub_title || '',
+      m.no_sub_title || '',
+      m.ticker || '',
+      m.event_ticker || '',
+      m.rules_primary || '',
+    ].join(' ').toLowerCase();
+  }
+
+  /**
+   * Fetch a large batch of markets for client-side search.
+   * No status filter — the API returns active/live markets by default.
+   */
+  async _fetchMarketBatch(pages = 3) {
     const allMarkets = [];
     let cursor = null;
 
-    // Fetch up to 3 pages (300 markets) to search through
-    for (let page = 0; page < 3; page++) {
-      const params = { status: 'open', limit: 200 };
+    for (let page = 0; page < pages; page++) {
+      const params = { limit: 1000 };
       if (cursor) params.cursor = cursor;
 
       const result = await this._fetch('/markets', params);
@@ -146,33 +161,42 @@ class KalshiService {
       if (!cursor || markets.length === 0) break;
     }
 
-    // Filter by keyword match in title, subtitle, or ticker
+    return allMarkets;
+  }
+
+  /**
+   * Search for markets by keyword. Kalshi doesn't have a text search endpoint,
+   * so we fetch markets and filter client-side across all text fields.
+   * Supports multi-word queries (all words must match).
+   */
+  async searchMarkets(query, limit = 10) {
+    const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+    if (words.length === 0) return [];
+
+    const allMarkets = await this._fetchMarketBatch(3);
+
+    // Filter: all query words must appear in the market's searchable text
     const matches = allMarkets.filter(m => {
-      const title = (m.title || '').toLowerCase();
-      const subtitle = (m.subtitle || '').toLowerCase();
-      const ticker = (m.ticker || '').toLowerCase();
-      const eventTicker = (m.event_ticker || '').toLowerCase();
-      return title.includes(lower) || subtitle.includes(lower) ||
-        ticker.includes(lower) || eventTicker.includes(lower);
+      const text = this._marketSearchText(m);
+      return words.every(w => text.includes(w));
     });
 
-    // Sort by volume (most active first)
-    matches.sort((a, b) => (b.volume || 0) - (a.volume || 0));
+    // Sort by volume (most active first), then by 24h volume
+    matches.sort((a, b) => (b.volume_24h || b.volume || 0) - (a.volume_24h || a.volume || 0));
 
     return matches.slice(0, limit);
   }
 
   /**
-   * Get trending/hot markets — most volume, most traded recently.
+   * Get trending/hot markets — most 24h volume.
    */
   async getTrendingMarkets(limit = 15) {
-    const result = await this._fetch('/markets', { status: 'open', limit: 200 });
-    const markets = result.markets || [];
+    const allMarkets = await this._fetchMarketBatch(2);
 
-    // Sort by volume descending to find the hottest markets
-    markets.sort((a, b) => (b.volume || 0) - (a.volume || 0));
+    // Sort by 24h volume (most recently active), fallback to total volume
+    allMarkets.sort((a, b) => (b.volume_24h || 0) - (a.volume_24h || 0) || (b.volume || 0) - (a.volume || 0));
 
-    return markets.slice(0, limit);
+    return allMarkets.slice(0, limit);
   }
 
   /**
@@ -181,38 +205,25 @@ class KalshiService {
   async getMarketsByCategory(category, limit = 10) {
     // Map common categories to likely keyword matches
     const categoryMap = {
-      economics: ['inflation', 'gdp', 'fed', 'interest rate', 'cpi', 'jobs', 'unemployment', 'recession'],
-      crypto: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'solana', 'sol'],
-      politics: ['president', 'election', 'congress', 'senate', 'democrat', 'republican', 'trump', 'biden'],
-      tech: ['ai', 'openai', 'google', 'apple', 'tesla', 'meta', 'nvidia', 'microsoft'],
-      markets: ['s&p', 'sp500', 'nasdaq', 'dow', 'stock', 'market', 'spy'],
-      weather: ['temperature', 'weather', 'hurricane', 'rainfall'],
-      sports: ['nfl', 'nba', 'mlb', 'super bowl', 'world series'],
+      economics: ['inflation', 'gdp', 'fed', 'interest rate', 'cpi', 'jobs', 'unemployment', 'recession', 'tariff'],
+      crypto: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'solana', 'sol', 'coin'],
+      politics: ['president', 'election', 'congress', 'senate', 'democrat', 'republican', 'trump', 'biden', 'governor', 'vote'],
+      tech: ['ai', 'openai', 'google', 'apple', 'tesla', 'meta', 'nvidia', 'microsoft', 'tiktok'],
+      markets: ['s&p', 'sp500', 'nasdaq', 'dow', 'stock', 'market', 'spy', 'index'],
+      weather: ['temperature', 'weather', 'hurricane', 'rainfall', 'climate'],
+      sports: ['nfl', 'nba', 'mlb', 'super bowl', 'world series', 'nhl', 'ufc', 'game'],
     };
 
     const keywords = categoryMap[category.toLowerCase()] || [category.toLowerCase()];
 
-    const allMarkets = [];
-    let cursor = null;
-
-    for (let page = 0; page < 3; page++) {
-      const params = { status: 'open', limit: 200 };
-      if (cursor) params.cursor = cursor;
-
-      const result = await this._fetch('/markets', params);
-      const markets = result.markets || [];
-      allMarkets.push(...markets);
-
-      cursor = result.cursor;
-      if (!cursor || markets.length === 0) break;
-    }
+    const allMarkets = await this._fetchMarketBatch(3);
 
     const matches = allMarkets.filter(m => {
-      const text = `${m.title || ''} ${m.subtitle || ''} ${m.event_ticker || ''}`.toLowerCase();
+      const text = this._marketSearchText(m);
       return keywords.some(kw => text.includes(kw));
     });
 
-    matches.sort((a, b) => (b.volume || 0) - (a.volume || 0));
+    matches.sort((a, b) => (b.volume_24h || 0) - (a.volume_24h || 0) || (b.volume || 0) - (a.volume || 0));
     return matches.slice(0, limit);
   }
 
@@ -224,22 +235,30 @@ class KalshiService {
     const noPrice = yesPrice != null ? (100 - yesPrice) : null;
     const prob = yesPrice != null ? `${yesPrice}%` : 'N/A';
     const volume = m.volume ? Number(m.volume).toLocaleString() : '0';
+    const volume24h = m.volume_24h ? Number(m.volume_24h).toLocaleString() : null;
     const openInterest = m.open_interest ? Number(m.open_interest).toLocaleString() : null;
 
-    const closeDate = m.close_time || m.expected_expiration_time;
+    const closeDate = m.close_time || m.expected_expiration_time || m.expiration_time;
     const closeDateStr = closeDate ? new Date(closeDate).toLocaleDateString() : 'TBD';
+
+    // Build a descriptive title — combine title + yes_sub_title when available
+    let title = m.title || m.ticker;
+    if (m.yes_sub_title && m.title && !m.title.includes(m.yes_sub_title)) {
+      title = `${m.title}: ${m.yes_sub_title}`;
+    }
 
     return {
       ticker: m.ticker,
-      title: m.title || m.subtitle || m.ticker,
-      subtitle: m.subtitle || '',
+      title,
+      subtitle: m.subtitle || m.yes_sub_title || '',
       yesPrice,
       noPrice,
       prob,
       volume,
+      volume24h,
       openInterest,
       closeDateStr,
-      status: m.status || 'open',
+      status: m.status || 'active',
       eventTicker: m.event_ticker,
     };
   }
@@ -255,8 +274,9 @@ class KalshiService {
     for (let i = 0; i < markets.length; i++) {
       const m = this.formatMarket(markets[i]);
       const probEmoji = m.yesPrice >= 70 ? '🟢' : m.yesPrice <= 30 ? '🔴' : '🟡';
+      const vol24h = m.volume24h ? ` (24h: ${m.volume24h})` : '';
       lines.push(`${probEmoji} **${m.title}**`);
-      lines.push(`   Yes: \`${m.prob}\` | Vol: \`${m.volume}\` | Closes: \`${m.closeDateStr}\` | \`${m.ticker}\``);
+      lines.push(`   Yes: \`${m.prob}\` | Vol: \`${m.volume}\`${vol24h} | Closes: \`${m.closeDateStr}\` | \`${m.ticker}\``);
       if (i < markets.length - 1) lines.push('');
     }
 
@@ -278,12 +298,19 @@ class KalshiService {
       '',
       `**Yes Price:** \`${m.prob}\` ($${((m.yesPrice || 0) / 100).toFixed(2)}/contract)`,
       `**No Price:** \`${m.noPrice != null ? m.noPrice + '%' : 'N/A'}\` ($${((m.noPrice || 0) / 100).toFixed(2)}/contract)`,
-      `**Volume:** \`${m.volume}\` contracts`,
+      `**Volume:** \`${m.volume}\` contracts${m.volume24h ? ` (24h: ${m.volume24h})` : ''}`,
       m.openInterest ? `**Open Interest:** \`${m.openInterest}\`` : '',
       `**Closes:** \`${m.closeDateStr}\``,
       `**Status:** \`${m.status}\``,
       `**Ticker:** \`${m.ticker}\``,
     ].filter(Boolean);
+
+    // Rules/description
+    if (market.rules_primary) {
+      const rules = market.rules_primary.slice(0, 200);
+      lines.push('');
+      lines.push(`**Rules:** _${rules}${market.rules_primary.length > 200 ? '...' : ''}_`);
+    }
 
     // Recent trades
     if (trades && trades.trades && trades.trades.length > 0) {
@@ -380,6 +407,8 @@ RECENT TRADE FLOW:
 - Price range: ${minPrice}c — ${maxPrice}c (avg: ${avgPrice}c)`;
     }
 
+    const rulesContext = market.rules_primary ? `\nRules: ${market.rules_primary.slice(0, 500)}` : '';
+
     const prompt = `You are a senior prediction market analyst specializing in probability assessment.
 
 MARKET: "${fm.title}"
@@ -387,7 +416,7 @@ ${fm.subtitle && fm.subtitle !== fm.title ? `Context: ${fm.subtitle}` : ''}
 Current Yes Price: ${fm.prob} (the market says there's a ${fm.prob} chance this happens)
 Volume: ${fm.volume} contracts traded
 Closes: ${fm.closeDateStr}
-Ticker: ${fm.ticker}
+Ticker: ${fm.ticker}${rulesContext}
 ${tradeContext}
 
 TODAY'S DATE: ${todayString()}

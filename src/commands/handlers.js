@@ -1387,21 +1387,43 @@ async function handlePredict(interaction) {
 async function handleOdds(interaction) {
   await interaction.deferReply();
 
-  const ticker = interaction.options.getString('market').toUpperCase();
+  const rawInput = interaction.options.getString('market').toUpperCase();
 
   try {
-    await interaction.editReply(`**${ticker} — Market Deep Dive**\n⏳ Fetching market data & trades...`);
+    await interaction.editReply(`**${rawInput} — Market Deep Dive**\n⏳ Fetching market data & trades...`);
 
-    // Fetch market details and recent trades in parallel
-    const [market, trades] = await Promise.all([
-      kalshi.getMarket(ticker),
-      kalshi.getTrades(ticker, 20).catch(() => null),
-    ]);
+    let market = null;
+    let trades = null;
+
+    // Try direct ticker lookup first
+    try {
+      [market, trades] = await Promise.all([
+        kalshi.getMarket(rawInput),
+        kalshi.getTrades(rawInput, 20).catch(() => null),
+      ]);
+    } catch (fetchErr) {
+      // If 404, this might be a topic/keyword, not a ticker — try searching
+      if (fetchErr.message.includes('404') || fetchErr.message.includes('not_found')) {
+        await interaction.editReply(`**${rawInput}**\n⏳ "${rawInput}" isn't a ticker — searching Kalshi markets...`);
+        const results = await kalshi.searchMarkets(rawInput, 1);
+        if (results && results.length > 0) {
+          const bestMatch = results[0];
+          [market, trades] = await Promise.all([
+            kalshi.getMarket(bestMatch.ticker).catch(() => bestMatch),
+            kalshi.getTrades(bestMatch.ticker, 20).catch(() => null),
+          ]);
+        }
+      } else {
+        throw fetchErr;
+      }
+    }
 
     if (!market || !market.ticker) {
-      await interaction.editReply(`**${ticker}**\n❌ Market not found. Use \`/predict <topic>\` to search for valid market tickers.`);
+      await interaction.editReply(`**${rawInput}**\n❌ No market found. Use \`/predict <topic>\` to search for markets, then copy the ticker (e.g. \`KXBTC-26FEB14-T98000\`).`);
       return;
     }
+
+    const ticker = market.ticker;
 
     // Show market details immediately
     const formatted = kalshi.formatMarketDetailForDiscord(market, trades);
