@@ -60,9 +60,3 @@ async function applyEdit(filePath, newContent, instruction) {
     }
   }
 }
-
-// Emergency disable command (add this to messageCreate handler if not already present)
-if (message && message.content === '!disable-autoedit' && message.author.id === BOT_OWNER_ID) {
-  autoApplyEdits = false;
-  message.reply('Autonomous self-edits disabled. Use !enable-autoedit to re-enable.');
-}
