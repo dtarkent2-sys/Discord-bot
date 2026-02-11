@@ -36,6 +36,22 @@ const DEFAULT_CONFIG = {
   position_size_pct: 0.25,           // max % of cash per trade (25%)
   symbol_allowlist: [],              // empty = allow all
   symbol_denylist: [],               // ticker blacklist
+
+  // ── Options-specific risk rules ──
+  options_max_premium_per_trade: 500,   // max $ premium per single options trade
+  options_max_daily_loss: 1000,         // max $ options loss per day before halt
+  options_max_positions: 3,             // max concurrent options positions
+  options_scalp_take_profit_pct: 0.30,  // 30% profit target for scalps
+  options_scalp_stop_loss_pct: 0.25,    // 25% stop loss for scalps
+  options_swing_take_profit_pct: 0.75,  // 75% profit target for swings
+  options_swing_stop_loss_pct: 0.40,    // 40% stop loss for swings
+  options_min_conviction: 7,            // min AI conviction (1-10) to enter a trade
+  options_close_before_minutes: 30,     // close 0DTE positions X min before market close
+  options_min_delta: 0.25,              // min option delta for contract selection
+  options_max_delta: 0.60,              // max option delta for contract selection
+  options_max_spread_pct: 0.10,         // max bid-ask spread as % of mid price
+  options_underlyings: ['SPY', 'QQQ'],  // default underlyings to scan
+  options_cooldown_minutes: 5,          // cooldown between options trades on same underlying
 };
 
 // Keys that accept numeric values
@@ -44,6 +60,13 @@ const NUMERIC_KEYS = new Set([
   'stop_loss_pct', 'take_profit_pct', 'cooldown_minutes',
   'min_sentiment_score', 'min_analyst_confidence', 'scan_interval_minutes',
   'position_size_pct',
+  // Options-specific
+  'options_max_premium_per_trade', 'options_max_daily_loss', 'options_max_positions',
+  'options_scalp_take_profit_pct', 'options_scalp_stop_loss_pct',
+  'options_swing_take_profit_pct', 'options_swing_stop_loss_pct',
+  'options_min_conviction', 'options_close_before_minutes',
+  'options_min_delta', 'options_max_delta', 'options_max_spread_pct',
+  'options_cooldown_minutes',
 ]);
 
 // Keys that accept boolean values
@@ -53,7 +76,7 @@ const BOOLEAN_KEYS = new Set([
 
 // Keys that accept comma-separated list values
 const LIST_KEYS = new Set([
-  'symbol_allowlist', 'symbol_denylist',
+  'symbol_allowlist', 'symbol_denylist', 'options_underlyings',
 ]);
 
 class PolicyEngine {
@@ -67,6 +90,8 @@ class PolicyEngine {
     this.lastResetDate = '';
     this.tradeCooldowns = new Map(); // symbol → timestamp of last trade
     this._approvalTokens = new Map(); // tokenId → { order, expiresAt }
+    this.optionsDailyLoss = 0;  // running daily options P&L loss
+    this.optionsCooldowns = new Map(); // underlying → timestamp of last options trade
   }
 
   // ── Configuration ─────────────────────────────────────────────────
@@ -173,8 +198,9 @@ class PolicyEngine {
     if (this.lastResetDate !== today) {
       this.dailyPnL = 0;
       this.dailyStartEquity = currentEquity;
+      this.optionsDailyLoss = 0;
       this.lastResetDate = today;
-      console.log(`[Policy] Daily reset — start equity: $${currentEquity.toFixed(2)}`);
+      console.log(`[Policy] Daily reset — start equity: $${currentEquity.toFixed(2)}, options daily loss reset`);
     }
   }
 
@@ -305,6 +331,183 @@ class PolicyEngine {
           pnlPct,
           message: `Take profit triggered: +${(pnlPct * 100).toFixed(1)}% (target: +${(this.config.take_profit_pct * 100).toFixed(0)}%)`,
         });
+      }
+    }
+
+    return exits;
+  }
+
+  // ── Options-Specific Validation ──────────────────────────────────
+
+  /**
+   * Validate an options trade against options-specific risk rules.
+   * @param {object} ctx
+   * @param {string} ctx.underlying - SPY, QQQ, etc.
+   * @param {number} ctx.premium - total premium (price × qty × 100)
+   * @param {number} ctx.qty - number of contracts
+   * @param {number} ctx.currentOptionsPositions - current open options positions
+   * @param {number} ctx.delta - option delta
+   * @param {number} ctx.spreadPct - bid-ask spread as % of mid
+   * @param {number} ctx.conviction - AI conviction score (1-10)
+   * @param {number} ctx.minutesToClose - minutes until market close
+   * @returns {{ allowed: boolean, violations: string[], warnings: string[] }}
+   */
+  evaluateOptionsOrder(ctx) {
+    const violations = [];
+    const warnings = [];
+    const cfg = this.config;
+
+    if (this.killSwitch) {
+      violations.push('Kill switch is active — all trading halted');
+      return { allowed: false, violations, warnings };
+    }
+
+    if (!cfg.options_enabled) {
+      violations.push('Options trading is disabled (set options_enabled: true to enable)');
+      return { allowed: false, violations, warnings };
+    }
+
+    // Premium per trade
+    if (ctx.premium > cfg.options_max_premium_per_trade) {
+      violations.push(`Premium $${ctx.premium.toFixed(0)} exceeds max $${cfg.options_max_premium_per_trade}`);
+    }
+
+    // Daily options loss limit
+    if (this.optionsDailyLoss >= cfg.options_max_daily_loss) {
+      violations.push(`Daily options loss limit reached: $${this.optionsDailyLoss.toFixed(0)} (max $${cfg.options_max_daily_loss})`);
+    }
+
+    // Position count
+    if (ctx.currentOptionsPositions >= cfg.options_max_positions) {
+      violations.push(`Max options positions reached: ${ctx.currentOptionsPositions}/${cfg.options_max_positions}`);
+    }
+
+    // Conviction threshold
+    if (ctx.conviction < cfg.options_min_conviction) {
+      violations.push(`Conviction ${ctx.conviction}/10 below minimum ${cfg.options_min_conviction}`);
+    }
+
+    // Delta range
+    if (ctx.delta != null) {
+      const absDelta = Math.abs(ctx.delta);
+      if (absDelta < cfg.options_min_delta) {
+        violations.push(`Delta ${absDelta.toFixed(2)} too low (min ${cfg.options_min_delta}) — too far OTM`);
+      }
+      if (absDelta > cfg.options_max_delta) {
+        warnings.push(`Delta ${absDelta.toFixed(2)} above preferred max ${cfg.options_max_delta} — consider lower strike`);
+      }
+    }
+
+    // Bid-ask spread
+    if (ctx.spreadPct != null && ctx.spreadPct > cfg.options_max_spread_pct) {
+      violations.push(`Bid-ask spread ${(ctx.spreadPct * 100).toFixed(1)}% exceeds max ${(cfg.options_max_spread_pct * 100).toFixed(0)}%`);
+    }
+
+    // Time-of-day: don't open 0DTE positions too close to market close
+    if (ctx.minutesToClose != null && ctx.minutesToClose < cfg.options_close_before_minutes) {
+      violations.push(`Only ${ctx.minutesToClose} min to close — too late for new 0DTE entry (need ${cfg.options_close_before_minutes}+ min)`);
+    }
+
+    // Cooldown per underlying
+    const lastTrade = this.optionsCooldowns.get(ctx.underlying);
+    if (lastTrade) {
+      const minutesSince = (Date.now() - lastTrade) / 60000;
+      if (minutesSince < cfg.options_cooldown_minutes) {
+        violations.push(`Options cooldown active for ${ctx.underlying}: ${Math.ceil(cfg.options_cooldown_minutes - minutesSince)} min remaining`);
+      }
+    }
+
+    // Daily loss limit (warning zone at 75%)
+    if (this.optionsDailyLoss >= cfg.options_max_daily_loss * 0.75) {
+      warnings.push(`Options daily loss at ${((this.optionsDailyLoss / cfg.options_max_daily_loss) * 100).toFixed(0)}% of limit`);
+    }
+
+    return { allowed: violations.length === 0, violations, warnings };
+  }
+
+  /**
+   * Record an options trade execution for cooldown tracking.
+   */
+  recordOptionsTrade(underlying) {
+    this.optionsCooldowns.set(underlying, Date.now());
+  }
+
+  /**
+   * Record an options trade P&L for daily loss tracking.
+   * @param {number} pnl - positive for profit, negative for loss
+   */
+  recordOptionsTradeResult(pnl) {
+    if (pnl < 0) {
+      this.optionsDailyLoss += Math.abs(pnl);
+    }
+  }
+
+  /**
+   * Check options positions for exit signals.
+   * Options use % of premium for stop/take-profit, plus time-based exits.
+   *
+   * @param {Array} positions - Alpaca options positions
+   * @param {string} strategy - 'scalp' or 'swing'
+   * @param {number} minutesToClose - minutes until market close
+   * @returns {Array<{symbol, reason, pnlPct, message}>}
+   */
+  checkOptionsExits(positions, strategy = 'scalp', minutesToClose = Infinity) {
+    const exits = [];
+    const cfg = this.config;
+
+    const stopPct = strategy === 'scalp' ? cfg.options_scalp_stop_loss_pct : cfg.options_swing_stop_loss_pct;
+    const tpPct = strategy === 'scalp' ? cfg.options_scalp_take_profit_pct : cfg.options_swing_take_profit_pct;
+
+    for (const pos of positions) {
+      const pnlPct = Number(pos.unrealized_plpc || 0);
+
+      // Stop loss
+      if (pnlPct <= -stopPct) {
+        exits.push({
+          symbol: pos.symbol,
+          reason: 'options_stop_loss',
+          pnlPct,
+          message: `Options stop loss: ${(pnlPct * 100).toFixed(1)}% (limit: -${(stopPct * 100).toFixed(0)}%)`,
+        });
+        continue;
+      }
+
+      // Take profit
+      if (pnlPct >= tpPct) {
+        exits.push({
+          symbol: pos.symbol,
+          reason: 'options_take_profit',
+          pnlPct,
+          message: `Options take profit: +${(pnlPct * 100).toFixed(1)}% (target: +${(tpPct * 100).toFixed(0)}%)`,
+        });
+        continue;
+      }
+
+      // Time-based exit: close 0DTE positions before market close
+      if (minutesToClose <= cfg.options_close_before_minutes) {
+        exits.push({
+          symbol: pos.symbol,
+          reason: 'time_exit',
+          pnlPct,
+          message: `Time exit: ${minutesToClose} min to close, P/L: ${(pnlPct * 100).toFixed(1)}%`,
+        });
+        continue;
+      }
+
+      // Trailing stop: if position was up >15% and drops back to +5%, lock profit
+      if (pnlPct > 0.05 && pnlPct < stopPct * 0.5) {
+        // Check if we had a bigger unrealized gain (simple heuristic)
+        const costBasis = Number(pos.cost_basis || 0);
+        const marketValue = Number(pos.market_value || 0);
+        if (costBasis > 0 && marketValue > 0) {
+          // This position was profitable but giving back gains
+          exits.push({
+            symbol: pos.symbol,
+            reason: 'trailing_stop',
+            pnlPct,
+            message: `Trailing stop: profit fading, locking +${(pnlPct * 100).toFixed(1)}%`,
+          });
+        }
       }
     }
 

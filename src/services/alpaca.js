@@ -373,6 +373,131 @@ class AlpacaService {
   }
   async getAsset(symbol) { return this._tradeFetch(`/v2/assets/${symbol.toUpperCase()}`); }
   get isPaper() { return TRADING_BASE.includes('paper'); }
+
+  // ═══════════════════════════════════════════════════════════════════
+  //  OPTIONS TRADING API
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * Create an options order using the OCC symbol.
+   *
+   * Alpaca options orders use the standard /v2/orders endpoint but with
+   * OCC-formatted symbols (e.g. SPY260211C00600000) and qty (not notional).
+   *
+   * @param {object} params
+   * @param {string} params.symbol - OCC option symbol (e.g. SPY260211C00600000)
+   * @param {number} params.qty - Number of contracts
+   * @param {string} params.side - 'buy' (to open) or 'sell' (to close)
+   * @param {string} [params.type='limit'] - 'market' or 'limit'
+   * @param {number} [params.limit_price] - Required for limit orders
+   * @param {string} [params.time_in_force='day'] - 'day', 'gtc', 'ioc', 'fok'
+   * @returns {object} Order response
+   */
+  async createOptionsOrder(params) {
+    const order = {
+      symbol: params.symbol,
+      qty: String(params.qty),
+      side: params.side,
+      type: params.type || 'limit',
+      time_in_force: params.time_in_force || 'day',
+    };
+    if (params.limit_price != null) {
+      order.limit_price = String(params.limit_price);
+    }
+    console.log(`[Alpaca:Trade] OPTIONS ORDER ${order.side} ${order.qty}x ${order.symbol} @ ${order.type}${order.limit_price ? ' $' + order.limit_price : ''}`);
+    return this._tradeFetch('/v2/orders', 'POST', order);
+  }
+
+  /**
+   * Close an options position by selling contracts.
+   *
+   * @param {string} occSymbol - OCC option symbol
+   * @param {number} [qty] - Contracts to close (omit for all)
+   */
+  async closeOptionsPosition(occSymbol, qty) {
+    const params = new URLSearchParams();
+    if (qty) params.set('qty', String(qty));
+    const qs = params.toString() ? `?${params}` : '';
+    return this._tradeFetch(`/v2/positions/${encodeURIComponent(occSymbol)}${qs}`, 'DELETE');
+  }
+
+  /**
+   * Get all open positions filtered to options only.
+   * Options positions have symbols matching OCC format.
+   */
+  async getOptionsPositions() {
+    const all = await this.getPositions();
+    return all.filter(p => /^\w+\d{6}[CP]\d{8}$/.test(p.symbol));
+  }
+
+  /**
+   * Fetch intraday bars for a ticker.
+   *
+   * @param {string} ticker
+   * @param {object} [opts]
+   * @param {string} [opts.timeframe='5Min'] - '1Min', '5Min', '15Min', '1Hour'
+   * @param {number} [opts.limit=50] - Number of bars
+   * @param {string} [opts.start] - ISO timestamp (defaults to market open today)
+   * @returns {Array<{date, open, high, low, close, volume, vwap}>}
+   */
+  async getIntradayBars(ticker, { timeframe = '5Min', limit = 50, start } = {}) {
+    const upper = ticker.toUpperCase();
+    const params = {
+      timeframe,
+      limit,
+      feed: config.alpacaFeed || 'iex',
+    };
+    if (start) params.start = start;
+
+    const data = await this._fetch(`/v2/stocks/${upper}/bars`, params);
+    return (data.bars || []).map(b => ({
+      date: b.t,
+      open: b.o,
+      high: b.h,
+      low: b.l,
+      close: b.c,
+      volume: b.v,
+      vwap: b.vw,
+    }));
+  }
+
+  /**
+   * Get the latest options quote for an OCC symbol.
+   * Returns bid/ask/last for an individual option contract.
+   */
+  async getOptionQuote(occSymbol) {
+    const data = await this._fetch(`/v1beta1/options/quotes/latest`, {
+      symbols: occSymbol,
+      feed: 'indicative',
+    });
+    const quote = data?.quotes?.[occSymbol];
+    if (!quote) return null;
+    return {
+      symbol: occSymbol,
+      bid: quote.bp ?? 0,
+      ask: quote.ap ?? 0,
+      bidSize: quote.bs ?? 0,
+      askSize: quote.as ?? 0,
+      timestamp: quote.t,
+    };
+  }
+
+  /**
+   * Build an OCC option symbol.
+   * @param {string} underlying - e.g. 'SPY'
+   * @param {string} expiration - 'YYYY-MM-DD'
+   * @param {string} type - 'call' or 'put'
+   * @param {number} strike - e.g. 600.00
+   * @returns {string} OCC symbol e.g. 'SPY260211C00600000'
+   */
+  buildOccSymbol(underlying, expiration, type, strike) {
+    const root = underlying.toUpperCase();
+    const [yyyy, mm, dd] = expiration.split('-');
+    const yy = yyyy.slice(2);
+    const cp = type === 'call' ? 'C' : 'P';
+    const strikeStr = String(Math.round(strike * 1000)).padStart(8, '0');
+    return `${root}${yy}${mm}${dd}${cp}${strikeStr}`;
+  }
 }
 
 module.exports = new AlpacaService();
