@@ -517,7 +517,10 @@ class KalshiService {
     const marketSummary = topEvents.map(m => {
       const fm = this.formatMarket(m);
       const siblings = m._contractCount > 1 ? ` [${m._contractCount} contracts in this event]` : '';
-      return `- "${fm.title}" | Yes: ${fm.prob} | Volume: ${fm.volume} | Closes: ${fm.closeDateStr} | Ticker: ${fm.ticker}${siblings}`;
+      // Include YES/NO meanings so the AI knows exactly what each side represents
+      const yesMeaning = m.yes_sub_title ? ` (YES = "${m.yes_sub_title}")` : '';
+      const noMeaning = m.no_sub_title ? ` (NO = "${m.no_sub_title}")` : '';
+      return `- "${fm.title}" | Yes: ${fm.prob}${yesMeaning}${noMeaning} | Volume: ${fm.volume} | Closes: ${fm.closeDateStr} | Ticker: ${fm.ticker}${siblings}`;
     }).join('\n');
 
     const prompt = `You are a sharp prediction market trader. A user asked for a play on "${query}". Here are the available Kalshi markets:
@@ -525,6 +528,13 @@ class KalshiService {
 ${marketSummary}
 
 TODAY'S DATE: ${todayString()}
+
+IMPORTANT CONTEXT:
+- Each market is a specific YES/NO question with a specific threshold (e.g. "Bitcoin above $98,000?" is DIFFERENT from "Bitcoin above $105,000?")
+- "BUY YES" = you believe the specific event described WILL happen
+- "BUY NO" = you believe the specific event described will NOT happen
+- Your recommendation must be about THIS EXACT CONTRACT at THIS EXACT threshold — do not generalize
+- Reference the specific ticker so the user knows exactly which contract to trade
 
 Pick your #1 HIGH CONVICTION play. The user wants ONE clear bet, not a dissertation.
 
@@ -536,8 +546,9 @@ Analyze which market has the biggest mispricing — where the market odds are WR
 FORMAT YOUR RESPONSE EXACTLY LIKE THIS (keep it punchy):
 
 🎯 **THE PLAY**
-**[Market title]**
+**[Full market question including the specific threshold]** (\`[TICKER]\`)
 Side: **BUY [YES/NO]** @ [current price]c
+Meaning: [1 sentence explaining what your bet means in plain English, e.g. "Betting Bitcoin stays above $98k by Feb 14"]
 My odds: [your probability]% vs market's [their probability]%
 Edge: [difference]%
 
@@ -585,12 +596,15 @@ RECENT TRADE FLOW:
     }
 
     const rulesContext = market.rules_primary ? `\nRules: ${market.rules_primary.slice(0, 500)}` : '';
+    // Include what YES/NO means so the AI doesn't misinterpret the sides
+    const yesMeaning = market.yes_sub_title ? `\nYES means: "${market.yes_sub_title}"` : '';
+    const noMeaning = market.no_sub_title ? `\nNO means: "${market.no_sub_title}"` : '';
 
     const prompt = `You are a sharp prediction market trader. Give a clear, decisive analysis.
 
 MARKET: "${fm.title}"
 ${fm.subtitle && fm.subtitle !== fm.title ? `Context: ${fm.subtitle}` : ''}
-Current Yes Price: ${fm.prob} (market-implied probability)
+Current Yes Price: ${fm.prob} (market-implied probability)${yesMeaning}${noMeaning}
 Volume: ${fm.volume} contracts traded
 Closes: ${fm.closeDateStr}
 Ticker: ${fm.ticker}${rulesContext}
@@ -598,12 +612,15 @@ ${tradeContext}
 
 TODAY'S DATE: ${todayString()}
 
+IMPORTANT: "BUY YES" means you believe the specific event/threshold WILL happen. "BUY NO" means you believe it will NOT happen. Be precise about what you're betting on.
+
 FORMAT YOUR RESPONSE (keep it punchy — traders don't read essays):
 
 📊 **MARKET: ${fm.prob} implied probability**
 My estimate: **[X]%** → Edge: **[diff]%**
 
 🎯 **VERDICT: BUY YES / BUY NO / NO BET**
+Meaning: [1 sentence in plain English, e.g. "Betting inflation stays above 3%"]
 Entry: [price]c | Conviction: [1-10]/10
 
 **Thesis:** [2-3 sentences — the core reasoning]
