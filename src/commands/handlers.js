@@ -25,6 +25,7 @@ const policy = require('../services/policy');
 const optionsEngine = require('../services/options-engine');
 const initiative = require('../services/initiative');
 const gammaSqueeze = require('../services/gamma-squeeze');
+const yoloMode = require('../services/yolo-mode');
 const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -353,8 +354,9 @@ async function handleHelp(interaction) {
     '`/flow <ticker>` — Smart money flow (insider + congress trades)',
     '`/whales <ticker>` — Full intelligence dashboard (analysts + fundamentals + insider + congress)',
     '',
-    '**YOLO**',
-    '`/yolo <ticker> [budget]` — High-conviction aggressive trade play with full data',
+    '**YOLO Mode (Self-Improvement)**',
+    '`/yolo status` — See YOLO mode state | `/yolo enable|disable` — Toggle',
+    '`/yolo run` — Manual improvement cycle | `/yolo history` `/yolo logs`',
     '',
     '**SHARK Agent**',
     '`/agent status` — Positions, risk, P/L',
@@ -1729,156 +1731,109 @@ async function handleSqueeze(interaction) {
   return interaction.reply({ content: 'Unknown squeeze action.', flags: MessageFlags.Ephemeral });
 }
 
-// ── /yolo — High-conviction aggressive trade generator ────────────────
+// ── /yolo — Autonomous self-improvement engine control ────────────────
 async function handleYolo(interaction) {
-  await interaction.deferReply();
+  const action = interaction.options.getString('action');
+  const hasAdminPerms = interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator);
+  const isOwner = config.botOwnerId && interaction.user.id === config.botOwnerId;
+  const isAuthorized = isOwner || hasAdminPerms;
 
-  const rawTicker = interaction.options.getString('ticker');
-  const ticker = yahoo.resolveTicker(rawTicker);
-  const budget = interaction.options.getNumber('budget');
+  // Privileged actions require owner/admin
+  const privilegedActions = new Set(['enable', 'disable', 'run']);
+  if (privilegedActions.has(action) && !isAuthorized) {
+    return interaction.reply({
+      content: 'YOLO mode control is restricted to the bot owner or server administrators.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 
-  try {
-    await interaction.editReply(`**${ticker} — YOLO Mode**\n⏳ Gathering market data, technicals, sentiment, and gamma...`);
-
-    // Fire all data fetches in parallel for speed
-    const [
-      marketCtx,
-      techResult,
-      socialResult,
-      redditResult,
-    ] = await Promise.allSettled([
-      getMarketContext(ticker),
-      technicals.analyze(ticker).catch(() => null),
-      stocktwits.analyzeSymbol(ticker).catch(() => null),
-      reddit.analyzeSymbol(ticker.replace('-USD', '')).catch(() => null),
-    ]);
-
-    const context = marketCtx.status === 'fulfilled' ? marketCtx.value : null;
-    const tech = techResult.status === 'fulfilled' ? techResult.value : null;
-    const social = socialResult.status === 'fulfilled' ? socialResult.value : null;
-    const redditData = redditResult.status === 'fulfilled' ? redditResult.value : null;
-
-    if (!context || context.error) {
-      await interaction.editReply(`**${ticker} — YOLO**\n❌ Can't YOLO without data: ${context?.message || 'market data unavailable'}`);
-      return;
+  switch (action) {
+    case 'status': {
+      const s = yoloMode.getStatus();
+      const lines = [
+        '**YOLO Mode — Autonomous Self-Improvement**',
+        '',
+        `**Enabled:** ${s.enabled ? 'YES' : 'NO'}`,
+        `**Running:** ${s.running ? 'YES' : 'NO'}`,
+        `**GitHub:** ${s.githubEnabled ? 'Connected' : 'Not configured (need GITHUB_TOKEN)'}`,
+        `**Cycle interval:** ${s.cycleIntervalMin} min`,
+        '',
+        `**Today:** ${s.dailyCount}/${s.dailyLimit} improvements`,
+        `**Total improvements:** ${s.totalImprovements}`,
+        `**Consecutive failures:** ${s.consecutiveFailures}/${s.failureThreshold}`,
+        '',
+        '_The bot scans its own code, finds issues, generates fixes, and deploys them autonomously._',
+      ];
+      return interaction.reply(lines.join('\n'));
     }
 
-    await interaction.editReply(`**${ticker} — YOLO Mode**\n⏳ Data collected. AI is cooking up your YOLO play...`);
-
-    // Build the data summary for the AI prompt
-    const q = context.quote || {};
-    const s = context.snapshot || {};
-
-    const dataParts = [];
-    dataParts.push(`=== LIVE MARKET DATA (as of ${context.fetchedAt || new Date().toISOString()}) ===`);
-    dataParts.push(`Ticker: ${ticker}`);
-    if (q.price) dataParts.push(`Price: $${q.price}`);
-    if (q.changePercent != null) dataParts.push(`Daily Change: ${q.changePercent > 0 ? '+' : ''}${q.changePercent.toFixed(2)}%`);
-    if (q.volume) dataParts.push(`Volume: ${Number(q.volume).toLocaleString()}`);
-    if (q.mktCap) dataParts.push(`Market Cap: $${(q.mktCap / 1e9).toFixed(2)}B`);
-    if (s.fiftyTwoWeekHigh) dataParts.push(`52W High: $${s.fiftyTwoWeekHigh}`);
-    if (s.fiftyTwoWeekLow) dataParts.push(`52W Low: $${s.fiftyTwoWeekLow}`);
-    if (s.beta) dataParts.push(`Beta: ${s.beta}`);
-    if (q.pe) dataParts.push(`P/E: ${q.pe}`);
-    if (s.eps) dataParts.push(`EPS: $${s.eps}`);
-
-    if (tech) {
-      dataParts.push(`\n=== TECHNICALS ===`);
-      if (tech.rsi14 != null) dataParts.push(`RSI(14): ${tech.rsi14}`);
-      if (tech.macd) dataParts.push(`MACD: ${JSON.stringify(tech.macd)}`);
-      if (tech.bollingerBands) dataParts.push(`Bollinger Bands: ${JSON.stringify(tech.bollingerBands)}`);
-      if (tech.sma50 != null) dataParts.push(`SMA(50): $${tech.sma50}`);
-      if (tech.sma200 != null) dataParts.push(`SMA(200): $${tech.sma200}`);
-      if (tech.atr14 != null) dataParts.push(`ATR(14): $${tech.atr14}`);
-      if (tech.signals && tech.signals.length > 0) dataParts.push(`Signals: ${tech.signals.map(s => s.signal || s).join(', ')}`);
+    case 'enable': {
+      yoloMode.enable();
+      return interaction.reply(
+        '**YOLO Mode ENABLED**\n' +
+        'The bot will now autonomously scan its own codebase, identify improvements, ' +
+        'generate fixes, and deploy them via GitHub.\n\n' +
+        'Safety: max 5 improvements/day, max 20 lines/commit, forbidden files protected, ' +
+        'auto-pause after 3 consecutive failures.\n\n' +
+        '_Use `/yolo status` to monitor, `/yolo disable` to stop._'
+      );
     }
 
-    if (social) {
-      dataParts.push(`\n=== STOCKTWITS SENTIMENT ===`);
-      if (social.sentiment) dataParts.push(`Sentiment: ${social.sentiment.label || social.sentiment} (bull: ${social.sentiment.bullPercent || 'N/A'}%, bear: ${social.sentiment.bearPercent || 'N/A'}%)`);
-      if (social.volume) dataParts.push(`Message Volume: ${social.volume}`);
+    case 'disable': {
+      yoloMode.disable();
+      return interaction.reply('**YOLO Mode DISABLED**\nAutonomous self-improvement stopped.');
     }
 
-    if (redditData) {
-      dataParts.push(`\n=== REDDIT SENTIMENT ===`);
-      if (redditData.sentiment) dataParts.push(`Overall: ${redditData.sentiment}`);
-      if (redditData.mentions != null) dataParts.push(`Mentions: ${redditData.mentions}`);
-      if (redditData.topPosts && redditData.topPosts.length > 0) {
-        dataParts.push(`Top posts: ${redditData.topPosts.slice(0, 3).map(p => p.title || p).join(' | ')}`);
-      }
-    }
+    case 'run': {
+      await interaction.deferReply();
+      await interaction.editReply('**YOLO Mode — Manual Cycle**\nRunning improvement scan now...');
 
-    const budgetLine = budget ? `\nThe user has a YOLO budget of $${budget.toLocaleString()}. Size the position accordingly.` : '';
-
-    const yoloPrompt = `You are a Wall Street degen trade analyst generating a YOLO play. This is for ENTERTAINMENT and EDUCATIONAL purposes — the user understands the risks.
-
-Your job: Analyze the provided live market data and generate the MOST AGGRESSIVE, HIGHEST-CONVICTION trade setup you can find for ${ticker}. Think like a WSB trader who found an asymmetric opportunity.
-
-RULES:
-1. ONLY use the market data provided below. Do NOT invent any prices, dates, or facts.
-2. You MUST include specific price levels (entry, target, stop-loss) based on the actual data.
-3. Prefer options plays (calls/puts) when the setup supports it — specify strike, expiration style (0DTE, weekly, monthly), and direction.
-4. If the data genuinely shows NO viable aggressive play, say so honestly — but try hard to find one.
-5. Include a risk rating (1-10, where 10 = maximum degen).
-6. Keep the tone bold and confident, but back every claim with actual data.${budgetLine}
-
-FORMAT your response EXACTLY like this (use the headers):
-
-**${ticker} YOLO PLAY**
-
-**Direction:** [CALLS/PUTS/LONG/SHORT]
-**Conviction:** [1-10] / 10
-**Risk Level:** [1-10] / 10
-
-**The Play:**
-[2-3 sentences describing the trade — strike, expiration style, reasoning]
-
-**Entry:** $[price]
-**Target:** $[price] ([X]% gain)
-**Stop-Loss:** $[price] ([X]% risk)
-**Risk/Reward:** [X:1]
-${budget ? `\n**Position Size:** [$ amount and contract count based on $${budget.toLocaleString()} budget]` : ''}
-
-**Why This Hits:**
-[3-5 bullet points citing specific data — technicals, sentiment, price action, catalysts from the data]
-
-**What Could Go Wrong:**
-[2-3 bullet points of honest risk factors from the data]
-
-**Degen Rating:** [emoji scale] [one-liner verdict]
-
-=== MARKET DATA ===
-${dataParts.join('\n')}`;
-
-    const response = await ai.complete(yoloPrompt);
-
-    if (!response || !response.trim()) {
-      await interaction.editReply(`**${ticker} — YOLO**\n❌ AI couldn't generate a play. Try again in a moment.`);
-      return;
-    }
-
-    // Format and send
-    const disclaimer = `\n\n_This is not financial advice. YOLO trades carry extreme risk. Do your own DD._`;
-    let output = response.trim() + disclaimer;
-
-    // Handle Discord 2000 char limit
-    if (output.length <= 2000) {
-      await interaction.editReply(output);
-    } else {
-      // Send main play in editReply, overflow in followUp
-      const mainPart = output.slice(0, 1990) + '...';
-      await interaction.editReply(mainPart);
-
-      const remaining = '...' + output.slice(1990);
-      if (remaining.length <= 2000) {
-        await interaction.followUp(remaining);
+      const result = await yoloMode.runNow();
+      if (result.success) {
+        await interaction.editReply('**YOLO Mode — Manual Cycle Complete**\nCheck `/yolo history` and `/yolo logs` for details.');
       } else {
-        await interaction.followUp(remaining.slice(0, 1990) + '...');
+        await interaction.editReply(`**YOLO Mode — Manual Cycle**\n${result.message}`);
       }
+      break;
     }
-  } catch (err) {
-    console.error(`[YOLO] Error for ${ticker}:`, err);
-    await interaction.editReply(`**${ticker} — YOLO**\n❌ ${err.message}`);
+
+    case 'history': {
+      const history = yoloMode.getHistory(10);
+      if (history.length === 0) {
+        return interaction.reply({ content: '_No improvements yet. Enable YOLO mode to start._', flags: MessageFlags.Ephemeral });
+      }
+
+      const lines = ['**YOLO Mode — Recent Improvements**\n'];
+      for (const h of history.slice().reverse()) {
+        const time = new Date(h.timestamp).toLocaleString('en-US', { timeZone: 'America/New_York' });
+        const emoji = h.source === 'error_pattern' ? '🔧' : '🔍';
+        lines.push(`${emoji} **${time} ET**`);
+        lines.push(`\`${h.file}\` — ${h.linesChanged} lines — ${h.source.replace('_', ' ')}`);
+        lines.push(`${h.instruction.slice(0, 120)}`);
+        if (h.commitUrl) lines.push(`<${h.commitUrl}>`);
+        lines.push('');
+      }
+      return interaction.reply(lines.join('\n').slice(0, 2000));
+    }
+
+    case 'logs': {
+      const journal = yoloMode.getJournal(15);
+      if (journal.length === 0) {
+        return interaction.reply({ content: '_No journal entries yet. The brain logs decisions once YOLO mode runs._', flags: MessageFlags.Ephemeral });
+      }
+
+      const lines = ['**YOLO Mode — Decision Journal**\n'];
+      for (const e of journal.slice().reverse()) {
+        const time = new Date(e.timestamp).toLocaleString('en-US', { timeZone: 'America/New_York' });
+        const emoji = { improvement: '✅', blocked: '⛔', failed: '❌' }[e.type] || '📝';
+        lines.push(`${emoji} \`${time}\` [${e.type}] \`${e.file}\``);
+        lines.push(`  ${e.content.slice(0, 150)}`);
+      }
+      return interaction.reply(lines.join('\n').slice(0, 2000));
+    }
+
+    default:
+      return interaction.reply({ content: 'Unknown YOLO action.', flags: MessageFlags.Ephemeral });
   }
 }
 

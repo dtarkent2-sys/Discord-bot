@@ -404,17 +404,19 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('yolo')
-    .setDescription('YOLO trade generator — high-conviction, aggressive play with full data backing')
+    .setDescription('YOLO Mode — autonomous self-improvement engine that makes the bot better on its own')
     .addStringOption(opt =>
-      opt.setName('ticker')
-        .setDescription('Stock symbol to YOLO (e.g. TSLA, NVDA, SPY, AMC)')
+      opt.setName('action')
+        .setDescription('Action to perform')
         .setRequired(true)
-    )
-    .addNumberOption(opt =>
-      opt.setName('budget')
-        .setDescription('How much $ you want to YOLO (optional, for position sizing)')
-        .setRequired(false)
-        .setMinValue(100)
+        .addChoices(
+          { name: 'status — current YOLO mode state', value: 'status' },
+          { name: 'enable — activate autonomous self-improvement', value: 'enable' },
+          { name: 'disable — stop autonomous self-improvement', value: 'disable' },
+          { name: 'run — manually trigger an improvement cycle', value: 'run' },
+          { name: 'history — recent improvements made', value: 'history' },
+          { name: 'logs — journal of all YOLO decisions', value: 'logs' },
+        )
     ),
 ];
 
