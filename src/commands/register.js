@@ -255,6 +255,42 @@ const commands = [
         .setDescription('Comma-separated tickers (e.g. AAPL,TSLA,SPY)')
         .setRequired(false)
     ),
+
+  new SlashCommandBuilder()
+    .setName('predict')
+    .setDescription('Search Kalshi prediction markets + AI betting recommendations')
+    .addStringOption(opt =>
+      opt.setName('topic')
+        .setDescription('What to search (e.g. "inflation", "bitcoin", "election", "recession")')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('odds')
+    .setDescription('Deep dive on a Kalshi prediction market — price, trades, AI analysis')
+    .addStringOption(opt =>
+      opt.setName('market')
+        .setDescription('Kalshi market ticker (e.g. KXBTC-26FEB14-T98000)')
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('bets')
+    .setDescription('Browse trending/hot Kalshi prediction markets by category')
+    .addStringOption(opt =>
+      opt.setName('category')
+        .setDescription('Category to browse')
+        .setRequired(false)
+        .addChoices(
+          { name: 'Trending (most volume)', value: 'trending' },
+          { name: 'Economics (inflation, GDP, Fed)', value: 'economics' },
+          { name: 'Crypto (BTC, ETH, SOL)', value: 'crypto' },
+          { name: 'Politics (elections, policy)', value: 'politics' },
+          { name: 'Tech (AI, FAANG)', value: 'tech' },
+          { name: 'Markets (S&P, Nasdaq, indices)', value: 'markets' },
+          { name: 'Sports', value: 'sports' },
+        )
+    ),
 ];
 
 async function registerCommands() {
