@@ -706,49 +706,8 @@ async function handleGEX(interaction) {
       await interaction.editReply(summary + '\n\n_Chart unavailable — canvas module not loaded._');
     }
 
-    // Enrich with Unusual Whales spot exposures + max pain if available
-    if (uw.enabled) {
-      try {
-        const [spotData, maxPainData, netPremData] = await Promise.allSettled([
-          uw.getSpotExposures(ticker),
-          uw.getMaxPain(ticker),
-          uw.getNetPremTicks(ticker),
-        ]);
-
-        const uwLines = [`**Unusual Whales — ${ticker} Options Intelligence**`];
-        let hasData = false;
-
-        if (maxPainData.status === 'fulfilled' && maxPainData.value) {
-          const mp = maxPainData.value?.data || maxPainData.value;
-          const pain = Array.isArray(mp) ? mp[0]?.max_pain || mp[0]?.price : mp.max_pain || mp.price;
-          if (pain != null) {
-            uwLines.push(`**Max Pain:** \`$${pain}\``);
-            hasData = true;
-          }
-        }
-
-        if (netPremData.status === 'fulfilled' && netPremData.value) {
-          const ticks = netPremData.value?.data || netPremData.value;
-          if (Array.isArray(ticks) && ticks.length > 0) {
-            const latest = ticks[ticks.length - 1];
-            const callPrem = Number(latest.net_call_premium || 0);
-            const putPrem = Number(latest.net_put_premium || 0);
-            const net = callPrem - putPrem;
-            const bias = net > 0 ? '🟢 CALL-DOMINANT' : '🔴 PUT-DOMINANT';
-            uwLines.push(`**Net Premium:** ${bias} (\`$${(Math.abs(net) / 1e6).toFixed(2)}M\` net)`);
-            hasData = true;
-          }
-        }
-
-        if (hasData) {
-          uwLines.push(`_Unusual Whales data_`);
-          await interaction.followUp({ content: uwLines.join('\n'), flags: MessageFlags.Ephemeral });
-        }
-      } catch (uwErr) {
-        // Non-critical — just skip UW enrichment
-        console.warn(`[GEX] UW enrichment failed for ${ticker}:`, uwErr.message);
-      }
-    }
+    // Unusual Whales enrichment — service not yet implemented
+    // TODO: add uw (unusual-whales) service and re-enable
   } catch (err) {
     console.error(`[GEX] Error for ${ticker}:`, err);
     const msg = err.message || 'Unknown error';
@@ -987,59 +946,8 @@ async function handleMacro(interaction) {
       await interaction.editReply(formatted.slice(0, 1990) + '...');
     }
 
-    // Enrich with Unusual Whales market tide + SPIKE if available
-    if (uw.enabled) {
-      try {
-        const [tideData, spikeData, totalVolData] = await Promise.allSettled([
-          uw.getMarketTide(),
-          uw.getSpike(),
-          uw.getTotalOptionsVolume(),
-        ]);
-
-        const uwLines = ['**Unusual Whales — Options Market Sentiment**'];
-        let hasData = false;
-
-        if (tideData.status === 'fulfilled' && tideData.value) {
-          const tideText = uw.formatMarketTideForDiscord(tideData.value);
-          if (tideText) {
-            uwLines.push(tideText);
-            hasData = true;
-          }
-        }
-
-        if (spikeData.status === 'fulfilled' && spikeData.value) {
-          const spike = spikeData.value?.data || spikeData.value;
-          if (spike) {
-            const val = Array.isArray(spike) ? spike[spike.length - 1] : spike;
-            if (val && (val.spike != null || val.value != null)) {
-              uwLines.push(`**SPIKE (Volatility):** \`${val.spike ?? val.value}\``);
-              hasData = true;
-            }
-          }
-        }
-
-        if (totalVolData.status === 'fulfilled' && totalVolData.value) {
-          const vol = totalVolData.value?.data || totalVolData.value;
-          if (vol) {
-            const latest = Array.isArray(vol) ? vol[vol.length - 1] : vol;
-            if (latest && (latest.total_volume != null || latest.call_volume != null)) {
-              const callVol = latest.call_volume || 0;
-              const putVol = latest.put_volume || 0;
-              const ratio = putVol > 0 ? (callVol / putVol).toFixed(2) : 'N/A';
-              uwLines.push(`**Options Volume:** Calls \`${Number(callVol).toLocaleString()}\` / Puts \`${Number(putVol).toLocaleString()}\` (C/P ratio: \`${ratio}\`)`);
-              hasData = true;
-            }
-          }
-        }
-
-        if (hasData) {
-          uwLines.push('_Unusual Whales data_');
-          await interaction.followUp({ content: uwLines.join('\n'), flags: MessageFlags.Ephemeral });
-        }
-      } catch (uwErr) {
-        console.warn('[Macro] UW enrichment failed:', uwErr.message);
-      }
-    }
+    // Unusual Whales enrichment — service not yet implemented
+    // TODO: add uw (unusual-whales) service and re-enable
   } catch (err) {
     console.error('[Macro] Error:', err);
     await interaction.editReply(`**Macro Environment**\n❌ ${err.message}`);
