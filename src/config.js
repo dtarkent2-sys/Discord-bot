@@ -68,4 +68,7 @@ module.exports = {
   valideaEmail: process.env.VALIDEA_EMAIL || '',
   valideaPassword: process.env.VALIDEA_PASSWORD || '',
   valideaCookie: process.env.VALIDEA_COOKIE || '', // Manual override: paste session cookie if auto-login blocked
+
+  // Unusual Whales (options flow, dark pool, congress trades, GEX, short interest)
+  unusualWhalesApiKey: process.env.UNUSUAL_WHALES_API_KEY || '',
 };
