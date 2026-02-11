@@ -28,6 +28,8 @@
 const alpaca = require('./alpaca');
 const gamma = require('./gamma');
 const GEXEngine = require('./gex-engine');
+const gammaSqueeze = require('./gamma-squeeze');
+const { analyzeMTFEMA, formatMTFForPrompt } = require('./mtf-ema');
 const technicals = require('./technicals');
 const macro = require('./macro');
 const policy = require('./policy');
@@ -322,6 +324,32 @@ class OptionsEngine {
 
     const directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spotPrice, macroRegime);
 
+    // 3b. Check gamma squeeze engine for conviction boost
+    const squeezeSignal = gammaSqueeze.getSqueezeSignal(underlying);
+    if (squeezeSignal.active) {
+      directionSignals.conviction = Math.min(directionSignals.conviction + squeezeSignal.convictionBoost, 10);
+      directionSignals.reasons.push(`Gamma squeeze: ${squeezeSignal.state} (${squeezeSignal.convictionBoost > 0 ? '+' : ''}${squeezeSignal.convictionBoost} conviction) — ${squeezeSignal.reason}`);
+      if (squeezeSignal.direction && squeezeSignal.direction !== directionSignals.direction) {
+        directionSignals.reasons.push(`Squeeze direction (${squeezeSignal.direction}) CONFLICTS with technical direction (${directionSignals.direction})`);
+      }
+      this._log('squeeze', `${underlying}: squeeze=${squeezeSignal.state}, boost=${squeezeSignal.convictionBoost}, dir=${squeezeSignal.direction}`);
+    }
+
+    // 3c. Multi-timeframe 9/20 EMA confluence — blocks low-confluence plays
+    let mtfResult = null;
+    try {
+      mtfResult = await analyzeMTFEMA(underlying);
+      const mtfDir = mtfResult.confluenceScore > 0 ? 'bullish' : 'bearish';
+      const mtfMatchesDirection = mtfDir === directionSignals.direction;
+
+      directionSignals.conviction = Math.max(1, Math.min(directionSignals.conviction + mtfResult.convictionBoost, 10));
+      directionSignals.reasons.push(`MTF EMA: ${mtfResult.consensus} (${mtfResult.confluenceScore > 0 ? '+' : ''}${mtfResult.confluenceScore.toFixed(2)}, boost ${mtfResult.convictionBoost > 0 ? '+' : ''}${mtfResult.convictionBoost}) — ${mtfMatchesDirection ? 'CONFIRMS' : 'CONFLICTS'}`);
+
+      this._log('mtf', `${underlying}: MTF=${mtfResult.consensus}, score=${mtfResult.confluenceScore.toFixed(2)}, boost=${mtfResult.convictionBoost}, bull=${mtfResult.bullishCount} bear=${mtfResult.bearishCount}`);
+    } catch (err) {
+      this._log('mtf', `${underlying}: MTF EMA unavailable (${err.message}) — proceeding without`);
+    }
+
     this._log('scan', `${underlying}: direction=${directionSignals.direction}, bull=${directionSignals.bullPoints.toFixed(1)} vs bear=${directionSignals.bearPoints.toFixed(1)}, conviction=${directionSignals.conviction}/10, strategy=${directionSignals.strategy}`);
 
     if (directionSignals.conviction < 4) {
@@ -603,6 +631,20 @@ class OptionsEngine {
       `Volume: ${tech.volumeTrend.toFixed(1)}x average`,
       `Support: $${tech.nearestSupport.toFixed(2)} | Resistance: $${tech.nearestResistance.toFixed(2)}`,
       ``,
+      `═══ GAMMA SQUEEZE STATUS ═══`,
+      (() => {
+        const sq = gammaSqueeze.getSqueezeSignal(underlying);
+        if (!sq.active) return 'No active squeeze conditions';
+        return `STATE: ${sq.state} | Direction: ${sq.direction || 'unknown'} | Conviction boost: ${sq.convictionBoost > 0 ? '+' : ''}${sq.convictionBoost}\nReason: ${sq.reason}`;
+      })(),
+      ``,
+      `═══ MULTI-TIMEFRAME EMA (9/20) ═══`,
+      (() => {
+        // MTF data is embedded in direction reasons if available, summarize here
+        const mtfReason = directionSignals.reasons.find(r => r.startsWith('MTF EMA:'));
+        return mtfReason || 'MTF EMA data not available for this scan';
+      })(),
+      ``,
       `═══ DIRECTIONAL ASSESSMENT ═══`,
       `Direction: ${directionSignals.direction} | Score: bull ${directionSignals.bullPoints.toFixed(1)} vs bear ${directionSignals.bearPoints.toFixed(1)}`,
       `Pre-conviction: ${directionSignals.conviction}/10 | Suggested strategy: ${directionSignals.strategy}`,
@@ -617,6 +659,8 @@ class OptionsEngine {
       `5. Volume must confirm. Low volume moves are traps.`,
       `6. Last hour of trading: be extra careful, theta accelerates exponentially.`,
       `7. If conviction is below 7, SKIP. There's always another trade.`,
+      `8. Multi-timeframe EMA alignment matters: if most timeframes agree, trade with conviction. If mixed, be cautious or SKIP.`,
+      `9. During an active gamma squeeze, ride the structural edge. During unwind, exit quickly.`,
       ``,
       `Respond with ONLY valid JSON:`,
       `{"action": "BUY_CALL" | "BUY_PUT" | "SKIP", "conviction": 1-10, "strategy": "scalp" | "swing", "target": "$X.XX", "stopLevel": "$X.XX", "reason": "1-2 sentences"}`,

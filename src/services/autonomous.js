@@ -28,6 +28,7 @@ const GEXAlertService = require('./gex-alerts');
 const mahoraga = require('./mahoraga');
 const policy = require('./policy');
 const initiative = require('./initiative');
+const gammaSqueeze = require('./gamma-squeeze');
 const config = require('../config');
 const auditLog = require('./audit-log');
 const circuitBreaker = require('./circuit-breaker');
@@ -213,6 +214,11 @@ class AutonomousBehaviorEngine {
     initiative.ensureJournalChannel().catch(() => {});
     console.log(`[Sprocket] Initiative engine active — autonomous brain running`);
 
+    // 8. GAMMA SQUEEZE ENGINE — real-time squeeze detection + sector GEX monitoring
+    gammaSqueeze.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
+    gammaSqueeze.start();
+    console.log(`[Sprocket] Gamma squeeze engine active — watching ${gammaSqueeze.getWatchlist().join(', ')}`);
+
     console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
   }
 
@@ -226,6 +232,7 @@ class AutonomousBehaviorEngine {
       this._mahoragaInterval = null;
     }
     initiative.stop();
+    gammaSqueeze.stop();
     this._stopped = true;
     console.log('[Sprocket] All scheduled behaviors stopped.');
     auditLog.log('schedule', 'All scheduled behaviors stopped');
