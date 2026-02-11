@@ -31,7 +31,7 @@ const DEFAULT_CONFIG = {
   min_analyst_confidence: 0.6,      // 0 to 1 scale
   allow_shorting: false,
   crypto_enabled: false,             // enable 24/7 crypto trading
-  options_enabled: false,            // enable options trading
+  options_enabled: true,             // enable options trading
   scan_interval_minutes: 5,          // how often the agent scans for signals
   position_size_pct: 0.25,           // max % of cash per trade (25%)
   symbol_allowlist: [],              // empty = allow all
