@@ -401,6 +401,21 @@ const commands = [
         .setDescription('Stock symbol (for detail view, e.g. SPY, QQQ)')
         .setRequired(false)
     ),
+
+  new SlashCommandBuilder()
+    .setName('yolo')
+    .setDescription('YOLO trade generator — high-conviction, aggressive play with full data backing')
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Stock symbol to YOLO (e.g. TSLA, NVDA, SPY, AMC)')
+        .setRequired(true)
+    )
+    .addNumberOption(opt =>
+      opt.setName('budget')
+        .setDescription('How much $ you want to YOLO (optional, for position sizing)')
+        .setRequired(false)
+        .setMinValue(100)
+    ),
 ];
 
 async function registerCommands() {
