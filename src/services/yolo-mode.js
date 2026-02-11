@@ -298,6 +298,8 @@ DO NOT suggest:
 - Adding comments or documentation
 - Changing logic that works correctly
 - Anything touching config, secrets, or auth
+- Changes that affect more than 10 lines of code
+- Reformatting, restructuring, or reorganizing existing code
 
 FILE: ${targetFile}
 \`\`\`javascript
@@ -343,13 +345,15 @@ If the code looks solid and you find NOTHING worth fixing, respond with exactly:
 
 INSTRUCTION: ${instruction}
 
-RULES:
+CRITICAL RULES:
 - Output the COMPLETE file with your fix applied
-- Change as FEW lines as possible (under 15 lines changed)
-- Do NOT add new features, comments, or documentation
-- Do NOT change working code that isn't related to the fix
+- Make a SURGICAL change — touch ONLY the lines needed for this ONE fix
+- NEVER reformat, restyle, reorganize, or restructure any other code
+- NEVER change whitespace, indentation, or line breaks on lines you aren't fixing
+- NEVER add comments, documentation, or logging unrelated to the fix
+- NEVER add new features or refactor existing working code
+- The file should be IDENTICAL to the original except for your specific fix (aim for under 10 lines different)
 - Do NOT add any API keys, tokens, or secrets
-- Preserve all existing functionality
 - Output ONLY the fixed code, no explanations or markdown fences
 
 FILE: ${filePath}

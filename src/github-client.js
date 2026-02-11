@@ -118,11 +118,34 @@ class GitHubClient {
   _diffLineCount(oldText, newText) {
     const oldLines = oldText.split('\n');
     const newLines = newText.split('\n');
-    let diff = 0;
-    for (let i = 0; i < Math.max(oldLines.length, newLines.length); i++) {
-      if (oldLines[i] !== newLines[i]) diff++;
+
+    // Use LCS (Longest Common Subsequence) to count actual insertions/deletions/changes.
+    // The naive positional comparison breaks when a single line is added/removed,
+    // causing every subsequent line to look "changed."
+    const m = oldLines.length;
+    const n = newLines.length;
+
+    // For very large files, use a space-optimized LCS (two-row DP)
+    let prev = new Uint16Array(n + 1);
+    let curr = new Uint16Array(n + 1);
+
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        if (oldLines[i - 1] === newLines[j - 1]) {
+          curr[j] = prev[j - 1] + 1;
+        } else {
+          curr[j] = Math.max(prev[j], curr[j - 1]);
+        }
+      }
+      // Swap rows
+      [prev, curr] = [curr, prev];
+      curr.fill(0);
     }
-    return diff;
+
+    const lcsLength = prev[n];
+    // Lines changed = lines removed + lines added
+    // removed = old lines not in LCS, added = new lines not in LCS
+    return (m - lcsLength) + (n - lcsLength);
   }
 }
 
