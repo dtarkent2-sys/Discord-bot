@@ -23,6 +23,8 @@ const mood = require('./mood');
 const commentary = require('./commentary');
 const stats = require('./stats');
 const gamma = require('./gamma');
+const GEXEngine = require('./gex-engine');
+const GEXAlertService = require('./gex-alerts');
 const mahoraga = require('./mahoraga');
 const policy = require('./policy');
 const config = require('../config');
@@ -46,6 +48,10 @@ class AutonomousBehaviorEngine {
     // Key: ticker, Value: { flipStrike, regime, spotPrice, lastAlertTime }
     this.gexState = new Map();
     this.gexWatchlist = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'MSFT', 'AMD', 'META', 'AMZN', 'IWM'];
+
+    // Multi-expiry GEX engine + break-and-hold alert service
+    this._gexEngine = new GEXEngine(gamma);
+    this._gexAlerts = new GEXAlertService();
   }
 
   startAllSchedules() {
@@ -383,84 +389,114 @@ class AutonomousBehaviorEngine {
     return null;
   }
 
-  // ── GEX Flip Monitor ─────────────────────────────────────────────────
+  // ── GEX Flip Monitor (upgraded: multi-expiry engine + break-and-hold) ─
 
   /**
-   * Scan watchlist tickers for gamma flip breaches.
-   * Alerts the trading channel when spot price crosses the gamma flip level
-   * (regime change from long→short gamma or vice versa).
+   * Scan watchlist tickers using the multi-expiry GEX engine.
+   * Alerts on:
+   *   1. Regime changes (long → short gamma or vice versa)
+   *   2. Gamma flip level shifts (> 2%)
+   *   3. Break-and-hold conditions on stacked walls
    */
   async _runGEXMonitor() {
-    const cooldown = 2 * 60 * 60 * 1000; // 2h cooldown per ticker between alerts
+    const cooldown = 2 * 60 * 60 * 1000; // 2h cooldown per ticker between regime alerts
     let consecutiveFailures = 0;
 
     for (const ticker of this.gexWatchlist) {
-      // Fail-fast: if 3 tickers in a row fail, there's probably a connectivity issue
       if (consecutiveFailures >= 3) {
         console.warn(`[Sprocket] GEX monitor: 3 consecutive failures, skipping remaining tickers`);
         break;
       }
 
       try {
-        const result = await gamma.analyze(ticker);
-        consecutiveFailures = 0; // reset on success
-        const { spotPrice, flip } = result;
+        // Use multi-expiry engine for richer analysis
+        const summary = await this._gexEngine.analyze(ticker);
+        consecutiveFailures = 0;
 
-        if (!flip.flipStrike) continue;
+        const { spot, regime, gammaFlip } = summary;
 
         const prev = this.gexState.get(ticker);
         const now = Date.now();
 
-        // First run — just record state, don't alert
+        // First run — record state, don't alert
         if (!prev) {
           this.gexState.set(ticker, {
-            flipStrike: flip.flipStrike,
-            regime: flip.regime,
-            spotPrice,
+            flipStrike: gammaFlip,
+            regime: regime.label,
+            spotPrice: spot,
             lastAlertTime: 0,
           });
           continue;
         }
 
         // Check for regime change
-        const regimeChanged = prev.regime !== flip.regime;
-        const flipMoved = Math.abs(prev.flipStrike - flip.flipStrike) / prev.flipStrike > 0.02; // >2% shift
+        const regimeChanged = prev.regime !== regime.label;
+        const flipMoved = prev.flipStrike && gammaFlip
+          ? Math.abs(prev.flipStrike - gammaFlip) / prev.flipStrike > 0.02
+          : false;
 
         if ((regimeChanged || flipMoved) && (now - prev.lastAlertTime) > cooldown) {
-          // Build alert
-          const emoji = flip.regime === 'long_gamma' ? '🟢' : '🔴';
-          const regimeLabel = flip.regime === 'long_gamma'
-            ? 'LONG GAMMA (dealers suppress moves — chop/reversion likely)'
-            : 'SHORT GAMMA (dealers amplify moves — trend/breakout likely)';
+          const emoji = regime.label === 'Long Gamma' ? '🟢'
+            : regime.label === 'Short Gamma' ? '🔴' : '🟡';
+          const confPct = (regime.confidence * 100).toFixed(0);
+
+          const callWall = summary.walls.callWalls[0];
+          const putWall = summary.walls.putWalls[0];
 
           const alert = [
             `⚡ **GEX ALERT — ${ticker}**`,
             ``,
-            `${emoji} **Regime: ${regimeLabel}**`,
-            `Spot: \`$${spotPrice}\` | Gamma Flip: \`$${flip.flipStrike}\``,
+            `${emoji} **Regime: ${regime.label}** (${confPct}% confidence)`,
+            `Spot: \`$${spot}\` | Flip: \`$${gammaFlip || '—'}\``,
             regimeChanged
-              ? `📢 Regime changed from **${prev.regime.replace('_', ' ')}** → **${flip.regime.replace('_', ' ')}**`
-              : `📢 Gamma flip shifted: \`$${prev.flipStrike}\` → \`$${flip.flipStrike}\``,
+              ? `📢 Regime changed: **${prev.regime}** → **${regime.label}**`
+              : `📢 Gamma flip shifted: \`$${prev.flipStrike}\` → \`$${gammaFlip}\``,
+            callWall ? `Call Wall: \`$${callWall.strike}\`${callWall.stacked ? ' **STACKED**' : ''}` : '',
+            putWall ? `Put Wall: \`$${putWall.strike}\`${putWall.stacked ? ' **STACKED**' : ''}` : '',
             ``,
-            `_Use /gex ${ticker} for full chart & breakdown_`,
-          ].join('\n');
+            `_/gex summary ${ticker} for full multi-expiry breakdown_`,
+          ].filter(Boolean).join('\n');
 
           await this.postToChannel(config.tradingChannelName, alert);
-          auditLog.log('gex', `GEX alert: ${ticker} regime=${flip.regime}`);
+          auditLog.log('gex', `GEX alert: ${ticker} regime=${regime.label} conf=${confPct}%`);
 
           this.gexState.set(ticker, {
-            flipStrike: flip.flipStrike,
-            regime: flip.regime,
-            spotPrice,
+            flipStrike: gammaFlip,
+            regime: regime.label,
+            spotPrice: spot,
             lastAlertTime: now,
           });
         } else {
-          // Update state without alerting
-          this.gexState.set(ticker, { ...prev, flipStrike: flip.flipStrike, regime: flip.regime, spotPrice });
+          this.gexState.set(ticker, { ...prev, flipStrike: gammaFlip, regime: regime.label, spotPrice: spot });
+        }
+
+        // Break-and-hold alert check (uses candle data if available)
+        try {
+          const alpacaSvc = require('./alpaca');
+          if (alpacaSvc.enabled) {
+            const bars = await alpacaSvc.getHistory(ticker, {
+              timeframe: this._gexAlerts.candleInterval,
+              limit: 20,
+            });
+            const candles = (bars || []).map(b => ({
+              close: b.ClosePrice || b.close || b.c,
+              volume: b.Volume || b.volume || b.v,
+            }));
+
+            const breakAlerts = this._gexAlerts.evaluate(ticker, candles, summary);
+            for (const ba of breakAlerts) {
+              await this.postToChannel(config.tradingChannelName, ba.message);
+              auditLog.log('gex_alert', `Break-and-hold: ${ticker} ${ba.type} $${ba.level} ${ba.direction}`);
+            }
+          }
+        } catch (candleErr) {
+          // Non-fatal: candle data not available
+          if (!candleErr.message?.includes('not configured')) {
+            console.warn(`[Sprocket] GEX break-hold check failed for ${ticker}: ${candleErr.message}`);
+          }
         }
       } catch (err) {
         consecutiveFailures++;
-        // Don't spam logs for tickers without options data
         if (!err.message?.includes('No options data')) {
           console.warn(`[Sprocket] GEX monitor error for ${ticker}:`, err.message);
         }

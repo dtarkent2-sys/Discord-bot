@@ -100,6 +100,88 @@ All settings are configured through environment variables. See `.env.example`.
 | `MODEL_CUTOFF` | Approximate training data cutoff for RAG enforcement | `mid-2024` |
 | `LOG_LEVEL` | Logging level: `debug`, `info`, `warn`, `error` | `info` |
 | `SHARK_AUTO_ENABLE` | Auto-enable SHARK autonomous trading agent on startup | `false` |
+| `GEX_INCLUDE_EXPIRIES` | Comma-separated expirations to analyze: `0dte,weekly,monthly` | `0dte,weekly,monthly` |
+| `GEX_HOLD_CANDLES` | Consecutive candle closes required for break-and-hold alerts | `3` |
+| `GEX_CANDLE_INTERVAL` | Candle interval for break-and-hold: `1Min`, `5Min`, `15Min`, `1Hour` | `5Min` |
+| `GEX_MIN_REGIME_CONFIDENCE` | Minimum confidence (0-1) before emitting regime alerts | `0.4` |
+| `GEX_MIN_ABS_GEX` | Minimum absolute GEX ($) to consider an expiry dominant | `1000000` |
+
+---
+
+## Gamma Exposure (GEX) Engine
+
+The GEX engine analyzes options gamma exposure across multiple expirations to produce actionable trading signals.
+
+### How GEX is Computed
+
+**Per-strike GEX (dealer perspective):**
+```
+GEX$ = OI × gamma × 100 (contract multiplier) × spot_price
+```
+
+- **Calls** contribute positive GEX (dealers who sold calls are long gamma)
+- **Puts** contribute negative GEX (dealers who sold puts are short gamma)
+- **Net GEX$** per strike = callGEX$ + putGEX$
+
+Gamma is computed using Black-Scholes when fetching from Yahoo Finance, or taken directly from Alpaca's pre-calculated greeks.
+
+**Multi-expiry aggregation:**
+1. **totalNetGEX$** — Sum of netGEX$ across all expirations (0DTE + weekly + monthly)
+2. **Dominant expiry** — The expiration contributing the highest absolute GEX share
+3. **Strike clustering** — Per-strike GEX aggregated across expirations; strikes that appear in multiple expirations are marked **STACKED**
+4. **Call walls** — Top 3 strikes with highest positive aggregated netGEX$
+5. **Put walls** — Top 3 strikes with most negative aggregated netGEX$
+6. **Gamma flip** — Strike where cumulative aggregated GEX crosses zero
+
+**Regime classification:**
+- `totalNetGEX$ > 0` → **Long Gamma** (dealers suppress moves — mean-reversion)
+- `totalNetGEX$ < 0` → **Short Gamma** (dealers amplify moves — trend/volatility)
+- Near zero or contradicted by per-expiry data → **Mixed/Uncertain**
+
+**Confidence scoring** (0-1): scales with `|totalNetGEX$|` and distance from flip. Reduced when per-expiry regimes disagree with the aggregate.
+
+### How Alerts Work
+
+**Break-and-hold** alerts fire when price action confirms a GEX level break:
+
+1. The engine identifies key levels: primary call wall, put wall, gamma flip
+2. Recent 5-minute candles are fetched (configurable interval)
+3. A **"hold"** requires `N` consecutive candle closes above (or below) the level (default N=3)
+4. Optional **volume confirmation**: average volume during hold must exceed prior-period average
+5. Alerts are rate-limited (1 hour cooldown per level per direction)
+
+**Alert triggers:**
+- Break above call wall → Upside expansion risk (dealer cover)
+- Break below put wall → Downside expansion risk (dealer selling amplifies)
+- Cross above gamma flip → Entering long gamma (mean-reversion expected)
+- Cross below gamma flip → Entering short gamma (trend/vol expansion expected)
+
+**Commands:**
+- `/gex chart <ticker> [expiration]` — Single-expiry GEX bar chart (original view)
+- `/gex summary <ticker>` — Multi-expiry aggregated analysis with regime, walls, playbook
+- `/gex alerts <ticker>` — Check current break-and-hold conditions
+
+### Example Output: Stacked 593 Call Wall
+
+```
+SPY — GEX Summary | Spot: $590
+Dominant: 2025-02-21 (78% of GEX)
+
+🟢 Long Gamma █████ (80%)
+Net GEX: $255.00M
+
+Call Wall: $593 ($155.00M) STACKED
+Put Wall: $580 (-$61.00M) STACKED
+Flip: $586.50 (spot ABOVE)
+
+• Below $593 call wall in long gamma: expect pin / mean-reversion toward $593
+• Acceptance above $593 call wall: upside expansion risk to $595
+• Breakdown below $580 put cluster: downside expansion risk to $575
+
+Mock | 3 expiries
+```
+
+The $593 call wall is **STACKED** — it appears as a major level in 0DTE ($7M), weekly ($43M), and monthly ($105M) expirations, making it a high-conviction resistance/magnet level.
 
 ---
 
@@ -114,7 +196,9 @@ All settings are configured through environment variables. See `.env.example`.
 | `/deepanalysis <ticker>` | Multi-agent deep analysis — 4 analysts, debate, trader, risk → BUY/SELL/HOLD |
 | `/price <ticker>` | Quick price + key stats lookup (P/E, RSI, moving averages, etc.) |
 | `/technicals <ticker>` | Technical analysis — RSI, MACD, Bollinger Bands, SMA/EMA crossovers, ATR |
-| `/gex <ticker>` | Gamma Exposure analysis with chart (requires Alpaca) |
+| `/gex chart <ticker>` | Single-expiry GEX chart with per-strike bars |
+| `/gex summary <ticker>` | Multi-expiry aggregated GEX — regime, stacked walls, playbook |
+| `/gex alerts <ticker>` | Check break-and-hold conditions on GEX levels |
 | `/macro` | Macro environment analysis — market regime, benchmarks, sector breadth |
 | `/sectors` | Sector rotation heatmap — performance of 11 sector ETFs |
 | `/validea <ticker>` | Validea guru fundamental analysis scores |
