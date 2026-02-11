@@ -299,6 +299,66 @@ class KalshiService {
 
   // ── Data Formatting ─────────────────────────────────────────────────
 
+  /**
+   * Group markets by event_ticker and pick the best contract per event.
+   * This deduplicates the wall of strike-price contracts into one per event.
+   */
+  _groupByEvent(markets) {
+    if (!markets || markets.length === 0) return [];
+
+    const groups = new Map(); // event_ticker → [markets]
+    for (const m of markets) {
+      const key = m.event_ticker || m.ticker; // solo markets use their own ticker
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(m);
+    }
+
+    // For each event, pick the "best" contract
+    const picks = [];
+    for (const [eventTicker, contracts] of groups) {
+      const best = this._pickBestContract(contracts);
+      best._eventTicker = eventTicker;
+      best._contractCount = contracts.length;
+      best._eventVolume = contracts.reduce((s, c) => s + (c.volume_24h || c.volume || 0), 0);
+      picks.push(best);
+    }
+
+    // Sort by total event volume (most active events first)
+    picks.sort((a, b) => (b._eventVolume || 0) - (a._eventVolume || 0));
+    return picks;
+  }
+
+  /**
+   * Pick the most "interesting" contract from a set of sibling contracts.
+   * Prefers: high volume + probability between 15-85% (where edge lives).
+   * Avoids extreme prices (>92% or <8%) which are boring/illiquid.
+   */
+  _pickBestContract(contracts) {
+    if (contracts.length === 1) return contracts[0];
+
+    return contracts.reduce((best, c) => {
+      const bestScore = this._contractScore(best);
+      const cScore = this._contractScore(c);
+      return cScore > bestScore ? c : best;
+    });
+  }
+
+  _contractScore(m) {
+    const price = m.yes_ask ?? m.last_price ?? m.yes_bid ?? 50;
+    const vol = m.volume_24h || m.volume || 0;
+
+    // Probability score: peak at 50%, drops toward extremes
+    // Sweet spot: 15-85% range (where real bets happen)
+    const probScore = price <= 8 || price >= 92 ? 0.1 :
+                      price <= 15 || price >= 85 ? 0.5 :
+                      price <= 30 || price >= 70 ? 0.8 : 1.0;
+
+    // Volume score: log scale, more volume = better
+    const volScore = vol > 0 ? Math.log10(vol + 1) / 5 : 0.01;
+
+    return probScore * 2 + volScore;
+  }
+
   /** Format a single market for display */
   formatMarket(m) {
     const yesPrice = m.yes_ask ?? m.last_price ?? m.yes_bid ?? null;
@@ -333,21 +393,34 @@ class KalshiService {
     };
   }
 
-  /** Format market list for Discord */
+  /**
+   * Format market list for Discord — groups by event so users aren't overwhelmed
+   * by 20 strike-price contracts for the same underlying question.
+   */
   formatMarketsForDiscord(markets, title = 'Prediction Markets') {
     if (!markets || markets.length === 0) {
       return `**${title}**\nNo markets found.`;
     }
 
+    // Group by event — show 1 "best" contract per event
+    const grouped = this._groupByEvent(markets);
+
     const lines = [`**${title}**\n`];
 
-    for (let i = 0; i < markets.length; i++) {
-      const m = this.formatMarket(markets[i]);
+    for (let i = 0; i < Math.min(grouped.length, 10); i++) {
+      const raw = grouped[i];
+      const m = this.formatMarket(raw);
       const probEmoji = m.yesPrice >= 70 ? '🟢' : m.yesPrice <= 30 ? '🔴' : '🟡';
       const vol24h = m.volume24h ? ` (24h: ${m.volume24h})` : '';
-      lines.push(`${probEmoji} **${m.title}**`);
+      const siblings = raw._contractCount > 1 ? ` (+${raw._contractCount - 1} contracts)` : '';
+
+      lines.push(`${probEmoji} **${m.title}**${siblings}`);
       lines.push(`   Yes: \`${m.prob}\` | Vol: \`${m.volume}\`${vol24h} | Closes: \`${m.closeDateStr}\` | \`${m.ticker}\``);
-      if (i < markets.length - 1) lines.push('');
+      if (i < Math.min(grouped.length, 10) - 1) lines.push('');
+    }
+
+    if (grouped.length > 10) {
+      lines.push(`\n_...and ${grouped.length - 10} more events_`);
     }
 
     lines.push(`\n_Data via Kalshi | ${new Date().toLocaleString()}_`);
@@ -402,52 +475,57 @@ class KalshiService {
   // ── AI Betting Recommendations ──────────────────────────────────────
 
   /**
-   * Analyze markets and produce AI betting recommendations.
-   * Cross-references Kalshi odds with reasoning to find potential edge.
+   * Analyze markets and produce ONE clear high-conviction play.
+   * Users want a simple "here's your bet" — not a wall of analysis.
    */
   async analyzeBets(markets, query) {
     if (!markets || markets.length === 0) return null;
 
-    const marketSummary = markets.map(m => {
+    // Group by event first so the AI sees unique events, not duplicate strike prices
+    const grouped = this._groupByEvent(markets);
+    const topEvents = grouped.slice(0, 8);
+
+    const marketSummary = topEvents.map(m => {
       const fm = this.formatMarket(m);
-      return `- "${fm.title}" | Yes: ${fm.prob} | Volume: ${fm.volume} | Closes: ${fm.closeDateStr} | Ticker: ${fm.ticker}`;
+      const siblings = m._contractCount > 1 ? ` [${m._contractCount} contracts in this event]` : '';
+      return `- "${fm.title}" | Yes: ${fm.prob} | Volume: ${fm.volume} | Closes: ${fm.closeDateStr} | Ticker: ${fm.ticker}${siblings}`;
     }).join('\n');
 
-    const prompt = `You are a prediction market analyst. The user searched for "${query}" and found these Kalshi prediction markets:
+    const prompt = `You are a sharp prediction market trader. A user asked for a play on "${query}". Here are the available Kalshi markets:
 
 ${marketSummary}
 
 TODAY'S DATE: ${todayString()}
 
-For each market, analyze:
-1. Does the current Yes price (implied probability) seem accurate based on available evidence?
-2. Where might the market be WRONG? (This is where edge exists)
-3. What factors could shift this market's odds significantly before it closes?
+Pick your #1 HIGH CONVICTION play. The user wants ONE clear bet, not a dissertation.
 
-Then produce your TOP PICKS — markets where you see the biggest edge (probability mispricing).
+Analyze which market has the biggest mispricing — where the market odds are WRONG based on current evidence. Consider:
+- Is the market over/underpricing the probability?
+- What catalyst or trend does the market not reflect yet?
+- Volume matters — illiquid markets are riskier
 
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS (keep it punchy):
 
-TOP PICKS:
+🎯 **THE PLAY**
+**[Market title]**
+Side: **BUY [YES/NO]** @ [current price]c
+My odds: [your probability]% vs market's [their probability]%
+Edge: [difference]%
 
-🎯 PICK 1: [market title]
-Side: YES/NO @ [current price]c
-Edge: [your estimated true probability]% vs market's [market price]%
-Reasoning: [2-3 sentences explaining why the market is mispriced]
-Confidence: [1-10]
+**Why:** [2-3 sentences max — the core thesis for why this is mispriced]
 
-🎯 PICK 2: [market title]
-Side: YES/NO @ [current price]c
-Edge: [your estimated true probability]% vs market's [market price]%
-Reasoning: [2-3 sentences]
-Confidence: [1-10]
+**Key catalyst:** [1 sentence — what event/data will move this]
 
-(Continue for up to 3 picks, only pick markets where you see real edge)
+**Risk:** [1 sentence — what could go wrong]
 
-AVOID: Markets where the current price seems about right — only recommend where you see genuine mispricing.
+**Conviction: [7-10]/10**
 
-End with:
-SUMMARY: One sentence with your overall take on this market category.`;
+${topEvents.length > 3 ? `\nIf you see a second strong play, add it as:
+
+🥈 **RUNNER-UP**
+(same format but briefer)` : ''}
+
+If you genuinely don't see edge in any of these markets, say so directly — don't force a bad pick.`;
 
     const response = await this._llmCall(prompt);
     return response;
@@ -479,11 +557,11 @@ RECENT TRADE FLOW:
 
     const rulesContext = market.rules_primary ? `\nRules: ${market.rules_primary.slice(0, 500)}` : '';
 
-    const prompt = `You are a senior prediction market analyst specializing in probability assessment.
+    const prompt = `You are a sharp prediction market trader. Give a clear, decisive analysis.
 
 MARKET: "${fm.title}"
 ${fm.subtitle && fm.subtitle !== fm.title ? `Context: ${fm.subtitle}` : ''}
-Current Yes Price: ${fm.prob} (the market says there's a ${fm.prob} chance this happens)
+Current Yes Price: ${fm.prob} (market-implied probability)
 Volume: ${fm.volume} contracts traded
 Closes: ${fm.closeDateStr}
 Ticker: ${fm.ticker}${rulesContext}
@@ -491,31 +569,22 @@ ${tradeContext}
 
 TODAY'S DATE: ${todayString()}
 
-Perform a deep probability analysis:
+FORMAT YOUR RESPONSE (keep it punchy — traders don't read essays):
 
-1. MARKET ASSESSMENT: What is the market saying at ${fm.prob}? Is this price reflecting consensus?
-2. YOUR ESTIMATE: Based on available evidence, what do YOU think the true probability is? Explain your reasoning.
-3. TRADE FLOW: What does the recent trade flow tell us about market sentiment direction?
-4. CATALYSTS: What upcoming events could move this market significantly?
-5. EDGE ANALYSIS: Is there a bet worth making here?
+📊 **MARKET: ${fm.prob} implied probability**
+My estimate: **[X]%** → Edge: **[diff]%**
 
-FORMAT YOUR RESPONSE:
+🎯 **VERDICT: BUY YES / BUY NO / NO BET**
+Entry: [price]c | Conviction: [1-10]/10
 
-PROBABILITY ASSESSMENT:
-Market Price: ${fm.prob}
-My Estimate: [your estimate]%
-Edge: [difference]% — [explain if this is significant enough to trade]
+**Thesis:** [2-3 sentences — the core reasoning]
 
-RECOMMENDATION:
-Side: BUY YES / BUY NO / NO BET
-Entry: [price you'd want to enter at]c
-Reasoning: [3-4 sentences with specific reasoning]
+**Catalyst:** [1 sentence — what moves this next]
+${tradeContext ? '\n**Flow read:** [1 sentence on what trade flow signals]' : ''}
 
-KEY RISKS:
-- [risk 1]
-- [risk 2]
+**Risk:** [1 sentence — the bear case]
 
-CONVICTION: [1-10]`;
+Be decisive. If you see edge, say it clearly. If you don't, say "NO BET" — don't hedge.`;
 
     const response = await this._llmCall(prompt);
     return response;
