@@ -9,7 +9,7 @@
  * The AI layer cross-references market odds with fundamentals, technicals,
  * and sentiment to find edge (mispricings the market hasn't caught yet).
  *
- * API Base: https://api.elections.kalshi.com/trade-api/v2
+ * API Base: https://api.elections.kalshi.com/trade-api/v2 (public, no auth required)
  * Rate limit: 20 reads/sec (Basic tier, free)
  */
 
@@ -18,6 +18,7 @@ const config = require('../config');
 const log = require('../logger')('Kalshi');
 const { todayString, ragEnforcementBlock } = require('../date-awareness');
 
+// Public read-only API (no auth required)
 const BASE_URL = 'https://api.elections.kalshi.com/trade-api/v2';
 const FETCH_TIMEOUT = 15000;
 
@@ -125,41 +126,114 @@ class KalshiService {
   // ── Search / Discovery ─────────────────────────────────────────────
 
   /**
-   * Search for markets by keyword. Kalshi doesn't have a text search endpoint,
-   * so we fetch a batch of open markets and filter client-side by title/subtitle.
+   * Search for markets by keyword.
+   *
+   * Strategy (Kalshi has no text search API, so we use multiple approaches):
+   * 1. Search events (fewer, more organized) and extract nested markets
+   * 2. Try matching series tickers for known categories (crypto, economics, etc.)
+   * 3. Fall back to scanning open markets directly (paginated)
    */
   async searchMarkets(query, limit = 10) {
     const lower = query.toLowerCase();
-    const allMarkets = [];
-    let cursor = null;
+    const allMatches = new Map(); // ticker → market (dedupe)
 
-    // Fetch up to 3 pages (300 markets) to search through
-    for (let page = 0; page < 3; page++) {
-      const params = { status: 'open', limit: 200 };
-      if (cursor) params.cursor = cursor;
+    // ── Strategy 1: Search via events (events have titles, contain markets) ──
+    try {
+      let cursor = null;
+      for (let page = 0; page < 5; page++) {
+        const params = { status: 'open', limit: 100, with_nested_markets: true };
+        if (cursor) params.cursor = cursor;
 
-      const result = await this._fetch('/markets', params);
-      const markets = result.markets || [];
-      allMarkets.push(...markets);
+        const result = await this._fetch('/events', params);
+        const events = result.events || [];
 
-      cursor = result.cursor;
-      if (!cursor || markets.length === 0) break;
+        for (const event of events) {
+          const eventText = `${event.title || ''} ${event.sub_title || ''} ${event.category || ''} ${event.event_ticker || ''}`.toLowerCase();
+          if (eventText.includes(lower)) {
+            // This event matches — add all its markets
+            const markets = event.markets || [];
+            for (const m of markets) {
+              if (m.status === 'open' || m.status === 'active') {
+                allMatches.set(m.ticker, m);
+              }
+            }
+          }
+        }
+
+        cursor = result.cursor;
+        if (!cursor || events.length === 0) break;
+        // Stop early if we have enough
+        if (allMatches.size >= limit * 3) break;
+      }
+    } catch (err) {
+      log.warn(`Event search failed: ${err.message}`);
     }
 
-    // Filter by keyword match in title, subtitle, or ticker
-    const matches = allMarkets.filter(m => {
-      const title = (m.title || '').toLowerCase();
-      const subtitle = (m.subtitle || '').toLowerCase();
-      const ticker = (m.ticker || '').toLowerCase();
-      const eventTicker = (m.event_ticker || '').toLowerCase();
-      return title.includes(lower) || subtitle.includes(lower) ||
-        ticker.includes(lower) || eventTicker.includes(lower);
-    });
+    // ── Strategy 2: Try known series tickers for common queries ──
+    const seriesMap = {
+      bitcoin: ['BTCATH', 'KXBTCRESERVESTATES', 'KXELSALVADORBTC', 'KXTEXASBTC'],
+      btc: ['BTCATH', 'KXBTCRESERVESTATES', 'KXELSALVADORBTC', 'KXTEXASBTC'],
+      crypto: ['BTCATH', 'KXBTCRESERVESTATES', 'KXELSALVADORBTC', 'KXTEXASBTC'],
+      fed: ['TERMINALRATE'],
+      'interest rate': ['TERMINALRATE'],
+    };
+
+    const matchingSeries = Object.entries(seriesMap)
+      .filter(([kw]) => lower.includes(kw))
+      .flatMap(([, tickers]) => tickers);
+
+    for (const seriesTicker of matchingSeries) {
+      try {
+        const result = await this._fetch('/events', {
+          status: 'open',
+          series_ticker: seriesTicker,
+          with_nested_markets: true,
+          limit: 50,
+        });
+        for (const event of (result.events || [])) {
+          for (const m of (event.markets || [])) {
+            if (m.status === 'open' || m.status === 'active') {
+              allMatches.set(m.ticker, m);
+            }
+          }
+        }
+      } catch (err) {
+        log.warn(`Series ${seriesTicker} fetch failed: ${err.message}`);
+      }
+    }
+
+    // ── Strategy 3: Fall back to scanning open markets if still no results ──
+    if (allMatches.size < limit) {
+      try {
+        let cursor = null;
+        for (let page = 0; page < 5; page++) {
+          const params = { status: 'open', limit: 200 };
+          if (cursor) params.cursor = cursor;
+
+          const result = await this._fetch('/markets', params);
+          const markets = result.markets || [];
+
+          for (const m of markets) {
+            const text = `${m.title || ''} ${m.subtitle || ''} ${m.ticker || ''} ${m.event_ticker || ''}`.toLowerCase();
+            if (text.includes(lower)) {
+              allMatches.set(m.ticker, m);
+            }
+          }
+
+          cursor = result.cursor;
+          if (!cursor || markets.length === 0) break;
+          if (allMatches.size >= limit * 3) break;
+        }
+      } catch (err) {
+        log.warn(`Market scan failed: ${err.message}`);
+      }
+    }
 
     // Sort by volume (most active first)
-    matches.sort((a, b) => (b.volume || 0) - (a.volume || 0));
+    const sorted = [...allMatches.values()];
+    sorted.sort((a, b) => (b.volume || 0) - (a.volume || 0));
 
-    return matches.slice(0, limit);
+    return sorted.slice(0, limit);
   }
 
   /**
@@ -179,41 +253,19 @@ class KalshiService {
    * Get markets by category keyword (economics, crypto, politics, tech, etc.)
    */
   async getMarketsByCategory(category, limit = 10) {
-    // Map common categories to likely keyword matches
+    // Use searchMarkets with the first keyword for the category
     const categoryMap = {
-      economics: ['inflation', 'gdp', 'fed', 'interest rate', 'cpi', 'jobs', 'unemployment', 'recession'],
-      crypto: ['bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'solana', 'sol'],
-      politics: ['president', 'election', 'congress', 'senate', 'democrat', 'republican', 'trump', 'biden'],
-      tech: ['ai', 'openai', 'google', 'apple', 'tesla', 'meta', 'nvidia', 'microsoft'],
-      markets: ['s&p', 'sp500', 'nasdaq', 'dow', 'stock', 'market', 'spy'],
-      weather: ['temperature', 'weather', 'hurricane', 'rainfall'],
-      sports: ['nfl', 'nba', 'mlb', 'super bowl', 'world series'],
+      economics: 'inflation',
+      crypto: 'bitcoin',
+      politics: 'election',
+      tech: 'ai',
+      markets: 'stock',
+      weather: 'temperature',
+      sports: 'nfl',
     };
 
-    const keywords = categoryMap[category.toLowerCase()] || [category.toLowerCase()];
-
-    const allMarkets = [];
-    let cursor = null;
-
-    for (let page = 0; page < 3; page++) {
-      const params = { status: 'open', limit: 200 };
-      if (cursor) params.cursor = cursor;
-
-      const result = await this._fetch('/markets', params);
-      const markets = result.markets || [];
-      allMarkets.push(...markets);
-
-      cursor = result.cursor;
-      if (!cursor || markets.length === 0) break;
-    }
-
-    const matches = allMarkets.filter(m => {
-      const text = `${m.title || ''} ${m.subtitle || ''} ${m.event_ticker || ''}`.toLowerCase();
-      return keywords.some(kw => text.includes(kw));
-    });
-
-    matches.sort((a, b) => (b.volume || 0) - (a.volume || 0));
-    return matches.slice(0, limit);
+    const query = categoryMap[category.toLowerCase()] || category;
+    return this.searchMarkets(query, limit);
   }
 
   // ── Data Formatting ─────────────────────────────────────────────────
