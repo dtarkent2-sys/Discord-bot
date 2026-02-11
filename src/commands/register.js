@@ -331,6 +331,44 @@ const commands = [
         .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY)')
         .setRequired(true)
     ),
+
+  new SlashCommandBuilder()
+    .setName('options')
+    .setDescription('0DTE Options Trading — autonomous scalping & swing trades on SPY, QQQ & more')
+    .addStringOption(opt =>
+      opt.setName('action')
+        .setDescription('Action to perform')
+        .setRequired(true)
+        .addChoices(
+          { name: 'status — view options engine status', value: 'status' },
+          { name: 'trade — manually trigger options trade', value: 'trade' },
+          { name: 'close — close all options positions', value: 'close' },
+          { name: 'logs — recent options activity', value: 'logs' },
+        )
+    )
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Underlying symbol for trade (e.g. SPY, QQQ, AAPL)')
+        .setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('direction')
+        .setDescription('Force direction (optional — AI picks if omitted)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'call — bullish', value: 'call' },
+          { name: 'put — bearish', value: 'put' },
+        )
+    )
+    .addStringOption(opt =>
+      opt.setName('strategy')
+        .setDescription('Trading strategy (optional — AI picks if omitted)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'scalp — quick in/out, tight stops', value: 'scalp' },
+          { name: 'swing — larger move, wider stops', value: 'swing' },
+        )
+    ),
 ];
 
 async function registerCommands() {

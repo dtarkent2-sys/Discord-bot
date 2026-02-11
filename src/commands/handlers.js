@@ -22,6 +22,7 @@ const validea = require('../services/validea');
 const macro = require('../services/macro');
 const sectors = require('../services/sectors');
 const policy = require('../services/policy');
+const optionsEngine = require('../services/options-engine');
 const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -96,6 +97,8 @@ async function handleCommand(interaction) {
       return handleFlow(interaction);
     case 'whales':
       return handleWhales(interaction);
+    case 'options':
+      return handleOptions(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -1491,6 +1494,129 @@ async function handleBets(interaction) {
   } catch (err) {
     console.error(`[Bets] Error for ${category}:`, err);
     await interaction.editReply(`**Kalshi — ${category}**\n❌ ${err.message}`);
+  }
+}
+
+// ── /options — 0DTE Options Trading Engine ──────────────────────────
+
+async function handleOptions(interaction) {
+  const action = interaction.options.getString('action');
+  const hasAdminPerms = interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator);
+  const isOwner = config.botOwnerId && interaction.user.id === config.botOwnerId;
+  const isAuthorized = isOwner || hasAdminPerms;
+
+  const privilegedActions = new Set(['trade', 'close']);
+  if (privilegedActions.has(action) && !isAuthorized) {
+    return interaction.reply({
+      content: 'This action is restricted to the bot owner or server administrators.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  if (['trade'].includes(action) && !alpaca.enabled) {
+    return interaction.reply({
+      content: '**0DTE Options requires Alpaca.** Set `ALPACA_API_KEY` and `ALPACA_API_SECRET` in your `.env` file.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  await interaction.deferReply();
+
+  try {
+    switch (action) {
+      case 'status': {
+        const status = await optionsEngine.getStatus();
+        await interaction.editReply(optionsEngine.formatStatusForDiscord(status));
+        break;
+      }
+      case 'trade': {
+        const ticker = interaction.options.getString('ticker');
+        if (!ticker) {
+          await interaction.editReply(
+            '**0DTE Options — Manual Trade**\n' +
+            'Specify an underlying to run the full options pipeline.\n\n' +
+            '`/options trade ticker:SPY` — AI picks direction + contract\n' +
+            '`/options trade ticker:QQQ direction:call` — force call direction\n' +
+            '`/options trade ticker:SPY direction:put strategy:swing` — force put + swing strategy'
+          );
+          break;
+        }
+
+        const direction = interaction.options.getString('direction');
+        const strategy = interaction.options.getString('strategy');
+
+        await interaction.editReply(`**0DTE — Evaluating ${ticker.toUpperCase()}...**\n⏳ Running options pipeline...`);
+
+        const result = await optionsEngine.manualTrade(ticker, { direction, strategy });
+
+        const lines = [];
+        if (result.success) {
+          lines.push(`**0DTE Trade Executed**`);
+          lines.push(result.message);
+        } else {
+          lines.push(`**0DTE Trade — ${ticker.toUpperCase()}**`);
+          lines.push(`❌ ${result.message}`);
+        }
+
+        if (result.details?.steps?.length > 0) {
+          lines.push('');
+          lines.push('__Pipeline Steps:__');
+          for (const step of result.details.steps) {
+            lines.push(`• ${step}`);
+          }
+        }
+
+        lines.push(`\n_${alpaca.isPaper ? 'Paper trading' : 'LIVE trading'} mode_`);
+        await interaction.editReply(lines.join('\n'));
+        break;
+      }
+      case 'close': {
+        // Close all options positions
+        const positions = await alpaca.getOptionsPositions();
+        if (positions.length === 0) {
+          await interaction.editReply('_No open options positions to close._');
+          break;
+        }
+
+        const results = [];
+        for (const pos of positions) {
+          try {
+            await alpaca.closeOptionsPosition(pos.symbol);
+            const pnl = Number(pos.unrealized_pl || 0);
+            policy.recordOptionsTradeResult(pnl);
+            const parsed = alpaca._parseOccSymbol(pos.symbol);
+            results.push(`✅ ${parsed.underlying} $${parsed.strike} ${parsed.type.toUpperCase()} — P/L: $${pnl.toFixed(2)}`);
+          } catch (err) {
+            results.push(`❌ ${pos.symbol}: ${err.message}`);
+          }
+        }
+
+        await interaction.editReply(
+          `**0DTE — Closing All Options Positions**\n\n${results.join('\n')}`
+        );
+        break;
+      }
+      case 'logs': {
+        const logs = optionsEngine.getLogs();
+        if (logs.length === 0) {
+          await interaction.editReply('_No recent 0DTE options activity._');
+          break;
+        }
+        const lines = [`**0DTE Options — Recent Activity**\n`];
+        for (const log of logs.slice(-15).reverse()) {
+          const time = new Date(log.timestamp).toLocaleTimeString('en-US', { timeZone: 'America/New_York' });
+          const emoji = log.type === 'trade' ? '💰' : log.type === 'blocked' ? '🚫' : log.type === 'error' ? '❌' : '📋';
+          lines.push(`\`${time}\` ${emoji} ${log.message}`);
+        }
+        await interaction.editReply(lines.join('\n'));
+        break;
+      }
+      default:
+        await interaction.editReply('Unknown options action. Use: `status`, `trade`, `close`, `logs`');
+    }
+  } catch (err) {
+    console.error(`[Options] Error (${action}):`, err);
+    await interaction.editReply(`**0DTE Options — ${action}**\n❌ ${err.message}`);
   }
 }
 
