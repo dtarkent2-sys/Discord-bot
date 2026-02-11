@@ -298,17 +298,39 @@ async function getMultiplePrices(tickers) {
 function formatForPrompt(prices) {
   if (!prices || prices.length === 0) return '';
 
+  let hasStale = false;
   const lines = prices
     .filter(p => !p.error && p.price != null)
     .map(p => {
       const dir = (p.changePercent ?? 0) >= 0 ? '+' : '';
       const pct = p.changePercent != null ? `${dir}${p.changePercent.toFixed(2)}%` : 'N/A';
       const vol = p.volume ? `Vol: ${(p.volume / 1e6).toFixed(1)}M` : '';
-      return `${p.ticker}: $${p.price.toFixed(2)} (${pct}) ${vol}`.trim();
+      // Calculate and display data age
+      let ageLabel = '';
+      if (p.lastUpdated) {
+        const ageMs = Date.now() - new Date(p.lastUpdated).getTime();
+        const ageSec = Math.floor(ageMs / 1000);
+        if (ageSec > 300) {
+          ageLabel = ` [STALE: ${Math.floor(ageSec / 60)}m old]`;
+          hasStale = true;
+        } else if (ageSec > 60) {
+          ageLabel = ` [${Math.floor(ageSec / 60)}m ago]`;
+        }
+      }
+      if (p.stale) {
+        ageLabel = ageLabel || ' [STALE: cached fallback]';
+        hasStale = true;
+      }
+      const src = p.source ? ` via ${p.source}` : '';
+      return `${p.ticker}: $${p.price.toFixed(2)} (${pct}) ${vol}${src}${ageLabel}`.trim();
     });
 
   if (lines.length === 0) return 'Price data unavailable — proceeding with caution.';
-  return `Current market data (real-time):\n${lines.join('\n')}`;
+
+  const header = hasStale
+    ? 'Market data (WARNING: some prices are stale/cached — do NOT treat as real-time):'
+    : `Current market data (fetched ${new Date().toISOString()}):`;
+  return `${header}\n${lines.join('\n')}`;
 }
 
 /**
