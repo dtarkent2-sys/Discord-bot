@@ -29,6 +29,7 @@ const mahoraga = require('./mahoraga');
 const policy = require('./policy');
 const initiative = require('./initiative');
 const gammaSqueeze = require('./gamma-squeeze');
+const yoloMode = require('./yolo-mode');
 const config = require('../config');
 const auditLog = require('./audit-log');
 const circuitBreaker = require('./circuit-breaker');
@@ -219,6 +220,11 @@ class AutonomousBehaviorEngine {
     gammaSqueeze.start();
     console.log(`[Sprocket] Gamma squeeze engine active — watching ${gammaSqueeze.getWatchlist().join(', ')}`);
 
+    // 9. YOLO MODE — autonomous self-improvement engine
+    yoloMode.init(this.client, (content) => this.postToChannel(config.tradingChannelName, content));
+    yoloMode.start();
+    console.log(`[Sprocket] YOLO mode ${yoloMode.enabled ? 'ACTIVE — autonomous self-improvement running' : 'standby — use /yolo enable to activate'}`);
+
     console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
   }
 
@@ -233,6 +239,7 @@ class AutonomousBehaviorEngine {
     }
     initiative.stop();
     gammaSqueeze.stop();
+    yoloMode.stop();
     this._stopped = true;
     console.log('[Sprocket] All scheduled behaviors stopped.');
     auditLog.log('schedule', 'All scheduled behaviors stopped');
