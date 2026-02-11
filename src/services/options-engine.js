@@ -352,7 +352,7 @@ class OptionsEngine {
 
     this._log('scan', `${underlying}: direction=${directionSignals.direction}, bull=${directionSignals.bullPoints.toFixed(1)} vs bear=${directionSignals.bearPoints.toFixed(1)}, conviction=${directionSignals.conviction}/10, strategy=${directionSignals.strategy}`);
 
-    if (directionSignals.conviction < 4) {
+    if (directionSignals.conviction < 3) {
       this._log('scan', `${underlying}: weak directional signals (${directionSignals.conviction}/10) — skipping`);
       this._markScanned(cooldownKey);
       return null;
@@ -593,7 +593,7 @@ class OptionsEngine {
 
     // Conviction: 1-10 scale based on signal strength and clarity
     const clarity = total > 0 ? dominantPoints / total : 0; // how one-sided
-    const rawConviction = Math.min(dominantPoints * clarity * 2, 10);
+    const rawConviction = Math.min(dominantPoints * clarity * 2.5, 10);
     const conviction = Math.round(rawConviction);
 
     // Strategy: scalp if low ATR / mean-reversion setup, swing if trending
@@ -607,8 +607,8 @@ class OptionsEngine {
 
   async _askOptionsAI(underlying, spot, tech, gexSummary, macroRegime, directionSignals, et) {
     const prompt = [
-      `You are an elite 0DTE options trader. Evaluate this intraday setup and decide: BUY_CALL, BUY_PUT, or SKIP.`,
-      `You are EXTREMELY selective — only A+ setups. If anything is off, SKIP.`,
+      `You are a confident 0DTE options trader who TAKES TRADES when the setup is there. Evaluate this intraday setup and decide: BUY_CALL, BUY_PUT, or SKIP.`,
+      `You WANT to trade. Your job is to find the trade, not to find reasons to skip. If the directional signals agree and risk/reward is defined, TAKE THE TRADE. Only SKIP when signals genuinely conflict or there is no clear edge.`,
       ``,
       `═══ CONTEXT ═══`,
       `Ticker: ${underlying} | Spot: $${spot} | Time: ${et.hour}:${String(et.minute).padStart(2, '0')} ET (${et.minutesToClose} min to close)`,
@@ -652,15 +652,16 @@ class OptionsEngine {
       ...directionSignals.reasons.map(r => `  - ${r}`),
       ``,
       `═══ RULES ═══`,
-      `1. 0DTE theta decay is BRUTAL — only trade if the move should happen FAST`,
-      `2. Need clear risk/reward: stop loss close by, target at a real level (GEX wall, VWAP, Bollinger band)`,
+      `1. 0DTE theta decay is real — but that's why we trade MOMENTUM. If the move is happening NOW, get in.`,
+      `2. Use a real level for stop/target: GEX wall, VWAP, Bollinger band, support/resistance. Don't need perfection — just a defined risk.`,
       `3. In Long Gamma: trade mean-reversion (buy dips, sell rips). In Short Gamma: trade trends.`,
-      `4. Never fight the GEX regime. If short gamma and price is tanking, don't buy calls.`,
-      `5. Volume must confirm. Low volume moves are traps.`,
-      `6. Last hour of trading: be extra careful, theta accelerates exponentially.`,
-      `7. If conviction is below 7, SKIP. There's always another trade.`,
-      `8. Multi-timeframe EMA alignment matters: if most timeframes agree, trade with conviction. If mixed, be cautious or SKIP.`,
-      `9. During an active gamma squeeze, ride the structural edge. During unwind, exit quickly.`,
+      `4. Don't fight the GEX regime. If short gamma and tanking, don't buy calls.`,
+      `5. Volume confirms — but absence of volume alone is NOT a reason to skip if other signals align.`,
+      `6. Last 45 min: tighter stops, quicker scalps. Last 15 min: probably skip.`,
+      `7. If pre-conviction is 5+ and signals agree, you should be giving conviction 6-8. Give 9-10 for perfect setups. Only give below 5 when signals genuinely CONFLICT.`,
+      `8. Multi-timeframe EMA alignment is a strong confirmation. If most timeframes agree, be MORE confident, not less.`,
+      `9. During an active gamma squeeze, ride the structural edge aggressively. During unwind, exit.`,
+      `10. YOU WANT TO TRADE. The system already filtered weak setups before asking you. If you're being asked, there's likely something here. Find the trade.`,
       ``,
       `Respond with ONLY valid JSON:`,
       `{"action": "BUY_CALL" | "BUY_PUT" | "SKIP", "conviction": 1-10, "strategy": "scalp" | "swing", "target": "$X.XX", "stopLevel": "$X.XX", "reason": "1-2 sentences"}`,
@@ -988,7 +989,7 @@ class OptionsEngine {
 
       this._log('alert_trigger', `${underlying}: direction=${directionSignals.direction}, conviction=${adjustedConviction}/10 (alert ${alertMatchesAnalysis ? 'confirms' : 'conflicts'}), strategy=${directionSignals.strategy}`);
 
-      if (adjustedConviction < 4) {
+      if (adjustedConviction < 3) {
         this._log('alert_trigger', `${underlying}: weak signals (${adjustedConviction}/10) even with alert — skipping`);
         return;
       }

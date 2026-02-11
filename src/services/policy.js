@@ -45,7 +45,7 @@ const DEFAULT_CONFIG = {
   options_scalp_stop_loss_pct: 0.25,    // 25% stop loss for scalps
   options_swing_take_profit_pct: 0.75,  // 75% profit target for swings
   options_swing_stop_loss_pct: 0.40,    // 40% stop loss for swings
-  options_min_conviction: 7,            // min AI conviction (1-10) to enter a trade
+  options_min_conviction: 5,            // min AI conviction (1-10) to enter a trade
   options_close_before_minutes: 30,     // close 0DTE positions X min before market close
   options_min_delta: 0.25,              // min option delta for contract selection
   options_max_delta: 0.60,              // max option delta for contract selection
