@@ -37,6 +37,14 @@ try {
   kalshi = null;
 }
 
+// Unusual Whales — options flow, dark pool, short interest, insider, GEX
+let uw;
+try {
+  uw = require('./unusual-whales');
+} catch {
+  uw = null;
+}
+
 // LLM call timeout (90 seconds per call)
 const LLM_TIMEOUT_MS = 90000;
 
@@ -138,6 +146,20 @@ class TradingAgents {
             }
           })
           .catch(err => console.warn(`[TradingAgents] Kalshi enrichment failed for ${upper}:`, err.message))
+      );
+    }
+
+    // Unusual Whales — options flow, dark pool, short interest, insider, IV, max pain
+    if (uw && uw.enabled) {
+      enrichPromises.push(
+        uw.getEnrichmentForAnalysis(upper)
+          .then(uwBlock => {
+            if (uwBlock) {
+              marketData += `\n\n${uwBlock}`;
+              dataSources.push('unusual-whales');
+            }
+          })
+          .catch(err => console.warn(`[TradingAgents] Unusual Whales enrichment failed for ${upper}:`, err.message))
       );
     }
 
