@@ -225,32 +225,40 @@ class OptionsEngine {
     const cfg = policy.getConfig();
     const underlyings = cfg.options_underlyings || ['SPY', 'QQQ'];
 
-    // 1. Get macro regime
+    // 1. Get macro regime — don't let failure block scanning
     let macroRegime = { regime: 'CAUTIOUS', score: 0 };
     try {
       macroRegime = await macro.getRegime();
-      this._log('macro', `Options scan — macro regime: ${macroRegime.regime}`);
     } catch (err) {
-      this._log('macro', `Macro unavailable: ${err.message}`);
+      this._log('macro', `Macro unavailable (${err.message}) — proceeding as CAUTIOUS`);
     }
+
+    this._log('scan', `Scanning ${underlyings.join(', ')} | macro=${macroRegime.regime} | positions=${currentOptionsPositions}/${cfg.options_max_positions}`);
 
     // Skip scanning in RISK_OFF (only monitor exits)
     if (macroRegime.regime === 'RISK_OFF') {
-      this._log('macro', 'RISK_OFF — skipping options entry scan');
+      this._log('scan', 'RISK_OFF — skipping options entry scan, monitoring exits only');
       return;
     }
 
     for (const underlying of underlyings) {
-      if (currentOptionsPositions >= cfg.options_max_positions) break;
+      if (currentOptionsPositions >= cfg.options_max_positions) {
+        this._log('scan', `Position cap reached — stopping scan`);
+        break;
+      }
 
       try {
         const signal = await this._analyzeUnderlying(underlying, macroRegime, et);
         if (!signal) continue;
 
         // Execute if we got a signal
+        this._log('trade', `EXECUTING: ${signal.optionType.toUpperCase()} on ${underlying} — conviction ${signal.conviction}/10, strategy ${signal.strategy}`);
         const result = await this._executeEntry(signal, account, currentOptionsPositions, et);
         if (result.success) {
           currentOptionsPositions++;
+          this._log('trade', `ORDER PLACED: ${underlying} ${signal.optionType} — ${signal.reason}`);
+        } else {
+          this._log('trade', `ORDER FAILED: ${underlying} — ${result.reason}`);
         }
       } catch (err) {
         this._log('error', `Scan error for ${underlying}: ${err.message}`);
@@ -261,74 +269,87 @@ class OptionsEngine {
   /**
    * Analyze an underlying for a 0DTE options trade opportunity.
    * Returns a signal object or null if no setup found.
+   *
+   * RESILIENT: GEX failure does NOT block analysis — falls back to
+   * technicals + AI. Signal cache only blocks for 5 min (not 15).
    */
   async _analyzeUnderlying(underlying, macroRegime, et) {
     const cfg = policy.getConfig();
-    const cacheKey = `opts_${underlying}`;
 
-    // Check signal cache (avoid re-evaluating too quickly)
-    const cached = signalCache.get(cacheKey);
-    if (cached.cached) {
-      return null;
+    // Cooldown per-underlying (not using signal cache — that was blocking too aggressively)
+    const cooldownKey = `opts_${underlying}`;
+    const lastScan = this._scanTimestamps?.get(cooldownKey) || 0;
+    if (Date.now() - lastScan < (cfg.options_cooldown_minutes || 5) * 60 * 1000) {
+      return null; // Still on cooldown, silently skip
     }
 
-    // 1. Fetch GEX data
-    let gexSummary;
+    this._log('scan', `${underlying}: Starting 0DTE analysis...`);
+
+    // 1. Fetch GEX data (OPTIONAL — failure does not block)
+    let gexSummary = null;
     try {
       gexSummary = await this._gexEngine.analyze(underlying, { include_expiries: ['0dte'] });
+      this._log('gex', `${underlying}: spot=$${gexSummary.spot}, regime=${gexSummary.regime.label} (${(gexSummary.regime.confidence * 100).toFixed(0)}%), flip=$${gexSummary.gammaFlip || '—'}`);
     } catch (err) {
-      this._log('gex', `${underlying}: GEX unavailable — ${err.message}`);
-      signalCache.skip(cacheKey, 'GEX unavailable');
-      return null;
+      this._log('gex', `${underlying}: GEX unavailable (${err.message}) — proceeding with technicals only`);
     }
 
-    const { spot, regime: gexRegime, walls, gammaFlip } = gexSummary;
-    this._log('gex', `${underlying}: spot=$${spot}, regime=${gexRegime.label} (${(gexRegime.confidence * 100).toFixed(0)}%), flip=$${gammaFlip || '—'}`);
-
-    // 2. Fetch intraday technicals (5-min bars)
+    // 2. Fetch intraday technicals (5-min bars) — REQUIRED
     let intradayTech;
+    const spot = gexSummary?.spot || null;
     try {
       const bars = await alpaca.getIntradayBars(underlying, { timeframe: '5Min', limit: 50 });
       if (bars.length < 10) {
-        this._log('tech', `${underlying}: not enough intraday bars (${bars.length})`);
-        signalCache.skip(cacheKey, 'insufficient bars');
+        this._log('tech', `${underlying}: not enough intraday bars (${bars.length}) — skipping`);
+        this._markScanned(cooldownKey);
         return null;
       }
-      intradayTech = this._computeIntradayTechnicals(bars, spot);
+      // Use spot from GEX if available, otherwise last close from bars
+      const refPrice = spot || bars[bars.length - 1].close;
+      intradayTech = this._computeIntradayTechnicals(bars, refPrice);
+      this._log('tech', `${underlying}: RSI=${intradayTech.rsi?.toFixed(1)}, MACD hist=${intradayTech.macd?.histogram?.toFixed(3) || 'N/A'}, momentum=${intradayTech.momentum.toFixed(2)}%, VWAP=$${intradayTech.vwap.toFixed(2)}, vol=${intradayTech.volumeTrend.toFixed(1)}x`);
     } catch (err) {
       this._log('tech', `${underlying}: intraday data error — ${err.message}`);
-      signalCache.skip(cacheKey, 'intraday data error');
+      this._markScanned(cooldownKey);
       return null;
     }
 
     // 3. Determine direction bias
-    const directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spot, macroRegime);
+    const gexRegime = gexSummary?.regime || { label: 'Unknown', confidence: 0 };
+    const walls = gexSummary?.walls || { callWalls: [], putWalls: [] };
+    const gammaFlip = gexSummary?.gammaFlip || null;
+    const spotPrice = spot || intradayTech.price;
+
+    const directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spotPrice, macroRegime);
+
+    this._log('scan', `${underlying}: direction=${directionSignals.direction}, bull=${directionSignals.bullPoints.toFixed(1)} vs bear=${directionSignals.bearPoints.toFixed(1)}, conviction=${directionSignals.conviction}/10, strategy=${directionSignals.strategy}`);
 
     if (directionSignals.conviction < 4) {
       this._log('scan', `${underlying}: weak directional signals (${directionSignals.conviction}/10) — skipping`);
-      signalCache.skip(cacheKey, `weak signals (${directionSignals.conviction}/10)`);
+      this._markScanned(cooldownKey);
       return null;
     }
 
-    this._log('scan', `${underlying}: direction=${directionSignals.direction}, conviction=${directionSignals.conviction}/10, strategy=${directionSignals.strategy}`);
-
     // 4. Ask AI for final decision
-    const aiDecision = await this._askOptionsAI(underlying, spot, intradayTech, gexSummary, macroRegime, directionSignals, et);
+    this._log('scan', `${underlying}: conviction ${directionSignals.conviction}/10 — asking AI...`);
+    const aiDecision = await this._askOptionsAI(underlying, spotPrice, intradayTech, gexSummary || this._buildMinimalGexContext(spotPrice), macroRegime, directionSignals, et);
 
     if (!aiDecision || aiDecision.action === 'SKIP') {
       const reason = aiDecision?.reason || 'AI says skip';
       this._log('scan', `${underlying}: AI SKIP — ${reason}`);
-      signalCache.set(cacheKey, { decision: 'skip', reason });
+      this._markScanned(cooldownKey);
       return null;
     }
 
     if (aiDecision.conviction < cfg.options_min_conviction) {
-      this._log('scan', `${underlying}: AI conviction ${aiDecision.conviction}/10 below min ${cfg.options_min_conviction}`);
-      signalCache.set(cacheKey, { decision: 'low_conviction', conviction: aiDecision.conviction });
+      this._log('scan', `${underlying}: AI conviction ${aiDecision.conviction}/10 below min ${cfg.options_min_conviction} — skipping`);
+      this._markScanned(cooldownKey);
       return null;
     }
 
-    this._log('scan', `${underlying}: AI ${aiDecision.action} — conviction ${aiDecision.conviction}/10, strategy: ${aiDecision.strategy || directionSignals.strategy}`);
+    this._log('scan', `${underlying}: AI says ${aiDecision.action} — conviction ${aiDecision.conviction}/10, strategy: ${aiDecision.strategy || directionSignals.strategy} — PROCEEDING TO EXECUTE`);
+
+    this._markScanned(cooldownKey);
 
     return {
       underlying,
@@ -337,11 +358,27 @@ class OptionsEngine {
       strategy: aiDecision.strategy || directionSignals.strategy,
       conviction: aiDecision.conviction,
       reason: aiDecision.reason,
-      spot,
+      spot: spotPrice,
       gex: gexSummary,
       technicals: intradayTech,
       target: aiDecision.target,
       stopLevel: aiDecision.stopLevel,
+    };
+  }
+
+  /** Track when we last scanned an underlying */
+  _markScanned(key) {
+    if (!this._scanTimestamps) this._scanTimestamps = new Map();
+    this._scanTimestamps.set(key, Date.now());
+  }
+
+  /** Build minimal GEX context when real GEX is unavailable (so AI prompt doesn't break) */
+  _buildMinimalGexContext(spotPrice) {
+    return {
+      spot: spotPrice,
+      regime: { label: 'Unknown', confidence: 0 },
+      walls: { callWalls: [], putWalls: [] },
+      gammaFlip: null,
     };
   }
 
@@ -450,8 +487,8 @@ class OptionsEngine {
     }
 
     // ── GEX WALLS (key levels) ──
-    const callWall = walls.callWalls[0];
-    const putWall = walls.putWalls[0];
+    const callWall = walls.callWalls?.[0];
+    const putWall = walls.putWalls?.[0];
 
     if (putWall && spot <= putWall.strike * 1.005) {
       bullPoints += 1.5;
@@ -552,9 +589,9 @@ class OptionsEngine {
       `Regime: ${macroRegime.regime} (score: ${macroRegime.score || 'N/A'})`,
       ``,
       `═══ GEX (GAMMA EXPOSURE) ═══`,
-      `Regime: ${gexSummary.regime.label} (${(gexSummary.regime.confidence * 100).toFixed(0)}% confidence)`,
-      gexSummary.walls.callWalls[0] ? `Call Wall: $${gexSummary.walls.callWalls[0].strike}${gexSummary.walls.callWalls[0].stacked ? ' STACKED' : ''}` : null,
-      gexSummary.walls.putWalls[0] ? `Put Wall: $${gexSummary.walls.putWalls[0].strike}${gexSummary.walls.putWalls[0].stacked ? ' STACKED' : ''}` : null,
+      gexSummary.regime?.label !== 'Unknown' ? `Regime: ${gexSummary.regime.label} (${(gexSummary.regime.confidence * 100).toFixed(0)}% confidence)` : `Regime: UNAVAILABLE (trade based on technicals)`,
+      gexSummary.walls?.callWalls?.[0] ? `Call Wall: $${gexSummary.walls.callWalls[0].strike}${gexSummary.walls.callWalls[0].stacked ? ' STACKED' : ''}` : null,
+      gexSummary.walls?.putWalls?.[0] ? `Put Wall: $${gexSummary.walls.putWalls[0].strike}${gexSummary.walls.putWalls[0].stacked ? ' STACKED' : ''}` : null,
       gexSummary.gammaFlip ? `Gamma Flip: $${gexSummary.gammaFlip} (spot ${spot > gexSummary.gammaFlip ? 'ABOVE' : 'BELOW'})` : null,
       ``,
       `═══ INTRADAY TECHNICALS (5-min bars) ═══`,
