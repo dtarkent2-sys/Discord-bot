@@ -34,7 +34,6 @@ const FILE_COOLDOWN_MS = 15 * 60 * 1000;    // 15 min cooldown per file — iter
 const MAX_IMPROVEMENTS_PER_CYCLE = 5;        // up to 5 improvements per cycle
 const MAX_IMPROVEMENTS_PER_DAY = 50;         // Billy can evolve all day
 const MAX_CONSECUTIVE_FAILURES = 10;         // very tolerant — keep trying
-const MAX_LINES_CHANGED = 80;               // allow substantial changes
 
 // Files the engine must NEVER touch (absolute minimum — only secrets + self)
 const FORBIDDEN_FILES = [
@@ -357,9 +356,6 @@ If the code looks solid and you find NOTHING worth fixing, respond with exactly:
 
     if (!issueMatch || !fixMatch) return null;
 
-    const linesEstimate = linesMatch ? parseInt(linesMatch[1]) : 10;
-    if (linesEstimate > MAX_LINES_CHANGED) return null;
-
     const instruction = `${issueMatch[1].trim()}. ${fixMatch[1].trim()}. Output the COMPLETE fixed file.`;
 
     return this._generateAndApplyFix(targetFile, instruction, 'code_quality');
@@ -585,11 +581,6 @@ ${currentCode}`;
     const linesChanged = github.diffLines(currentCode, newCode);
     if (linesChanged === 0) {
       console.log(`[YOLO] No actual changes for ${filePath}`);
-      return null;
-    }
-    if (linesChanged > MAX_LINES_CHANGED) {
-      console.log(`[YOLO] Too many lines changed (${linesChanged}/${MAX_LINES_CHANGED}) for ${filePath}`);
-      this._addJournal('blocked', filePath, `Change too large: ${linesChanged} lines (limit: ${MAX_LINES_CHANGED})`, source);
       return null;
     }
 

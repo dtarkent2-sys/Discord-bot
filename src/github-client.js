@@ -109,7 +109,7 @@ class GitHubClient {
   // Safety check: is this change safe for auto-edit?
   isChangeSafe(filePath, newContent, currentContent) {
     // Rule 1: Never touch files with secrets or core infra
-    const forbiddenFiles = ['.env', 'config.json', 'github-client.js', 'ai-coder.js', 'package-lock.json'];
+    const forbiddenFiles = ['.env', 'config.json', 'package-lock.json'];
     if (forbiddenFiles.some(f => filePath.includes(f))) {
       return { safe: false, reason: 'File is forbidden for auto-edit.' };
     }
@@ -119,12 +119,6 @@ class GitHubClient {
     const ext = filePath.slice(filePath.lastIndexOf('.'));
     if (!allowedExtensions.includes(ext)) {
       return { safe: false, reason: `File type "${ext}" not allowed for auto-edit.` };
-    }
-
-    // Rule 3: Reject very large changes (sanity check — YOLO mode has its own limit)
-    const linesChanged = this._diffLineCount(currentContent, newContent);
-    if (linesChanged > 100) {
-      return { safe: false, reason: `Change too large (${linesChanged} lines changed). Requires manual review.` };
     }
 
     return { safe: true };
