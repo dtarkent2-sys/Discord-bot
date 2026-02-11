@@ -354,6 +354,7 @@ async function handleHelp(interaction) {
     '**SHARK Agent**',
     '`/agent status` — Positions, risk, P/L',
     '`/agent config` — View settings | `/agent set` — Change settings',
+    '`/agent dangerous` — Toggle aggressive trading mode',
     '`/agent enable|disable|kill|reset|logs`',
     '',
     '**Owner:** `!update` `!suggest` `!autoedit` `!rollback` `!selfheal`',
@@ -1146,7 +1147,7 @@ async function handleAgent(interaction) {
   const isAuthorized = isOwner || hasAdminPerms;
 
   // Fast permission + config checks BEFORE deferring (these are synchronous / instant)
-  const privilegedActions = new Set(['enable', 'disable', 'kill', 'set', 'reset', 'trade']);
+  const privilegedActions = new Set(['enable', 'disable', 'kill', 'set', 'reset', 'trade', 'dangerous']);
   if (privilegedActions.has(action) && !isAuthorized) {
     const ownerHint = config.botOwnerId ? '' : ' (set BOT_OWNER_ID to grant owner access)';
     return interaction.reply({
@@ -1225,6 +1226,35 @@ async function handleAgent(interaction) {
       case 'reset': {
         policy.resetConfig();
         await interaction.editReply('**SHARK Config Reset**\nAll settings restored to defaults.\n\n_Use `/agent config` to view current settings._');
+        break;
+      }
+      case 'dangerous': {
+        const cfg = policy.getConfig();
+        if (cfg.dangerousMode) {
+          const result = policy.disableDangerousMode();
+          await interaction.editReply(
+            '**SHARK — Dangerous Mode DISABLED**\n' +
+            'Restored previous trading parameters.\n\n' +
+            '_Use `/agent config` to verify settings._'
+          );
+        } else {
+          const result = policy.enableDangerousMode();
+          const lines = [
+            '**SHARK — DANGEROUS MODE ENABLED**\n',
+            'Aggressive trading parameters are now active:',
+            '• Max positions: `10` | Max per trade: `$10,000`',
+            '• Daily loss limit: `5%` | Position size: `40%` of cash',
+            '• Stop loss: `8%` | Take profit: `15%`',
+            '• Cooldown: `5 min` | Scan interval: `2 min`',
+            '• Shorting: `enabled` | Crypto: `enabled`',
+            '• Min sentiment: `0.1` | Min confidence: `0.4`',
+            '• Options: `$1,000` premium, `5` positions, conviction `3/10`',
+            '',
+            '_Use `/agent dangerous` again to disable and restore previous settings._',
+            '_Use `/agent config` to see full config._',
+          ];
+          await interaction.editReply(lines.join('\n'));
+        }
         break;
       }
       case 'trade': {

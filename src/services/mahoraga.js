@@ -898,9 +898,10 @@ class SharkEngine {
   formatStatusForDiscord(status) {
     if (!status) return '_Could not fetch agent status._';
 
+    const dangerousLabel = status.config?.dangerousMode ? ' | **DANGEROUS MODE**' : '';
     const lines = [
       `**SHARK — Autonomous Trading Agent**`,
-      `Mode: ${status.paper ? '📄 Paper Trading' : '💵 LIVE Trading'}`,
+      `Mode: ${status.paper ? '📄 Paper Trading' : '💵 LIVE Trading'}${dangerousLabel}`,
       `Agent: ${status.agent_enabled ? '🟢 **ENABLED**' : '🔴 **DISABLED**'}`,
       ``,
     ];
@@ -1035,8 +1036,10 @@ class SharkEngine {
 
     lines.push(``);
     lines.push(`Kill Switch: ${cfg.killSwitch ? '🛑 **ACTIVE**' : '🟢 OK'}`);
+    lines.push(`Dangerous Mode: ${cfg.dangerousMode ? '**ACTIVE** — aggressive parameters' : 'OFF'}`);
     lines.push(``);
     lines.push(`_Use \`/agent set key:<name> value:<val>\` to change a setting_`);
+    lines.push(`_Use \`/agent dangerous\` to toggle aggressive mode_`);
     lines.push(`_Use \`/agent reset\` to restore defaults_`);
     return lines.join('\n');
   }
