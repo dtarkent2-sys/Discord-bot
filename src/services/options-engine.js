@@ -963,52 +963,86 @@ class OptionsEngine {
         return;
       }
 
-      // 3. GEX analysis
-      let gexSummary;
+      // 3. GEX analysis (OPTIONAL — failure does NOT block alert trades)
+      let gexSummary = null;
       try {
         gexSummary = await this._gexEngine.analyze(underlying, { include_expiries: ['0dte'] });
         this._log('alert_trigger', `${underlying}: GEX=${gexSummary.regime.label} (${(gexSummary.regime.confidence * 100).toFixed(0)}%), spot=$${gexSummary.spot}, flip=$${gexSummary.gammaFlip || '—'}`);
       } catch (err) {
-        this._log('alert_trigger', `${underlying}: GEX unavailable — ${err.message}`);
-        return;
+        this._log('alert_trigger', `${underlying}: GEX unavailable (${err.message}) — proceeding with technicals`);
       }
 
-      // 4. Intraday technicals
+      // 4. Intraday technicals — REQUIRED
       let intradayTech;
+      const spot = gexSummary?.spot || null;
       try {
         const bars = await alpaca.getIntradayBars(underlying, { timeframe: '5Min', limit: 50 });
         if (bars.length < 10) {
           this._log('alert_trigger', `${underlying}: not enough bars (${bars.length})`);
           return;
         }
-        intradayTech = this._computeIntradayTechnicals(bars, gexSummary.spot);
+        const refPrice = spot || bars[bars.length - 1].close;
+        intradayTech = this._computeIntradayTechnicals(bars, refPrice);
       } catch (err) {
         this._log('alert_trigger', `${underlying}: intraday data error — ${err.message}`);
         return;
       }
 
-      // 5. Direction assessment — factor in the alert hint
-      const directionSignals = this._assessDirection(intradayTech, gexSummary.regime, gexSummary.walls, gexSummary.gammaFlip, gexSummary.spot, macroRegime);
+      const spotPrice = spot || intradayTech.price;
 
-      // Boost conviction if alert direction matches our analysis
+      // 5. Direction assessment — factor in the alert hint
+      const gexRegime = gexSummary?.regime || { label: 'Unknown', confidence: 0 };
+      const walls = gexSummary?.walls || { callWalls: [], putWalls: [] };
+      const gammaFlip = gexSummary?.gammaFlip || null;
+      const directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spotPrice, macroRegime);
+
+      // 5b. Boost conviction from TradingView alert (+2 if confirms, 0 if conflicts)
+      // External signal confirmation is worth more than internal indicators
       let adjustedConviction = directionSignals.conviction;
       const alertMatchesAnalysis = directionSignals.direction === directionHint;
       if (alertMatchesAnalysis) {
-        adjustedConviction = Math.min(adjustedConviction + 1, 10);
-        directionSignals.reasons.push(`TradingView ${alert.action} signal confirms direction (+1 conviction boost)`);
+        adjustedConviction = Math.min(adjustedConviction + 2, 10);
+        directionSignals.reasons.push(`TradingView ${alert.action} signal CONFIRMS direction (+2 conviction)`);
       } else {
-        directionSignals.reasons.push(`TradingView ${alert.action} signal CONFLICTS with ${directionSignals.direction} analysis (no boost)`);
+        directionSignals.reasons.push(`TradingView ${alert.action} signal conflicts with ${directionSignals.direction} analysis`);
       }
 
-      this._log('alert_trigger', `${underlying}: direction=${directionSignals.direction}, conviction=${adjustedConviction}/10 (alert ${alertMatchesAnalysis ? 'confirms' : 'conflicts'}), strategy=${directionSignals.strategy}`);
+      // 5c. Confidence boost from TradingView signal strength
+      if (alert.confidence === 'HIGH') {
+        adjustedConviction = Math.min(adjustedConviction + 1, 10);
+        directionSignals.reasons.push('TradingView HIGH confidence (+1 conviction)');
+      }
 
-      if (adjustedConviction < 3) {
-        this._log('alert_trigger', `${underlying}: weak signals (${adjustedConviction}/10) even with alert — skipping`);
+      // 5d. Gamma squeeze signal boost (same as scan path)
+      const squeezeSignal = gammaSqueeze.getSqueezeSignal(underlying);
+      if (squeezeSignal.active) {
+        adjustedConviction = Math.min(adjustedConviction + squeezeSignal.convictionBoost, 10);
+        directionSignals.reasons.push(`Gamma squeeze: ${squeezeSignal.state} (${squeezeSignal.convictionBoost > 0 ? '+' : ''}${squeezeSignal.convictionBoost})`);
+      }
+
+      // 5e. MTF EMA confluence (same as scan path)
+      let mtfResult = null;
+      try {
+        mtfResult = await analyzeMTFEMA(underlying);
+        adjustedConviction = Math.max(1, Math.min(adjustedConviction + mtfResult.convictionBoost, 10));
+        directionSignals.reasons.push(`MTF EMA: ${mtfResult.consensus} (${mtfResult.convictionBoost > 0 ? '+' : ''}${mtfResult.convictionBoost})`);
+      } catch (err) {
+        this._log('alert_trigger', `${underlying}: MTF unavailable (${err.message})`);
+      }
+
+      directionSignals.conviction = adjustedConviction;
+
+      this._log('alert_trigger', `${underlying}: direction=${directionSignals.direction}, conviction=${adjustedConviction}/10 (alert ${alertMatchesAnalysis ? 'CONFIRMS' : 'conflicts'}), strategy=${directionSignals.strategy}`);
+
+      // Alert-triggered trades have an external signal — lower floor to 2
+      if (adjustedConviction < 2) {
+        this._log('alert_trigger', `${underlying}: very weak signals (${adjustedConviction}/10) even with TradingView alert — skipping`);
         return;
       }
 
       // 6. AI decision — pass the alert context for extra information
-      const aiDecision = await this._askOptionsAI(underlying, gexSummary.spot, intradayTech, gexSummary, macroRegime, { ...directionSignals, conviction: adjustedConviction }, et);
+      const gexContext = gexSummary || this._buildMinimalGexContext(spotPrice);
+      const aiDecision = await this._askOptionsAI(underlying, spotPrice, intradayTech, gexContext, macroRegime, { ...directionSignals, conviction: adjustedConviction }, et);
 
       if (!aiDecision || aiDecision.action === 'SKIP') {
         const reason = aiDecision?.reason || 'AI says skip';
@@ -1021,7 +1055,7 @@ class OptionsEngine {
         return;
       }
 
-      this._log('alert_trigger', `${underlying}: AI ${aiDecision.action} — conviction ${aiDecision.conviction}/10 — proceeding to execution`);
+      this._log('alert_trigger', `${underlying}: AI ${aiDecision.action} — conviction ${aiDecision.conviction}/10 — EXECUTING from TradingView alert`);
 
       // 7. Build signal and execute
       const signal = {
@@ -1031,7 +1065,7 @@ class OptionsEngine {
         strategy: aiDecision.strategy || directionSignals.strategy,
         conviction: aiDecision.conviction,
         reason: `Alert trigger: "${alert.reason || alert.action}" → ${aiDecision.reason}`,
-        spot: gexSummary.spot,
+        spot: spotPrice,
         gex: gexSummary,
         technicals: intradayTech,
         target: aiDecision.target,

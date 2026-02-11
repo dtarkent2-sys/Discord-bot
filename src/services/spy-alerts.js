@@ -69,8 +69,10 @@ function convictionToGrade(conviction) {
   if (conviction >= 9) return 'A+';
   if (conviction >= 8) return 'A';
   if (conviction >= 7) return 'B+';
-  if (conviction >= 5) return 'C';
-  return 'F';
+  if (conviction >= 5) return 'B';
+  if (conviction >= 4) return 'C+';
+  if (conviction >= 3) return 'C';
+  return 'D';
 }
 
 // ── Alert Rate Limiter ──────────────────────────────────────────────────
