@@ -2,40 +2,7 @@
 // Set to true to make self-edits apply automatically (no !confirm needed)
 const autoApplyEdits = true;  // Change to false to re-enable manual review
 
-// Override applyEdit to use the flag
-async function applyEdit(filePath, newContent, instruction) {
-  if (!autoApplyEdits) {
-    // Old manual mode (if flag false)
-    await message.reply("Preview generated. Use !confirm to apply.");
-    return;
-  }
-
-  console.log(`[AICoder] AUTO-APPLYING edit to ${filePath}`);
-  
-  const commitResult = await githubClient.commitAndPush(
-    filePath,
-    newContent,
-    `Auto-edit: ${instruction.slice(0, 80)}`
-  );
-
-  if (commitResult.success) {
-    console.log(`[AICoder] Auto-committed ${filePath} (SHA: ${commitResult.sha?.substring(0,7) || 'unknown'})`);
-    if (ownerUser) {
-      try {
-        await ownerUser.send(`✅ Auto-edit applied to \`${filePath}\`\nInstruction: ${instruction.slice(0,200)}...\nCommit: ${commitResult.sha?.substring(0,7) || 'unknown'}`);
-      } catch (dmErr) {
-        console.error('[AICoder] Failed to DM owner:', dmErr.message);
-      }
-    }
-  } else {
-    console.error('[AICoder] Auto-commit failed:', commitResult.error);
-    if (ownerUser) {
-      ownerUser.send(`⚠️ Auto-edit failed on \`${filePath}\`: ${commitResult.error}`).catch(() => {});
-    }
-  }
-}
-
-// Safety rails (keep these!)
+// Safety rails
 const MAX_FILES_PER_RUN = 3;
 let recentFailedDeploys = 0;
 const FAILED_DEPLOY_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -52,8 +19,50 @@ function recordFailedDeploy() {
   return false;
 }
 
-// Emergency disable command (add to messageCreate handler if not already there)
-if (message.content === '!disable-autoedit' && message.author.id === BOT_OWNER_ID) {
+// Override applyEdit to use the flag (safe version with fallbacks)
+async function applyEdit(filePath, newContent, instruction) {
+  if (!autoApplyEdits) {
+    // Old manual mode
+    if (message && message.reply) {
+      await message.reply("Preview generated. Use !confirm to apply.");
+    } else {
+      console.log('[AICoder] Preview generated (manual confirm needed)');
+    }
+    return;
+  }
+
+  console.log(`[AICoder] AUTO-APPLYING edit to ${filePath}`);
+
+  if (!githubClient || !githubClient.commitAndPush) {
+    console.error('[AICoder] githubClient not available - cannot commit');
+    return;
+  }
+
+  const commitResult = await githubClient.commitAndPush(
+    filePath,
+    newContent,
+    `Auto-edit: ${instruction.slice(0, 80)}`
+  );
+
+  if (commitResult.success) {
+    console.log(`[AICoder] Auto-committed ${filePath} (SHA: ${commitResult.sha?.substring(0,7) || 'unknown'})`);
+    if (ownerUser && ownerUser.send) {
+      try {
+        await ownerUser.send(`✅ Auto-edit applied to \`${filePath}\`\nInstruction: ${instruction.slice(0,200)}...\nCommit: ${commitResult.sha?.substring(0,7) || 'unknown'}`);
+      } catch (dmErr) {
+        console.error('[AICoder] Failed to DM owner:', dmErr.message);
+      }
+    }
+  } else {
+    console.error('[AICoder] Auto-commit failed:', commitResult.error);
+    if (ownerUser && ownerUser.send) {
+      ownerUser.send(`⚠️ Auto-edit failed on \`${filePath}\`: ${commitResult.error}`).catch(() => {});
+    }
+  }
+}
+
+// Emergency disable command (add this to messageCreate handler if not already present)
+if (message && message.content === '!disable-autoedit' && message.author.id === BOT_OWNER_ID) {
   autoApplyEdits = false;
   message.reply('Autonomous self-edits disabled. Use !enable-autoedit to re-enable.');
 }
