@@ -5,7 +5,7 @@ const mood = require('./mood');
 const { persona, buildPersonalityPrompt } = require('../personality');
 const { webSearch, formatResultsForAI } = require('../tools/web-search');
 const auditLog = require('./audit-log');
-const { todayString, nowEST, ragEnforcementBlock, MODEL_CUTOFF, userMessageDateAnchor } = require('../date-awareness');
+const { todayString, nowEST, ragEnforcementBlock, MODEL_CUTOFF, userMessageDateAnchor, detectHallucinations, buildHallucinationWarning } = require('../date-awareness');
 const priceFetcher = require('../tools/price-fetcher');
 
 class AIService {
@@ -355,6 +355,9 @@ ${mood.buildMoodContext()}
       }
     }
 
+    // Track all live data provided to the model (for hallucination cross-reference)
+    const liveDataContext = { livePrices, liveData, searchResults };
+
     const systemPrompt = this.buildSystemPrompt({ liveData, searchResults, livePrices });
 
     const memoryContext = memory.buildContext(userId);
@@ -396,8 +399,7 @@ ${mood.buildMoodContext()}
         } else {
           const cleaned = this._cleanResponse(assistantMessage);
           if (cleaned) {
-            history.push({ role: 'assistant', content: cleaned });
-            return cleaned.length > 1990 ? cleaned.slice(0, 1990) + '...' : cleaned;
+            return this._finalizeResponse(cleaned, history, liveDataContext);
           }
           console.warn('[AI] Kimi response empty after cleaning, falling back to Ollama');
         }
@@ -415,8 +417,7 @@ ${mood.buildMoodContext()}
       // Clean thinking tags and validate
       const cleaned = this._cleanResponse(assistantMessage);
       if (cleaned) {
-        history.push({ role: 'assistant', content: cleaned });
-        return cleaned.length > 1990 ? cleaned.slice(0, 1990) + '...' : cleaned;
+        return this._finalizeResponse(cleaned, history, liveDataContext);
       }
 
       // Ollama returned empty — try non-streaming as fallback
@@ -430,8 +431,7 @@ ${mood.buildMoodContext()}
         assistantMessage = result.message?.content || '';
         const cleanedRetry = this._cleanResponse(assistantMessage);
         if (cleanedRetry) {
-          history.push({ role: 'assistant', content: cleanedRetry });
-          return cleanedRetry.length > 1990 ? cleanedRetry.slice(0, 1990) + '...' : cleanedRetry;
+          return this._finalizeResponse(cleanedRetry, history, liveDataContext);
         }
       } catch (retryErr) {
         console.warn(`[AI] Non-streaming retry also failed: ${retryErr.message}`);
@@ -444,8 +444,7 @@ ${mood.buildMoodContext()}
           const kimiResult = await this._kimiAgentChat(chatMessages);
           const cleanedKimi = this._cleanResponse(kimiResult);
           if (cleanedKimi) {
-            history.push({ role: 'assistant', content: cleanedKimi });
-            return cleanedKimi.length > 1990 ? cleanedKimi.slice(0, 1990) + '...' : cleanedKimi;
+            return this._finalizeResponse(cleanedKimi, history, liveDataContext);
           }
         } catch (kimiErr) {
           console.warn(`[AI] Kimi last-resort also failed: ${kimiErr.message}`);
@@ -467,6 +466,33 @@ ${mood.buildMoodContext()}
       }
       return `Oops, something went wrong on my end: ${msg}`;
     }
+  }
+
+  /**
+   * Finalize a response: scan for hallucinations, append warning if needed, truncate.
+   * All chat return paths should go through this.
+   * @param {string} cleaned — The cleaned LLM response
+   * @param {Array} history — Conversation history to push to
+   * @param {object} [liveDataContext] — The live data provided to the model (for cross-reference)
+   * @returns {string} — The final response to send to the user
+   */
+  _finalizeResponse(cleaned, history, liveDataContext = {}) {
+    // Scan for hallucinations
+    const scan = detectHallucinations(cleaned, liveDataContext);
+    let final = cleaned;
+
+    if (scan.flagged) {
+      console.warn(`[AI] Hallucination detector flagged response (confidence: ${scan.confidence}%): ${scan.warnings.join('; ')}`);
+
+      // Only append warning to user-facing response if confidence is high enough
+      if (scan.confidence >= 50) {
+        const warning = buildHallucinationWarning(scan.warnings);
+        final = cleaned + warning;
+      }
+    }
+
+    history.push({ role: 'assistant', content: cleaned }); // Store clean version in history
+    return final.length > 1990 ? final.slice(0, 1990) + '...' : final;
   }
 
   /**
@@ -531,10 +557,17 @@ ${mood.buildMoodContext()}
   async complete(prompt) {
     const startTime = Date.now();
 
+    // Always include RAG enforcement for completions — prevents hallucination in
+    // autonomous posts, commentary, and other non-chat paths
+    const systemMsg = {
+      role: 'system',
+      content: `${ragEnforcementBlock()}\n\nYou are analyzing data provided in the user prompt. All prices, metrics, and market conditions in the prompt are current as of today (${todayString()}). Use ONLY the data given. Do NOT fill in gaps from training memory for any post-${MODEL_CUTOFF} facts.`,
+    };
+
     // Try Kimi agent mode first if enabled
     if (this.kimiEnabled) {
       try {
-        const result = await this._kimiAgentChat([{ role: 'user', content: prompt }]);
+        const result = await this._kimiAgentChat([systemMsg, { role: 'user', content: prompt }]);
         const durationMs = Date.now() - startTime;
         auditLog.logOllama('kimi-complete', prompt, result, durationMs);
         return result;
@@ -546,7 +579,7 @@ ${mood.buildMoodContext()}
     try {
       const stream = await this.ollama.chat({
         model: this.model,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [systemMsg, { role: 'user', content: prompt }],
         stream: true,
       });
 
