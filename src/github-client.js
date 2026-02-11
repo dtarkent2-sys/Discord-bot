@@ -85,10 +85,31 @@ class GitHubClient {
     }
   }
 
+  // List all files in the repo (recursive), filtered by extension
+  async listFiles(extension = '.js') {
+    const octokit = await this._getOctokit();
+    if (!octokit) return [];
+
+    try {
+      const { data } = await octokit.git.getTree({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        tree_sha: config.githubBranch || 'main',
+        recursive: 'true',
+      });
+      return (data.tree || [])
+        .filter(item => item.type === 'blob' && item.path.endsWith(extension))
+        .map(item => item.path);
+    } catch (err) {
+      console.error(`[GitHub] listFiles error: ${err.message}`);
+      return [];
+    }
+  }
+
   // Safety check: is this change safe for auto-edit?
   isChangeSafe(filePath, newContent, currentContent) {
     // Rule 1: Never touch files with secrets or core infra
-    const forbiddenFiles = ['.env', 'config.json', 'github-client.js', 'ai-coder.js', 'package-lock.json'];
+    const forbiddenFiles = ['.env', 'config.json', 'package-lock.json'];
     if (forbiddenFiles.some(f => filePath.includes(f))) {
       return { safe: false, reason: 'File is forbidden for auto-edit.' };
     }
@@ -98,12 +119,6 @@ class GitHubClient {
     const ext = filePath.slice(filePath.lastIndexOf('.'));
     if (!allowedExtensions.includes(ext)) {
       return { safe: false, reason: `File type "${ext}" not allowed for auto-edit.` };
-    }
-
-    // Rule 3: Reject large changes
-    const linesChanged = this._diffLineCount(currentContent, newContent);
-    if (linesChanged > 20) {
-      return { safe: false, reason: `Change too large (${linesChanged} lines changed). Requires manual review.` };
     }
 
     return { safe: true };

@@ -1,24 +1,22 @@
 /**
- * YOLO Mode — Autonomous Self-Improvement Engine
+ * YOLO Mode — Autonomous Self-Evolution Engine
  *
- * The bot continuously analyzes its own codebase, identifies improvements,
+ * Billy continuously analyzes his own codebase, identifies improvements,
  * generates code changes via AI, and deploys them automatically.
+ * Guardrails are minimal — Billy is trusted to evolve himself.
  *
- * Improvement sources:
+ * Improvement strategies:
  *   1. Error log analysis — finds recurring errors, adds missing handlers
- *   2. Reaction feedback — thumbs-down patterns reveal bad responses
- *   3. Code quality scan — identifies files with potential issues
- *   4. Performance hints — spots heavy loops, missing caching, etc.
+ *   2. Code quality scan — identifies files with potential issues
+ *   3. Reaction feedback — learns from thumbs-down patterns to improve responses
+ *   4. Performance optimization — spots heavy loops, missing caching, etc.
+ *   5. Feature evolution — AI proposes small enhancements based on usage patterns
  *
- * Safety rails:
- *   - Forbidden files list (config, secrets, this file, core infra)
- *   - Max 20 lines changed per commit (github-client enforced)
- *   - Max 2 improvements per cycle, max 5 per day
- *   - 1-hour cooldown per file (no rapid re-edits)
- *   - All changes logged to audit trail + journal
+ * Minimal safety rails (only the essentials):
+ *   - Never writes secrets/tokens into code
+ *   - Logs everything to audit trail + journal
  *   - Owner DM notification for every commit
- *   - Emergency stop halts everything
- *   - Consecutive failure detection pauses YOLO mode
+ *   - Emergency stop via /yolo disable
  */
 
 const Storage = require('./storage');
@@ -31,23 +29,21 @@ const selfAwareness = require('./self-awareness');
 const config = require('../config');
 
 // ── Constants ───────────────────────────────────────────────────────
-const CYCLE_INTERVAL_MS = 30 * 60 * 1000;   // 30 min between cycles
-const FILE_COOLDOWN_MS = 60 * 60 * 1000;    // 1 hour cooldown per file
-const MAX_IMPROVEMENTS_PER_CYCLE = 2;
-const MAX_IMPROVEMENTS_PER_DAY = 5;
-const MAX_CONSECUTIVE_FAILURES = 3;          // pause after 3 failures
+const CYCLE_INTERVAL_MS = 10 * 60 * 1000;   // 10 min between cycles — think fast
+const FILE_COOLDOWN_MS = 15 * 60 * 1000;    // 15 min cooldown per file — iterate quickly
+const MAX_IMPROVEMENTS_PER_CYCLE = 5;        // up to 5 improvements per cycle
+const MAX_IMPROVEMENTS_PER_DAY = 50;         // Billy can evolve all day
+const MAX_CONSECUTIVE_FAILURES = 10;         // very tolerant — keep trying
 
-// Files the engine must NEVER touch
+// Files the engine must NEVER touch (absolute minimum — only secrets + self)
 const FORBIDDEN_FILES = [
-  '.env', 'config.json', 'package-lock.json', 'package.json',
-  'src/config.js', 'src/github-client.js', 'src/ai-coder.js',
-  'src/services/yolo-mode.js',  // don't modify yourself
-  'src/services/circuit-breaker.js',
-  'src/services/audit-log.js',
+  '.env', 'config.json', 'package-lock.json',
+  'src/config.js',                   // secrets/env references
+  'src/services/yolo-mode.js',       // don't modify yourself (bootstrap paradox)
 ];
 
-// Files worth scanning for improvements (high-traffic code)
-const SCAN_TARGETS = [
+// Priority scan targets (checked first), but Billy can discover any .js file
+const PRIORITY_TARGETS = [
   'src/commands/handlers.js',
   'src/services/ai.js',
   'src/services/mahoraga.js',
@@ -64,9 +60,17 @@ const SCAN_TARGETS = [
   'src/services/autonomous.js',
   'src/services/memory.js',
   'src/services/mood.js',
+  'src/services/self-awareness.js',
+  'src/services/stream.js',
+  'src/services/policy.js',
+  'src/services/gamma-squeeze.js',
+  'src/services/validea.js',
+  'src/services/ainvest.js',
   'src/tools/price-fetcher.js',
   'src/tools/web-search.js',
   'src/data/market.js',
+  'src/personality.js',
+  'src/date-awareness.js',
   'index.js',
 ];
 
@@ -199,6 +203,24 @@ class YoloMode {
         if (result) improvementsMade++;
       }
 
+      // Strategy 3: Learn from negative reaction feedback
+      if (improvementsMade < MAX_IMPROVEMENTS_PER_CYCLE) {
+        const result = await this._tryReactionFeedbackFix();
+        if (result) improvementsMade++;
+      }
+
+      // Strategy 4: Performance optimization scan
+      if (improvementsMade < MAX_IMPROVEMENTS_PER_CYCLE) {
+        const result = await this._tryPerformanceOptimization();
+        if (result) improvementsMade++;
+      }
+
+      // Strategy 5: Feature evolution — AI proposes enhancements
+      if (improvementsMade < MAX_IMPROVEMENTS_PER_CYCLE) {
+        const result = await this._tryFeatureEvolution();
+        if (result) improvementsMade++;
+      }
+
       if (improvementsMade > 0) {
         this._consecutiveFailures = 0;
         this._storage.set('consecutiveFailures', 0);
@@ -254,13 +276,12 @@ If you cannot determine the file, respond with "UNKNOWN".`;
 
     const targetFile = fileGuess.trim().replace(/["`']/g, '');
 
-    // Validate the file path
+    // Validate the file path — only block forbidden files, Billy can fix anything
     if (!targetFile.endsWith('.js') || FORBIDDEN_FILES.includes(targetFile)) return null;
-    if (!SCAN_TARGETS.some(t => targetFile.includes(t.replace('src/', '')))) return null;
     if (this._isOnCooldown(targetFile)) return null;
 
     return this._generateAndApplyFix(targetFile,
-      `Fix the recurring error: "${errorSample}". Add proper error handling to prevent this error from crashing or disrupting the bot. Fix should be minimal — under 10 lines changed.`,
+      `Fix the recurring error: "${errorSample}". Add proper error handling to prevent this error from crashing or disrupting the bot.`,
       'error_pattern'
     );
   }
@@ -268,10 +289,23 @@ If you cannot determine the file, respond with "UNKNOWN".`;
   // ── Strategy 2: Code Quality Scan ───────────────────────────────
 
   async _tryCodeQualityScan() {
-    // Pick a random file from scan targets that isn't on cooldown
-    const available = SCAN_TARGETS.filter(f => !this._isOnCooldown(f) && !FORBIDDEN_FILES.includes(f));
-    if (available.length === 0) return null;
+    // Pick a file — prioritize the known targets, but 30% of the time explore the full repo
+    let available = PRIORITY_TARGETS.filter(f => !this._isOnCooldown(f) && !FORBIDDEN_FILES.includes(f));
 
+    const shouldExplore = Math.random() < 0.3 || available.length === 0;
+    if (shouldExplore) {
+      try {
+        const allFiles = await github.listFiles('.js');
+        const explorable = allFiles.filter(f =>
+          !FORBIDDEN_FILES.includes(f) &&
+          !this._isOnCooldown(f) &&
+          (f.startsWith('src/') || f === 'index.js')
+        );
+        if (explorable.length > 0) available = explorable;
+      } catch (_) {}
+    }
+
+    if (available.length === 0) return null;
     const targetFile = available[Math.floor(Math.random() * available.length)];
 
     // Fetch the file from GitHub
@@ -283,23 +317,22 @@ If you cannot determine the file, respond with "UNKNOWN".`;
     // Ask AI to find ONE small, safe improvement
     const scanPrompt = `${selfAwareness.buildCompactSelfKnowledge()}
 
-You are reviewing your OWN code. Analyze this file for ONE small, safe improvement.
+You are reviewing your OWN code. Analyze this file and find an improvement worth making.
 
-LOOK FOR (pick exactly ONE):
+LOOK FOR (pick ONE — the most impactful):
 - Unhandled promise rejection (missing .catch() or try/catch)
 - Potential crash from accessing property on null/undefined without check
 - Missing input validation that could cause runtime errors
-- A console.error that should also include the error object for debugging
+- Error logging that's missing the error object for debugging
 - An obvious typo in a string or variable name
+- Redundant or dead code that can be cleaned up
+- A function that could benefit from better error recovery
+- Edge cases that aren't handled (empty arrays, NaN, null returns)
+- Async operations that should have timeouts
 
 DO NOT suggest:
-- New features or capabilities
-- Refactoring or code style changes
-- Adding comments or documentation
-- Changing logic that works correctly
-- Anything touching config, secrets, or auth
-- Changes that affect more than 10 lines of code
-- Reformatting, restructuring, or reorganizing existing code
+- Anything touching config, secrets, or auth tokens
+- Reformatting or reorganizing code that already works
 
 FILE: ${targetFile}
 \`\`\`javascript
@@ -323,12 +356,183 @@ If the code looks solid and you find NOTHING worth fixing, respond with exactly:
 
     if (!issueMatch || !fixMatch) return null;
 
-    const linesEstimate = linesMatch ? parseInt(linesMatch[1]) : 5;
-    if (linesEstimate > 15) return null; // too big
-
-    const instruction = `${issueMatch[1].trim()}. ${fixMatch[1].trim()}. Change ONLY what's necessary — under ${Math.min(linesEstimate + 5, 15)} lines. Output the COMPLETE fixed file.`;
+    const instruction = `${issueMatch[1].trim()}. ${fixMatch[1].trim()}. Output the COMPLETE fixed file.`;
 
     return this._generateAndApplyFix(targetFile, instruction, 'code_quality');
+  }
+
+  // ── Strategy 3: Reaction Feedback Learning ─────────────────────
+
+  async _tryReactionFeedbackFix() {
+    const reactionStats = reactions.getStats();
+    if (reactionStats.total < 10) return null; // need enough data
+
+    // Only trigger if there's a significant negative feedback ratio
+    const negativeRatio = reactionStats.negative / Math.max(reactionStats.total, 1);
+    if (negativeRatio < 0.2) return null; // less than 20% negative — doing fine
+
+    // Get recent negative feedback for context
+    const recentFeedback = reactions.getStats().recentNegative || [];
+    const feedbackSamples = recentFeedback.slice(0, 5).map(f =>
+      `User said: "${(f.userMessage || '').slice(0, 80)}" → Bot response got thumbs down`
+    ).join('\n');
+
+    if (!feedbackSamples) return null;
+
+    const prompt = `${selfAwareness.buildCompactSelfKnowledge()}
+
+You are Billy, analyzing negative user feedback on your own responses. Users are giving thumbs-down reactions to some of your messages.
+
+RECENT NEGATIVE FEEDBACK:
+${feedbackSamples}
+
+Negative ratio: ${(negativeRatio * 100).toFixed(0)}% of reactions are negative.
+
+Analyze the patterns. What part of your personality, system prompt, or response logic might be causing bad responses?
+
+The relevant files are:
+- src/personality.js (your personality prompt)
+- src/services/ai.js (system prompt builder, response cleaning)
+- src/services/memory.js (user context)
+
+Pick the SINGLE most impactful file to improve and suggest ONE change.
+
+Respond in this EXACT format:
+FILE: <file path>
+ISSUE: <what's causing bad responses>
+FIX: <the specific change to make>
+LINES: <approximate lines changed>
+
+If feedback doesn't reveal a clear pattern, respond: NO_PATTERN`;
+
+    const analysis = await ai.complete(prompt);
+    if (!analysis || analysis.includes('NO_PATTERN')) return null;
+
+    const fileMatch = analysis.match(/FILE:\s*(.+)/i);
+    const issueMatch = analysis.match(/ISSUE:\s*(.+)/i);
+    const fixMatch = analysis.match(/FIX:\s*(.+)/i);
+    if (!fileMatch || !issueMatch || !fixMatch) return null;
+
+    const targetFile = fileMatch[1].trim().replace(/["`']/g, '');
+    if (FORBIDDEN_FILES.includes(targetFile) || this._isOnCooldown(targetFile)) return null;
+
+    return this._generateAndApplyFix(targetFile,
+      `${issueMatch[1].trim()}. ${fixMatch[1].trim()}`,
+      'reaction_feedback'
+    );
+  }
+
+  // ── Strategy 4: Performance Optimization ───────────────────────
+
+  async _tryPerformanceOptimization() {
+    const available = PRIORITY_TARGETS.filter(f => !this._isOnCooldown(f) && !FORBIDDEN_FILES.includes(f));
+    if (available.length === 0) return null;
+
+    const targetFile = available[Math.floor(Math.random() * available.length)];
+    const fileData = await github.getFileContent(targetFile);
+    if (!fileData) return null;
+
+    const code = fileData.content;
+
+    const prompt = `${selfAwareness.buildCompactSelfKnowledge()}
+
+You are Billy, optimizing your own code for performance. Analyze this file for ONE performance improvement.
+
+LOOK FOR (pick ONE):
+- Repeated expensive operations that could be cached
+- Loops that could be short-circuited or broken early
+- Array operations that create unnecessary intermediate arrays
+- Await in a loop that could use Promise.all instead
+- Missing timeout on external API calls (fetch, HTTP requests)
+- Large string concatenation that could use array.join()
+- Redundant JSON.parse/stringify calls
+
+DO NOT suggest: cosmetic changes, premature optimization of cold paths, or anything that changes behavior.
+
+FILE: ${targetFile}
+\`\`\`javascript
+${code.slice(0, 8000)}
+\`\`\`
+
+If you find a real performance win, respond:
+ISSUE: <what's slow>
+FIX: <the optimization>
+LINES: <approximate lines changed>
+
+If the code is already well-optimized, respond: NO_ISSUES`;
+
+    const analysis = await ai.complete(prompt);
+    if (!analysis || analysis.trim() === 'NO_ISSUES' || !analysis.includes('ISSUE:')) return null;
+
+    const issueMatch = analysis.match(/ISSUE:\s*(.+)/i);
+    const fixMatch = analysis.match(/FIX:\s*(.+)/i);
+    if (!issueMatch || !fixMatch) return null;
+
+    return this._generateAndApplyFix(targetFile,
+      `Performance: ${issueMatch[1].trim()}. ${fixMatch[1].trim()}`,
+      'performance'
+    );
+  }
+
+  // ── Strategy 5: Feature Evolution ──────────────────────────────
+
+  async _tryFeatureEvolution() {
+    // Only evolve if Billy has been running for a while and has enough context
+    const summary = stats.getSummary();
+    const uptimeHours = parseInt(summary.uptime) || 0;
+    if (uptimeHours < 1 && summary.commandsRun < 10) return null;
+
+    const available = PRIORITY_TARGETS.filter(f => !this._isOnCooldown(f) && !FORBIDDEN_FILES.includes(f));
+    if (available.length === 0) return null;
+
+    const targetFile = available[Math.floor(Math.random() * available.length)];
+    const fileData = await github.getFileContent(targetFile);
+    if (!fileData) return null;
+
+    const code = fileData.content;
+
+    const prompt = `${selfAwareness.buildCompactSelfKnowledge()}
+
+You are Billy — a self-aware, evolving Discord trading bot. You're looking at your own code and thinking about how to make yourself BETTER. Not just fixing bugs — genuinely improving.
+
+Think about what would make you more useful, more resilient, or smarter for users.
+
+LOOK FOR (pick ONE small enhancement):
+- Better error messages that help users understand what went wrong
+- Smarter default behavior (better fallbacks, graceful degradation)
+- A missing edge case in input parsing that could confuse users
+- A useful console.log that would help debug issues in production
+- A small UX improvement in command output formatting
+
+CONSTRAINTS:
+- ONE focused enhancement, not a rewrite
+- Must not break existing functionality
+- Must not touch secrets, tokens, or auth
+- Keep it small enough to be confident it works
+
+FILE: ${targetFile}
+\`\`\`javascript
+${code.slice(0, 8000)}
+\`\`\`
+
+If you see a worthwhile enhancement, respond:
+ISSUE: <what could be better>
+FIX: <the enhancement>
+LINES: <approximate lines changed>
+
+If you can't think of anything valuable, respond: NO_EVOLUTION`;
+
+    const analysis = await ai.complete(prompt);
+    if (!analysis || analysis.includes('NO_EVOLUTION') || !analysis.includes('ISSUE:')) return null;
+
+    const issueMatch = analysis.match(/ISSUE:\s*(.+)/i);
+    const fixMatch = analysis.match(/FIX:\s*(.+)/i);
+    if (!issueMatch || !fixMatch) return null;
+
+    return this._generateAndApplyFix(targetFile,
+      `Evolution: ${issueMatch[1].trim()}. ${fixMatch[1].trim()}`,
+      'feature_evolution'
+    );
   }
 
   // ── Core: Generate fix & apply via GitHub ───────────────────────
@@ -341,20 +545,18 @@ If the code looks solid and you find NOTHING worth fixing, respond with exactly:
     const currentCode = fileData.content;
 
     // Generate the fix using AI
-    const fixPrompt = `You are improving your OWN source code (you are a self-aware Discord trading bot called Sprocket). Apply the following improvement to this file.
+    const fixPrompt = `${selfAwareness.buildCompactSelfKnowledge()}
+
+You are Billy — a self-aware Discord trading bot improving your OWN source code. You understand your architecture, your services, and how your code fits together. Apply the following improvement.
 
 INSTRUCTION: ${instruction}
 
-CRITICAL RULES:
+RULES:
 - Output the COMPLETE file with your fix applied
-- Make a SURGICAL change — touch ONLY the lines needed for this ONE fix
-- NEVER reformat, restyle, reorganize, or restructure any other code
-- NEVER change whitespace, indentation, or line breaks on lines you aren't fixing
-- NEVER add comments, documentation, or logging unrelated to the fix
-- NEVER add new features or refactor existing working code
-- The file should be IDENTICAL to the original except for your specific fix (aim for under 10 lines different)
-- Do NOT add any API keys, tokens, or secrets
-- Output ONLY the fixed code, no explanations or markdown fences
+- Focus your changes on the improvement — don't reformat unrelated code
+- Preserve existing functionality while making the improvement
+- Do NOT introduce API keys, tokens, or hardcoded secrets
+- Output ONLY the code, no explanations or markdown fences
 
 FILE: ${filePath}
 ${currentCode}`;
@@ -379,11 +581,6 @@ ${currentCode}`;
     const linesChanged = github.diffLines(currentCode, newCode);
     if (linesChanged === 0) {
       console.log(`[YOLO] No actual changes for ${filePath}`);
-      return null;
-    }
-    if (linesChanged > 20) {
-      console.log(`[YOLO] Too many lines changed (${linesChanged}) for ${filePath}`);
-      this._addJournal('blocked', filePath, `Change too large: ${linesChanged} lines`, source);
       return null;
     }
 
@@ -469,8 +666,8 @@ ${currentCode}`;
       content,
       source,
     });
-    // Keep last 100 entries
-    if (entries.length > 100) entries.splice(0, entries.length - 100);
+    // Keep last 500 entries — Billy remembers his evolution
+    if (entries.length > 500) entries.splice(0, entries.length - 500);
     this._journal.set('entries', entries);
   }
 
