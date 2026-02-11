@@ -14,7 +14,7 @@ const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
 const stream = require('../services/stream');
 const kalshi = require('../services/kalshi');
-const uw = require('../services/unusual-whales');
+const ainvest = require('../services/ainvest');
 const reddit = require('../services/reddit');
 const validea = require('../services/validea');
 const macro = require('../services/macro');
@@ -92,8 +92,6 @@ async function handleCommand(interaction) {
       return handleBets(interaction);
     case 'flow':
       return handleFlow(interaction);
-    case 'darkpool':
-      return handleDarkPool(interaction);
     case 'whales':
       return handleWhales(interaction);
     default:
@@ -338,10 +336,9 @@ async function handleHelp(interaction) {
     '`/odds <ticker>` — Deep dive on a market with AI probability analysis',
     '`/bets [category]` — Browse trending/categorized prediction markets',
     '',
-    '**Unusual Whales**',
-    '`/flow [ticker]` — Unusual options flow (sweeps, big premium, smart money)',
-    '`/darkpool <ticker>` — Dark pool / off-exchange prints',
-    '`/whales <ticker>` — Full whale dashboard (flow + dark pool + shorts + insider)',
+    '**Market Intelligence (AInvest)**',
+    '`/flow <ticker>` — Smart money flow (insider + congress trades)',
+    '`/whales <ticker>` — Full intelligence dashboard (analysts + fundamentals + insider + congress)',
     '',
     '**SHARK Agent**',
     '`/agent status` — Positions, risk, P/L',
@@ -709,49 +706,8 @@ async function handleGEX(interaction) {
       await interaction.editReply(summary + '\n\n_Chart unavailable — canvas module not loaded._');
     }
 
-    // Enrich with Unusual Whales spot exposures + max pain if available
-    if (uw.enabled) {
-      try {
-        const [spotData, maxPainData, netPremData] = await Promise.allSettled([
-          uw.getSpotExposures(ticker),
-          uw.getMaxPain(ticker),
-          uw.getNetPremTicks(ticker),
-        ]);
-
-        const uwLines = [`**Unusual Whales — ${ticker} Options Intelligence**`];
-        let hasData = false;
-
-        if (maxPainData.status === 'fulfilled' && maxPainData.value) {
-          const mp = maxPainData.value?.data || maxPainData.value;
-          const pain = Array.isArray(mp) ? mp[0]?.max_pain || mp[0]?.price : mp.max_pain || mp.price;
-          if (pain != null) {
-            uwLines.push(`**Max Pain:** \`$${pain}\``);
-            hasData = true;
-          }
-        }
-
-        if (netPremData.status === 'fulfilled' && netPremData.value) {
-          const ticks = netPremData.value?.data || netPremData.value;
-          if (Array.isArray(ticks) && ticks.length > 0) {
-            const latest = ticks[ticks.length - 1];
-            const callPrem = Number(latest.net_call_premium || 0);
-            const putPrem = Number(latest.net_put_premium || 0);
-            const net = callPrem - putPrem;
-            const bias = net > 0 ? '🟢 CALL-DOMINANT' : '🔴 PUT-DOMINANT';
-            uwLines.push(`**Net Premium:** ${bias} (\`$${(Math.abs(net) / 1e6).toFixed(2)}M\` net)`);
-            hasData = true;
-          }
-        }
-
-        if (hasData) {
-          uwLines.push(`_Unusual Whales data_`);
-          await interaction.followUp({ content: uwLines.join('\n'), flags: MessageFlags.Ephemeral });
-        }
-      } catch (uwErr) {
-        // Non-critical — just skip UW enrichment
-        console.warn(`[GEX] UW enrichment failed for ${ticker}:`, uwErr.message);
-      }
-    }
+    // Unusual Whales enrichment — service not yet implemented
+    // TODO: add uw (unusual-whales) service and re-enable
   } catch (err) {
     console.error(`[GEX] Error for ${ticker}:`, err);
     const msg = err.message || 'Unknown error';
@@ -990,59 +946,8 @@ async function handleMacro(interaction) {
       await interaction.editReply(formatted.slice(0, 1990) + '...');
     }
 
-    // Enrich with Unusual Whales market tide + SPIKE if available
-    if (uw.enabled) {
-      try {
-        const [tideData, spikeData, totalVolData] = await Promise.allSettled([
-          uw.getMarketTide(),
-          uw.getSpike(),
-          uw.getTotalOptionsVolume(),
-        ]);
-
-        const uwLines = ['**Unusual Whales — Options Market Sentiment**'];
-        let hasData = false;
-
-        if (tideData.status === 'fulfilled' && tideData.value) {
-          const tideText = uw.formatMarketTideForDiscord(tideData.value);
-          if (tideText) {
-            uwLines.push(tideText);
-            hasData = true;
-          }
-        }
-
-        if (spikeData.status === 'fulfilled' && spikeData.value) {
-          const spike = spikeData.value?.data || spikeData.value;
-          if (spike) {
-            const val = Array.isArray(spike) ? spike[spike.length - 1] : spike;
-            if (val && (val.spike != null || val.value != null)) {
-              uwLines.push(`**SPIKE (Volatility):** \`${val.spike ?? val.value}\``);
-              hasData = true;
-            }
-          }
-        }
-
-        if (totalVolData.status === 'fulfilled' && totalVolData.value) {
-          const vol = totalVolData.value?.data || totalVolData.value;
-          if (vol) {
-            const latest = Array.isArray(vol) ? vol[vol.length - 1] : vol;
-            if (latest && (latest.total_volume != null || latest.call_volume != null)) {
-              const callVol = latest.call_volume || 0;
-              const putVol = latest.put_volume || 0;
-              const ratio = putVol > 0 ? (callVol / putVol).toFixed(2) : 'N/A';
-              uwLines.push(`**Options Volume:** Calls \`${Number(callVol).toLocaleString()}\` / Puts \`${Number(putVol).toLocaleString()}\` (C/P ratio: \`${ratio}\`)`);
-              hasData = true;
-            }
-          }
-        }
-
-        if (hasData) {
-          uwLines.push('_Unusual Whales data_');
-          await interaction.followUp({ content: uwLines.join('\n'), flags: MessageFlags.Ephemeral });
-        }
-      } catch (uwErr) {
-        console.warn('[Macro] UW enrichment failed:', uwErr.message);
-      }
-    }
+    // Unusual Whales enrichment — service not yet implemented
+    // TODO: add uw (unusual-whales) service and re-enable
   } catch (err) {
     console.error('[Macro] Error:', err);
     await interaction.editReply(`**Macro Environment**\n❌ ${err.message}`);
@@ -1239,143 +1144,105 @@ async function handleAgent(interaction) {
   }
 }
 
-// ── /flow — Unusual options flow (Unusual Whales) ────────────────────
+// ── /flow — Smart money flow: insider + congress trades (AInvest) ────
 async function handleFlow(interaction) {
-  await interaction.deferReply();
-
-  const ticker = interaction.options.getString('ticker');
-  const filter = interaction.options.getString('filter') || 'all';
-
-  try {
-    if (!uw.enabled) {
-      await interaction.editReply('**Options Flow** requires an Unusual Whales API key. Set `UNUSUAL_WHALES_API_KEY` in your .env file.');
-      return;
-    }
-
-    const label = ticker ? ticker.toUpperCase() : 'Market';
-    await interaction.editReply(`**Options Flow — ${label}**\n⏳ Fetching unusual activity from Unusual Whales...`);
-
-    const params = {};
-    if (ticker) params.ticker = ticker;
-    if (filter === 'calls') params.isCall = true;
-    if (filter === 'puts') params.isPut = true;
-    if (filter === 'sweeps') params.isSweep = true;
-
-    let data;
-    if (ticker) {
-      data = await uw.getTickerFlow(ticker);
-    } else {
-      data = await uw.getFlowAlerts(params);
-    }
-
-    const formatted = uw.formatFlowForDiscord(data, ticker);
-    await interaction.editReply(formatted);
-  } catch (err) {
-    console.error('[Flow] Error:', err);
-    await interaction.editReply(`**Options Flow**\n❌ ${err.message}`);
-  }
-}
-
-// ── /darkpool — Dark pool prints (Unusual Whales) ────────────────────
-async function handleDarkPool(interaction) {
   await interaction.deferReply();
 
   const ticker = interaction.options.getString('ticker').toUpperCase();
 
   try {
-    if (!uw.enabled) {
-      await interaction.editReply('**Dark Pool** requires an Unusual Whales API key. Set `UNUSUAL_WHALES_API_KEY` in your .env file.');
+    if (!ainvest.enabled) {
+      await interaction.editReply('**Smart Money Flow** requires an AInvest API key. Set `AINVEST_API_KEY` in your environment.');
       return;
     }
 
-    await interaction.editReply(`**Dark Pool — ${ticker}**\n⏳ Fetching off-exchange prints...`);
+    await interaction.editReply(`**Smart Money Flow — ${ticker}**\n⏳ Fetching insider and congress trades...`);
 
-    const data = await uw.getDarkPool(ticker, { limit: 50 });
-    const formatted = uw.formatDarkPoolForDiscord(data, ticker);
+    const [insiderResult, congressResult] = await Promise.allSettled([
+      ainvest.getInsiderTrades(ticker),
+      ainvest.getCongressTrades(ticker),
+    ]);
+
+    const formatted = ainvest.formatFlowForDiscord({
+      insider: insiderResult.status === 'fulfilled' ? insiderResult.value : [],
+      congress: congressResult.status === 'fulfilled' ? congressResult.value : [],
+    }, ticker);
+
     await interaction.editReply(formatted);
   } catch (err) {
-    console.error(`[DarkPool] Error for ${ticker}:`, err);
-    await interaction.editReply(`**Dark Pool — ${ticker}**\n❌ ${err.message}`);
+    console.error(`[Flow] Error for ${ticker}:`, err);
+    await interaction.editReply(`**Smart Money Flow — ${ticker}**\n❌ ${err.message}`);
   }
 }
 
-// ── /whales — Combined whale activity dashboard (Unusual Whales) ─────
+// ── /whales — Market intelligence dashboard (AInvest) ────────────────
 async function handleWhales(interaction) {
   await interaction.deferReply();
 
   const ticker = interaction.options.getString('ticker').toUpperCase();
 
   try {
-    if (!uw.enabled) {
-      await interaction.editReply('**Whale Dashboard** requires an Unusual Whales API key. Set `UNUSUAL_WHALES_API_KEY` in your .env file.');
+    if (!ainvest.enabled) {
+      await interaction.editReply('**Market Intelligence** requires an AInvest API key. Set `AINVEST_API_KEY` in your environment.');
       return;
     }
 
-    await interaction.editReply(`**Whale Activity — ${ticker}**\n⏳ Gathering flow, dark pool, short interest, and insider data...`);
+    await interaction.editReply(`**Market Intelligence — ${ticker}**\n⏳ Gathering analyst ratings, fundamentals, insider, and congress data...`);
 
-    // Fetch all data in parallel
-    const [flow, darkPool, shortData, insider] = await Promise.allSettled([
-      uw.getTickerFlow(ticker),
-      uw.getDarkPool(ticker, { limit: 30 }),
-      uw.getShortData(ticker),
-      uw.getInsiderTrades(ticker),
+    const [analysts, financials, earnings, insider, congress, news] = await Promise.allSettled([
+      ainvest.getAnalystConsensus(ticker),
+      ainvest.getFinancials(ticker),
+      ainvest.getEarnings(ticker, 2),
+      ainvest.getInsiderTrades(ticker),
+      ainvest.getCongressTrades(ticker),
+      ainvest.getNews({ tickers: [ticker], limit: 3 }),
     ]);
 
-    const formatted = uw.formatWhalesDashboard(ticker, {
-      flow: flow.status === 'fulfilled' ? flow.value : null,
-      darkPool: darkPool.status === 'fulfilled' ? darkPool.value : null,
-      shortData: shortData.status === 'fulfilled' ? shortData.value : null,
+    const formatted = ainvest.formatIntelDashboard(ticker, {
+      analysts: analysts.status === 'fulfilled' ? analysts.value : null,
+      financials: financials.status === 'fulfilled' ? financials.value : null,
+      earnings: earnings.status === 'fulfilled' ? earnings.value : null,
       insider: insider.status === 'fulfilled' ? insider.value : null,
+      congress: congress.status === 'fulfilled' ? congress.value : null,
+      news: news.status === 'fulfilled' ? news.value : null,
     });
 
     await interaction.editReply(formatted);
   } catch (err) {
     console.error(`[Whales] Error for ${ticker}:`, err);
-    await interaction.editReply(`**Whale Activity — ${ticker}**\n❌ ${err.message}`);
+    await interaction.editReply(`**Market Intelligence — ${ticker}**\n❌ ${err.message}`);
   }
 }
 
-// ── /predict — Search Kalshi prediction markets + AI betting recs ────
+// ── /predict — Search Kalshi prediction markets + AI high-conviction play ─
 async function handlePredict(interaction) {
   await interaction.deferReply();
 
   const topic = interaction.options.getString('topic');
 
   try {
-    await interaction.editReply(`**Prediction Markets — "${topic}"**\n⏳ Searching Kalshi markets...`);
+    await interaction.editReply(`**Prediction Markets — "${topic}"**\n⏳ Searching Kalshi markets & finding the best play...`);
 
-    const markets = await kalshi.searchMarkets(topic, 8);
+    // Fetch more markets than we display so grouping works well
+    const markets = await kalshi.searchMarkets(topic, 30);
 
     if (!markets || markets.length === 0) {
       await interaction.editReply(`**Prediction Markets — "${topic}"**\nNo open markets found for "${topic}". Try broader terms like "inflation", "bitcoin", "election", "recession".`);
       return;
     }
 
-    // Show the markets immediately
+    // Show grouped markets (deduplicated by event) and kick off AI simultaneously
     const formatted = kalshi.formatMarketsForDiscord(markets, `Prediction Markets — "${topic}"`);
+    const aiPromise = kalshi.analyzeBets(markets, topic);
+
     await interaction.editReply(formatted);
 
-    // Run AI analysis in the background and post as follow-up
-    await interaction.followUp({ content: `⏳ AI is analyzing ${markets.length} markets for betting edge...`, flags: MessageFlags.Ephemeral });
-
-    const aiAnalysis = await kalshi.analyzeBets(markets, topic);
+    // AI picks the best play
+    const aiAnalysis = await aiPromise;
 
     if (aiAnalysis) {
-      // Chunk if needed
-      if (aiAnalysis.length <= 1900) {
-        await interaction.followUp(`**AI Betting Analysis — "${topic}"**\n\n${aiAnalysis}`);
-      } else {
-        const chunks = [];
-        let remaining = aiAnalysis;
-        while (remaining.length > 0) {
-          chunks.push(remaining.slice(0, 1850));
-          remaining = remaining.slice(1850);
-        }
-        await interaction.followUp(`**AI Betting Analysis — "${topic}"**\n\n${chunks[0]}${chunks.length > 1 ? '...' : ''}`);
-        for (let i = 1; i < Math.min(chunks.length, 3); i++) {
-          await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
-        }
-      }
+      const output = aiAnalysis.length <= 1900 ? aiAnalysis : aiAnalysis.slice(0, 1900) + '...';
+      await interaction.followUp(`${output}`);
     }
   } catch (err) {
     console.error('[Predict] Error:', err);
@@ -1430,25 +1297,11 @@ async function handleOdds(interaction) {
     await interaction.editReply(formatted);
 
     // Run AI deep analysis
-    await interaction.followUp({ content: `⏳ AI is running deep probability analysis on **${market.title || ticker}**...`, flags: MessageFlags.Ephemeral });
-
     const aiAnalysis = await kalshi.analyzeMarket(market, trades);
 
     if (aiAnalysis) {
-      if (aiAnalysis.length <= 1900) {
-        await interaction.followUp(`**AI Analysis — ${market.title || ticker}**\n\n${aiAnalysis}`);
-      } else {
-        const chunks = [];
-        let remaining = aiAnalysis;
-        while (remaining.length > 0) {
-          chunks.push(remaining.slice(0, 1850));
-          remaining = remaining.slice(1850);
-        }
-        await interaction.followUp(`**AI Analysis — ${market.title || ticker}**\n\n${chunks[0]}${chunks.length > 1 ? '...' : ''}`);
-        for (let i = 1; i < Math.min(chunks.length, 3); i++) {
-          await interaction.followUp({ content: chunks[i], flags: MessageFlags.Ephemeral });
-        }
-      }
+      const output = aiAnalysis.length <= 1900 ? aiAnalysis : aiAnalysis.slice(0, 1900) + '...';
+      await interaction.followUp(`${output}`);
     }
   } catch (err) {
     console.error(`[Odds] Error for ${ticker}:`, err);
@@ -1456,7 +1309,7 @@ async function handleOdds(interaction) {
   }
 }
 
-// ── /bets — Browse trending/categorized Kalshi markets ───────────────
+// ── /bets — Browse trending/categorized Kalshi markets + best play ────
 async function handleBets(interaction) {
   await interaction.deferReply();
 
@@ -1466,23 +1319,25 @@ async function handleBets(interaction) {
     let markets;
     let title;
 
+    const labels = {
+      trending: 'Trending',
+      economics: 'Economics',
+      crypto: 'Crypto',
+      politics: 'Politics',
+      tech: 'Tech',
+      markets: 'Markets & Indices',
+      sports: 'Sports',
+    };
+    const label = labels[category] || category;
+
+    await interaction.editReply(`**Kalshi — ${label}**\n⏳ Finding the best plays...`);
+
     if (category === 'trending') {
-      await interaction.editReply('**Kalshi — Trending Bets**\n⏳ Fetching hottest prediction markets...');
-      markets = await kalshi.getTrendingMarkets(12);
-      title = 'Kalshi — Trending Prediction Markets';
+      markets = await kalshi.getTrendingMarkets(30);
+      title = `Kalshi — Trending Bets`;
     } else {
-      const labels = {
-        economics: 'Economics',
-        crypto: 'Crypto',
-        politics: 'Politics',
-        tech: 'Tech',
-        markets: 'Markets & Indices',
-        sports: 'Sports',
-      };
-      const label = labels[category] || category;
-      await interaction.editReply(`**Kalshi — ${label} Markets**\n⏳ Searching...`);
-      markets = await kalshi.getMarketsByCategory(category, 12);
-      title = `Kalshi — ${label} Prediction Markets`;
+      markets = await kalshi.getMarketsByCategory(category, 30);
+      title = `Kalshi — ${label} Bets`;
     }
 
     if (!markets || markets.length === 0) {
@@ -1490,17 +1345,17 @@ async function handleBets(interaction) {
       return;
     }
 
+    // Show grouped markets and kick off AI simultaneously
     const formatted = kalshi.formatMarketsForDiscord(markets, title);
+    const aiPromise = kalshi.analyzeBets(markets, category);
+
     await interaction.editReply(formatted);
 
-    // Quick AI take on the category
-    const aiTake = await kalshi.analyzeBets(markets.slice(0, 6), category);
+    // AI picks the best play from the category
+    const aiTake = await aiPromise;
     if (aiTake) {
-      if (aiTake.length <= 1900) {
-        await interaction.followUp(`**AI Quick Picks — ${category}**\n\n${aiTake}`);
-      } else {
-        await interaction.followUp(`**AI Quick Picks — ${category}**\n\n${aiTake.slice(0, 1900)}...`);
-      }
+      const output = aiTake.length <= 1900 ? aiTake : aiTake.slice(0, 1900) + '...';
+      await interaction.followUp(`${output}`);
     }
   } catch (err) {
     console.error(`[Bets] Error for ${category}:`, err);

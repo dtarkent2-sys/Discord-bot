@@ -625,6 +625,249 @@ class AInvestService {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  //  DISCORD FORMATTERS
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Format insider + congress trades for Discord (/flow command).
+   */
+  formatFlowForDiscord({ insider = [], congress = [] }, ticker) {
+    const upper = ticker ? ticker.toUpperCase() : 'Market';
+    const lines = [`**Smart Money Flow — ${upper}**`, ''];
+
+    // Insider trades
+    if (insider.length > 0) {
+      lines.push('**Insider Trades:**');
+      for (const t of insider.slice(0, 8)) {
+        const name = t.name || t.insider_name || t.full_name || 'Unknown';
+        const title = t.title || t.position || '';
+        const type = (t.trade_type || t.transaction_type || t.type || '').toUpperCase();
+        const isBuy = /buy|purchase|acquisition/i.test(type) || t.acquisition_or_disposition === 'A';
+        const emoji = isBuy ? '🟢' : '🔴';
+        const shares = t.shares || t.quantity || t.number_of_shares || '?';
+        const price = t.price || t.price_per_share ? `@ $${Number(t.price || t.price_per_share).toFixed(2)}` : '';
+        const value = t.value || t.total_value;
+        const valStr = value ? ` ($${Number(value).toLocaleString()})` : '';
+        const date = t.date || t.filing_date || t.transaction_date || '';
+
+        lines.push(`${emoji} **${name}**${title ? ` (${title})` : ''}`);
+        lines.push(`   ${isBuy ? 'BUY' : 'SELL'} \`${Number(shares).toLocaleString()}\` shares ${price}${valStr} — ${date}`);
+        lines.push('');
+      }
+      if (insider.length > 8) lines.push(`_...and ${insider.length - 8} more insider trades_\n`);
+    } else {
+      lines.push('**Insider Trades:** No recent activity\n');
+    }
+
+    // Congress trades
+    if (congress.length > 0) {
+      lines.push('**Congress Trades:**');
+      for (const t of congress.slice(0, 6)) {
+        const name = t.name || t.politician || t.congress_member || 'Unknown';
+        const party = t.party || '';
+        const type = (t.trade_type || t.transaction_type || t.type || '').toUpperCase();
+        const isBuy = /buy|purchase/i.test(type);
+        const emoji = isBuy ? '🟢' : '🔴';
+        const amount = t.amount || t.dollar_amount || t.value || '';
+        const date = t.date || t.transaction_date || t.disclosure_date || '';
+
+        lines.push(`${emoji} **${name}**${party ? ` (${party})` : ''}`);
+        lines.push(`   ${isBuy ? 'BUY' : 'SELL'} ${amount ? `\`${amount}\`` : ''} — ${date}`);
+        lines.push('');
+      }
+      if (congress.length > 6) lines.push(`_...and ${congress.length - 6} more congress trades_\n`);
+    } else {
+      lines.push('**Congress Trades:** No recent activity\n');
+    }
+
+    lines.push(`_Data via AInvest | ${new Date().toLocaleString()}_`);
+
+    let output = lines.join('\n');
+    if (output.length > 1950) output = output.slice(0, 1950) + '\n...';
+    return output;
+  }
+
+  /**
+   * Format the /whales intelligence dashboard for Discord.
+   */
+  formatIntelDashboard(ticker, { analysts, financials, earnings, insider, congress, news } = {}) {
+    const upper = ticker.toUpperCase();
+    const lines = [`**Market Intelligence — ${upper}**`, ''];
+
+    // Analyst ratings
+    if (analysts) {
+      const total = analysts.totalAnalysts || 0;
+      const buys = (analysts.strongBuy || 0) + (analysts.buy || 0);
+      const holds = analysts.hold || 0;
+      const sells = (analysts.sell || 0) + (analysts.strongSell || 0);
+      const bias = buys > sells * 2 ? '🟢 STRONG BUY' : buys > sells ? '🟢 BUY' : sells > buys ? '🔴 SELL' : '🟡 HOLD';
+
+      lines.push(`**Analyst Consensus (${total} analysts):** ${bias}`);
+      lines.push(`  Buy: \`${buys}\` | Hold: \`${holds}\` | Sell: \`${sells}\``);
+      if (analysts.targetAvg) {
+        lines.push(`  Target: \`$${analysts.targetLow}\` – \`$${analysts.targetHigh}\` (avg \`$${analysts.targetAvg}\`)`);
+      }
+      lines.push('');
+    }
+
+    // Financials
+    if (financials) {
+      const parts = [];
+      if (financials.peTTM != null) parts.push(`P/E: \`${financials.peTTM.toFixed(1)}\``);
+      if (financials.epsTTM != null) parts.push(`EPS: \`$${financials.epsTTM.toFixed(2)}\``);
+      if (financials.roeTTM != null) parts.push(`ROE: \`${(financials.roeTTM * 100).toFixed(1)}%\``);
+      if (financials.netMargin != null) parts.push(`Net Margin: \`${(financials.netMargin * 100).toFixed(1)}%\``);
+      if (financials.marketCap != null) parts.push(`Mkt Cap: \`$${(financials.marketCap / 1e9).toFixed(1)}B\``);
+      if (parts.length > 0) {
+        lines.push(`**Fundamentals:** ${parts.join(' | ')}`);
+        lines.push('');
+      }
+    }
+
+    // Earnings
+    if (earnings && earnings.length > 0) {
+      lines.push('**Recent Earnings:**');
+      for (const e of earnings.slice(0, 2)) {
+        const surprise = e.epsSurprise != null ? ` (${e.epsSurprise > 0 ? '+' : ''}${e.epsSurprise}%)` : '';
+        const beat = e.epsSurprise > 0 ? '🟢' : e.epsSurprise < 0 ? '🔴' : '🟡';
+        lines.push(`  ${beat} ${e.date}: EPS \`$${e.epsActual ?? 'N/A'}\` vs est \`$${e.epsForecast ?? 'N/A'}\`${surprise}`);
+      }
+      lines.push('');
+    }
+
+    // Insider trades
+    if (insider && insider.length > 0) {
+      lines.push('**Insider Trades (recent):**');
+      for (const t of insider.slice(0, 3)) {
+        const name = t.name || t.insider_name || t.full_name || 'Unknown';
+        const type = (t.trade_type || t.transaction_type || t.type || '').toUpperCase();
+        const isBuy = /buy|purchase|acquisition/i.test(type) || t.acquisition_or_disposition === 'A';
+        const emoji = isBuy ? '🟢 BUY' : '🔴 SELL';
+        const shares = t.shares || t.quantity || t.number_of_shares || '?';
+        const date = t.date || t.filing_date || '';
+        lines.push(`  ${emoji} ${name} — ${Number(shares).toLocaleString()} shares (${date})`);
+      }
+      lines.push('');
+    }
+
+    // Congress trades
+    if (congress && congress.length > 0) {
+      lines.push('**Congress Trades:**');
+      for (const t of congress.slice(0, 3)) {
+        const name = t.name || t.politician || t.congress_member || 'Unknown';
+        const type = (t.trade_type || t.transaction_type || t.type || '').toUpperCase();
+        const isBuy = /buy|purchase/i.test(type);
+        const emoji = isBuy ? '🟢 BUY' : '🔴 SELL';
+        const amount = t.amount || t.dollar_amount || t.value || '';
+        const date = t.date || t.transaction_date || '';
+        lines.push(`  ${emoji} ${name} — ${amount ? `\`${amount}\`` : ''} (${date})`);
+      }
+      lines.push('');
+    }
+
+    // News headlines
+    if (news && news.length > 0) {
+      lines.push('**Latest News:**');
+      for (const n of news.slice(0, 3)) {
+        lines.push(`  - ${n.title}`);
+      }
+      lines.push('');
+    }
+
+    lines.push(`_Data via AInvest | ${new Date().toLocaleString()}_`);
+
+    let output = lines.join('\n');
+    if (output.length > 1950) output = output.slice(0, 1950) + '\n...';
+    return output;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  ENRICHMENT FOR AI ANALYSIS (replaces Unusual Whales enrichment)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Fetch and format AInvest data for inclusion in TradingAgents prompts.
+   * Returns a text block suitable for appending to market data.
+   */
+  async getEnrichmentForAnalysis(ticker) {
+    if (!this.enabled) return '';
+
+    const upper = ticker.toUpperCase();
+    const sections = [];
+
+    const results = await Promise.allSettled([
+      this.getAnalystConsensus(upper),
+      this.getFinancials(upper),
+      this.getEarnings(upper, 2),
+      this.getInsiderTrades(upper).then(t => t.slice(0, 5)),
+      this.getCongressTrades(upper).then(t => t.slice(0, 3)),
+    ]);
+
+    const [analystResult, financialsResult, earningsResult, insiderResult, congressResult] = results;
+
+    // Analyst consensus
+    if (analystResult.status === 'fulfilled' && analystResult.value) {
+      const a = analystResult.value;
+      const buys = (a.strongBuy || 0) + (a.buy || 0);
+      const sells = (a.sell || 0) + (a.strongSell || 0);
+      const bias = buys > sells * 2 ? 'STRONG BUY' : buys > sells ? 'BUY LEAN' : sells > buys ? 'SELL LEAN' : 'NEUTRAL';
+
+      sections.push(`ANALYST CONSENSUS (${a.totalAnalysts} analysts):
+  Buy: ${buys} | Hold: ${a.hold || 0} | Sell: ${sells}
+  Consensus: ${bias}${a.targetAvg ? `\n  Price Target: $${a.targetLow}–$${a.targetHigh} (avg $${a.targetAvg})` : ''}`);
+    }
+
+    // Fundamentals
+    if (financialsResult.status === 'fulfilled' && financialsResult.value) {
+      const f = financialsResult.value;
+      const parts = [];
+      if (f.peTTM != null) parts.push(`P/E: ${f.peTTM.toFixed(1)}`);
+      if (f.epsTTM != null) parts.push(`EPS: $${f.epsTTM.toFixed(2)}`);
+      if (f.roeTTM != null) parts.push(`ROE: ${(f.roeTTM * 100).toFixed(1)}%`);
+      if (f.netMargin != null) parts.push(`Net Margin: ${(f.netMargin * 100).toFixed(1)}%`);
+      if (f.marketCap != null) parts.push(`Mkt Cap: $${(f.marketCap / 1e9).toFixed(1)}B`);
+      if (parts.length > 0) {
+        sections.push(`FUNDAMENTALS: ${parts.join(' | ')}`);
+      }
+    }
+
+    // Earnings
+    if (earningsResult.status === 'fulfilled' && earningsResult.value?.length > 0) {
+      sections.push('RECENT EARNINGS:');
+      for (const e of earningsResult.value) {
+        const surprise = e.epsSurprise != null ? ` (${e.epsSurprise > 0 ? '+' : ''}${e.epsSurprise}% surprise)` : '';
+        sections.push(`  ${e.date}: EPS $${e.epsActual ?? 'N/A'} vs est $${e.epsForecast ?? 'N/A'}${surprise}`);
+      }
+    }
+
+    // Insider trades
+    if (insiderResult.status === 'fulfilled' && insiderResult.value?.length > 0) {
+      const trades = insiderResult.value;
+      sections.push('INSIDER TRADING (AInvest):');
+      for (const t of trades) {
+        const name = t.name || t.insider_name || 'Unknown';
+        const type = t.trade_type || t.transaction_type || t.type || '?';
+        const shares = t.shares || t.quantity || '?';
+        sections.push(`  ${type}: ${name} — ${Number(shares).toLocaleString()} shares (${t.date || t.filing_date || ''})`);
+      }
+    }
+
+    // Congress trades
+    if (congressResult.status === 'fulfilled' && congressResult.value?.length > 0) {
+      sections.push('CONGRESS TRADES (AInvest):');
+      for (const t of congressResult.value) {
+        const name = t.name || t.politician || 'Unknown';
+        const type = t.trade_type || t.transaction_type || '?';
+        const amount = t.amount || t.dollar_amount || '';
+        sections.push(`  ${type}: ${name} — ${amount} (${t.date || ''})`);
+      }
+    }
+
+    if (sections.length === 0) return '';
+    return `=== AINVEST MARKET INTELLIGENCE ===\n${sections.join('\n')}`;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   //  FORMATTED CONTEXT FOR AI PROMPTS
   // ═══════════════════════════════════════════════════════════════════════
 

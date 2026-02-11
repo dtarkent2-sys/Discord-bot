@@ -14,9 +14,14 @@
  *
  * Architecture:
  *   Series (e.g. KXCPI) → Events (e.g. KXCPI-26JAN) → Markets (e.g. KXCPI-26JAN-T0.3)
- *   We search the series catalog (~8k entries) by keyword, then fetch
- *   events+markets for matching series. This avoids the raw /markets endpoint
- *   which is flooded with thousands of zero-volume sports parlay combos.
+ *
+ *   Search strategy (two-pronged):
+ *   1. Series index search: Search the ~8k series catalog by keyword, then fetch
+ *      markets for matching series. This finds niche topics (inflation, CPI) that
+ *      don't appear in the first 600 events.
+ *   2. Event batch fetch: Paginate /events with nested markets. Each market gets
+ *      tagged with its event's authoritative category field, enabling reliable
+ *      sports filtering and category browsing.
  */
 
 const { Ollama } = require('ollama');
@@ -163,7 +168,7 @@ class KalshiService {
   }
 
   /**
-   * Search series by keyword, return matching series tickers.
+   * Search series by keyword, return matching series entries.
    * All query words must appear in the series searchText.
    */
   async _searchSeries(query, limit = 10) {
@@ -176,7 +181,74 @@ class KalshiService {
     return matches.slice(0, limit);
   }
 
+  // ── Event Batch Fetch (with category tagging) ──────────────────────
+
+  /**
+   * Fetch events with nested markets, tagging each market with its event's category.
+   * Uses the /events endpoint which has an authoritative `category` field
+   * (e.g. "Sports", "Economics", "Politics") — far more reliable than
+   * guessing from ticker strings.
+   *
+   * @param {number} pages - Number of pages to fetch
+   * @param {object} opts
+   * @param {boolean} opts.excludeSports - Skip sports/esports events entirely
+   * @returns {Array} Markets enriched with _category and _eventTitle
+   */
+  async _fetchEventBatch(pages = 3, { excludeSports = false } = {}) {
+    const allMarkets = [];
+    let cursor = null;
+
+    for (let page = 0; page < pages; page++) {
+      const params = { limit: 200, with_nested_markets: true };
+      if (cursor) params.cursor = cursor;
+
+      const result = await this._fetch('/events', params);
+      const events = result.events || [];
+
+      for (const event of events) {
+        const category = (event.category || '').toLowerCase();
+
+        // Skip sports entirely if requested
+        if (excludeSports && (category === 'sports' || category === 'esports')) continue;
+
+        for (const m of (event.markets || [])) {
+          m._category = category;
+          m._eventTitle = event.title || '';
+          allMarkets.push(m);
+        }
+      }
+
+      cursor = result.cursor;
+      if (!cursor || events.length === 0) break;
+    }
+
+    return allMarkets;
+  }
+
   // ── Market Filtering ─────────────────────────────────────────────────
+
+  /**
+   * Detect if a market is a sports/game betting market.
+   * Primarily uses the _category tag set by _fetchEventBatch (authoritative).
+   * Falls back to ticker/title pattern matching for markets from other sources.
+   */
+  _isSportsMarket(m) {
+    // Primary: use the event category tag (set by _fetchEventBatch)
+    const cat = (m._category || m.category || '').toLowerCase();
+    if (cat === 'sports' || cat === 'esports') return true;
+    // If we have a known non-sports category, trust it
+    if (cat && cat !== 'sports' && cat !== 'esports') return false;
+
+    // Fallback: ticker pattern matching for untagged markets (e.g., from /markets endpoint)
+    const ticker = (m.event_ticker || m.ticker || '').toUpperCase();
+    const sportsTickerParts = [
+      'NBA', 'NFL', 'MLB', 'NHL', 'MLS', 'WNBA', 'NCAAB', 'NCAAF', 'NCAAM',
+      'UFC', 'PGA', 'LIV', 'LPGA', 'ATP', 'WTA', 'NASCAR',
+      'EPL', 'LALIGA', 'SOCCER', 'FIFAWC',
+      'CRICKET', 'IPL', 'CFL', 'XFL', 'CFB',
+    ];
+    return sportsTickerParts.some(s => ticker.includes(s));
+  }
 
   /** Filter out junk: zero-price, zero-volume, settled markets */
   _isLiveMarket(m) {
@@ -189,83 +261,105 @@ class KalshiService {
     return true;
   }
 
+  /**
+   * Build searchable text from a market object.
+   * Combines all text fields for keyword matching.
+   */
+  _marketSearchText(m) {
+    return [
+      m.title || '',
+      m.subtitle || '',
+      m.yes_sub_title || '',
+      m.no_sub_title || '',
+      m.ticker || '',
+      m.event_ticker || '',
+      m.rules_primary || '',
+    ].join(' ').toLowerCase();
+  }
+
   // ── Search / Discovery ─────────────────────────────────────────────
 
   /**
-   * Search for markets by keyword.
-   * Strategy: search series index → fetch markets for matching series → filter & rank.
+   * Search for markets by keyword (two-pronged strategy):
+   *
+   * 1. Series index search: Finds niche topics (inflation, CPI, recession) that
+   *    don't appear in the first ~600 events returned by /events.
+   * 2. Event batch search: Catches markets from popular events and provides
+   *    authoritative category tagging for sports filtering.
+   *
+   * Results are deduplicated, filtered (no junk, no sports unless queried),
+   * grouped by event, and sorted by volume.
    */
   async searchMarkets(query, limit = 10) {
-    // Step 1: Find matching series
-    const matchingSeries = await this._searchSeries(query, 8);
+    const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+    if (words.length === 0) return [];
 
-    if (matchingSeries.length === 0) {
-      log.info(`No series found for "${query}"`);
-      return [];
+    const allMatches = new Map(); // ticker → market (dedupe)
+
+    // ── Strategy 1: Series index search (finds niche topics) ──
+    const matchingSeries = await this._searchSeries(query, 8);
+    if (matchingSeries.length > 0) {
+      log.info(`Found ${matchingSeries.length} series for "${query}": ${matchingSeries.map(s => s.ticker).join(', ')}`);
+
+      const seriesToFetch = matchingSeries.slice(0, 5);
+      const marketResults = await Promise.all(
+        seriesToFetch.map(s =>
+          this._fetch('/markets', { series_ticker: s.ticker, limit: 50 })
+            .catch(err => { log.error(`Failed fetching markets for ${s.ticker}:`, err.message); return { markets: [] }; })
+        )
+      );
+
+      for (const r of marketResults) {
+        for (const m of (r.markets || [])) {
+          allMatches.set(m.ticker, m);
+        }
+      }
     }
 
-    log.info(`Found ${matchingSeries.length} series for "${query}": ${matchingSeries.map(s => s.ticker).join(', ')}`);
+    // ── Strategy 2: Event batch search (has category data for sports filtering) ──
+    if (allMatches.size < limit * 2) {
+      const eventMarkets = await this._fetchEventBatch(3);
+      for (const m of eventMarkets) {
+        const text = this._marketSearchText(m);
+        if (words.every(w => text.includes(w)) && !allMatches.has(m.ticker)) {
+          allMatches.set(m.ticker, m);
+        }
+      }
+    }
 
-    // Step 2: Fetch markets for each matching series (in parallel, max 5)
-    const seriesToFetch = matchingSeries.slice(0, 5);
-    const marketResults = await Promise.all(
-      seriesToFetch.map(s =>
-        this._fetch('/markets', { series_ticker: s.ticker, limit: 50 })
-          .catch(err => { log.error(`Failed fetching markets for ${s.ticker}:`, err.message); return { markets: [] }; })
-      )
-    );
+    // Filter out sports unless the query is sports-related
+    const sportsQueries = ['nfl', 'nba', 'mlb', 'nhl', 'ufc', 'pga', 'soccer', 'football', 'basketball', 'baseball', 'hockey', 'sports', 'game', 'super bowl', 'world series', 'march madness', 'playoff'];
+    const isSportsQuery = sportsQueries.some(sq => query.toLowerCase().includes(sq));
 
-    // Step 3: Combine, filter, and rank
-    const allMarkets = marketResults.flatMap(r => r.markets || []);
-    const liveMarkets = allMarkets.filter(m => this._isLiveMarket(m));
+    let results = [...allMatches.values()];
 
-    // Sort: volume_24h first (recency), then total volume (popularity)
-    liveMarkets.sort((a, b) =>
+    if (!isSportsQuery) {
+      results = results.filter(m => !this._isSportsMarket(m));
+    }
+
+    // Filter out zero-price junk and settled markets
+    results = results.filter(m => this._isLiveMarket(m));
+
+    // Sort by volume (most active first)
+    results.sort((a, b) =>
       (b.volume_24h || 0) - (a.volume_24h || 0) ||
       (b.volume || 0) - (a.volume || 0)
     );
 
-    return liveMarkets.slice(0, limit);
+    return results.slice(0, limit);
   }
 
   /**
-   * Get trending/hot markets from popular series across categories.
-   * Fetches markets for high-interest series and sorts by recent volume.
+   * Get trending/hot markets — most 24h volume, diversified across categories.
+   * Uses the events endpoint (has authoritative category field) and excludes
+   * sports, which dominate Kalshi by 10-100x volume and drown out everything.
    */
   async getTrendingMarkets(limit = 15) {
-    // Curated list of high-interest series tickers across categories
-    const trendingSeries = [
-      // Economics
-      'KXCPI', 'KXFED', 'KXRATECUT', 'KXRECSSNBER', 'KXAVGTARIFF', 'KXGDP',
-      'KXFEDHIKE', 'KXCPIYOY', 'KXCPICORE', 'KXTARIFFREVENUE',
-      // Politics
-      'KXCHINATARIFF', 'KXTARIFFSGLOBAL', 'KXNEWTARIFFS', 'KXTARIFFSPRC',
-      'KXTARIFFSMEX', 'KXTARIFFSEU', 'KXTARIFFSCANADA',
-      // Crypto
-      'KXBTC', 'KXETH', 'KXSOL',
-      // Tech / Companies
-      'KXGPT6', 'KXOAIANTH',
-      // Finance
-      'KXSPY', 'KXNAS', 'KXDOW',
-    ];
+    // Fetch non-sports markets via events endpoint (authoritative category)
+    const nonSports = await this._fetchEventBatch(3, { excludeSports: true });
 
-    // Fetch markets for all these series in parallel (batched to avoid rate limits)
-    const batchSize = 8;
-    const allMarkets = [];
-
-    for (let i = 0; i < trendingSeries.length; i += batchSize) {
-      const batch = trendingSeries.slice(i, i + batchSize);
-      const results = await Promise.all(
-        batch.map(ticker =>
-          this._fetch('/markets', { series_ticker: ticker, limit: 20 })
-            .catch(() => ({ markets: [] }))
-        )
-      );
-      allMarkets.push(...results.flatMap(r => r.markets || []));
-    }
-
-    // Filter and sort by 24h volume
-    const live = allMarkets.filter(m => this._isLiveMarket(m));
+    // Filter out junk and sort by 24h volume
+    const live = nonSports.filter(m => this._isLiveMarket(m));
     live.sort((a, b) =>
       (b.volume_24h || 0) - (a.volume_24h || 0) ||
       (b.volume || 0) - (a.volume || 0)
@@ -276,7 +370,7 @@ class KalshiService {
 
   /**
    * Get markets by category keyword (economics, crypto, politics, tech, etc.)
-   * Searches series by category field, then fetches their markets.
+   * Two-pronged: event batch (has authoritative category) + series index (deeper coverage).
    */
   async getMarketsByCategory(category, limit = 10) {
     // Map user-facing categories to Kalshi category names + keywords
@@ -291,35 +385,58 @@ class KalshiService {
     };
 
     const mapping = categoryMap[category.toLowerCase()];
-    const index = await this._getSeriesIndex();
+    const isSportsCategory = category.toLowerCase() === 'sports';
+    const allMatches = new Map();
 
-    let matchingSeries;
+    // Strategy 1: Event batch (authoritative categories)
+    const eventMarkets = await this._fetchEventBatch(3, { excludeSports: !isSportsCategory });
     if (mapping) {
-      // Match by Kalshi category name OR keywords in title
       const catSet = new Set(mapping.categories.map(c => c.toLowerCase()));
-      matchingSeries = index.filter(s =>
-        catSet.has(s.category.toLowerCase()) ||
-        mapping.keywords.some(kw => s.searchText.includes(kw))
-      );
+      for (const m of eventMarkets) {
+        const cat = (m._category || '').toLowerCase();
+        const text = this._marketSearchText(m);
+        if (catSet.has(cat) || mapping.keywords.some(kw => text.includes(kw))) {
+          allMatches.set(m.ticker, m);
+        }
+      }
     } else {
-      // Freeform category — search as keyword
       const lower = category.toLowerCase();
-      matchingSeries = index.filter(s => s.searchText.includes(lower));
+      for (const m of eventMarkets) {
+        const text = this._marketSearchText(m);
+        if (text.includes(lower)) allMatches.set(m.ticker, m);
+      }
     }
 
-    if (matchingSeries.length === 0) return [];
+    // Strategy 2: Series index search (deeper coverage for niche topics)
+    if (allMatches.size < limit * 2) {
+      const index = await this._getSeriesIndex();
+      let matchingSeries;
+      if (mapping) {
+        const catSet = new Set(mapping.categories.map(c => c.toLowerCase()));
+        matchingSeries = index.filter(s =>
+          catSet.has(s.category.toLowerCase()) ||
+          mapping.keywords.some(kw => s.searchText.includes(kw))
+        );
+      } else {
+        const lower = category.toLowerCase();
+        matchingSeries = index.filter(s => s.searchText.includes(lower));
+      }
 
-    // Fetch markets for top matching series
-    const seriesToFetch = matchingSeries.slice(0, 8);
-    const results = await Promise.all(
-      seriesToFetch.map(s =>
-        this._fetch('/markets', { series_ticker: s.ticker, limit: 30 })
-          .catch(() => ({ markets: [] }))
-      )
-    );
+      const seriesToFetch = matchingSeries.slice(0, 5);
+      const results = await Promise.all(
+        seriesToFetch.map(s =>
+          this._fetch('/markets', { series_ticker: s.ticker, limit: 30 })
+            .catch(() => ({ markets: [] }))
+        )
+      );
+      for (const r of results) {
+        for (const m of (r.markets || [])) {
+          if (!allMatches.has(m.ticker)) allMatches.set(m.ticker, m);
+        }
+      }
+    }
 
-    const allMarkets = results.flatMap(r => r.markets || []);
-    const live = allMarkets.filter(m => this._isLiveMarket(m));
+    let live = [...allMatches.values()].filter(m => this._isLiveMarket(m));
 
     live.sort((a, b) =>
       (b.volume_24h || 0) - (a.volume_24h || 0) ||
@@ -330,6 +447,66 @@ class KalshiService {
   }
 
   // ── Data Formatting ─────────────────────────────────────────────────
+
+  /**
+   * Group markets by event_ticker and pick the best contract per event.
+   * This deduplicates the wall of strike-price contracts into one per event.
+   */
+  _groupByEvent(markets) {
+    if (!markets || markets.length === 0) return [];
+
+    const groups = new Map(); // event_ticker → [markets]
+    for (const m of markets) {
+      const key = m.event_ticker || m.ticker; // solo markets use their own ticker
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(m);
+    }
+
+    // For each event, pick the "best" contract
+    const picks = [];
+    for (const [eventTicker, contracts] of groups) {
+      const best = this._pickBestContract(contracts);
+      best._eventTicker = eventTicker;
+      best._contractCount = contracts.length;
+      best._eventVolume = contracts.reduce((s, c) => s + (c.volume_24h || c.volume || 0), 0);
+      picks.push(best);
+    }
+
+    // Sort by total event volume (most active events first)
+    picks.sort((a, b) => (b._eventVolume || 0) - (a._eventVolume || 0));
+    return picks;
+  }
+
+  /**
+   * Pick the most "interesting" contract from a set of sibling contracts.
+   * Prefers: high volume + probability between 15-85% (where edge lives).
+   * Avoids extreme prices (>92% or <8%) which are boring/illiquid.
+   */
+  _pickBestContract(contracts) {
+    if (contracts.length === 1) return contracts[0];
+
+    return contracts.reduce((best, c) => {
+      const bestScore = this._contractScore(best);
+      const cScore = this._contractScore(c);
+      return cScore > bestScore ? c : best;
+    });
+  }
+
+  _contractScore(m) {
+    const price = m.last_price > 0 ? m.last_price : (m.yes_ask ?? m.yes_bid ?? 50);
+    const vol = m.volume_24h || m.volume || 0;
+
+    // Probability score: peak at 50%, drops toward extremes
+    // Sweet spot: 15-85% range (where real bets happen)
+    const probScore = price <= 8 || price >= 92 ? 0.1 :
+                      price <= 15 || price >= 85 ? 0.5 :
+                      price <= 30 || price >= 70 ? 0.8 : 1.0;
+
+    // Volume score: log scale, more volume = better
+    const volScore = vol > 0 ? Math.log10(vol + 1) / 5 : 0.01;
+
+    return probScore * 2 + volScore;
+  }
 
   /** Format a single market for display */
   formatMarket(m) {
@@ -375,21 +552,34 @@ class KalshiService {
     };
   }
 
-  /** Format market list for Discord */
+  /**
+   * Format market list for Discord — groups by event so users aren't overwhelmed
+   * by 20 strike-price contracts for the same underlying question.
+   */
   formatMarketsForDiscord(markets, title = 'Prediction Markets') {
     if (!markets || markets.length === 0) {
       return `**${title}**\nNo markets found.`;
     }
 
+    // Group by event — show 1 "best" contract per event
+    const grouped = this._groupByEvent(markets);
+
     const lines = [`**${title}**\n`];
 
-    for (let i = 0; i < markets.length; i++) {
-      const m = this.formatMarket(markets[i]);
+    for (let i = 0; i < Math.min(grouped.length, 10); i++) {
+      const raw = grouped[i];
+      const m = this.formatMarket(raw);
       const probEmoji = m.yesPrice >= 70 ? '🟢' : m.yesPrice <= 30 ? '🔴' : '🟡';
       const vol24h = m.volume24h ? ` (24h: ${m.volume24h})` : '';
-      lines.push(`${probEmoji} **${m.title}**`);
+      const siblings = raw._contractCount > 1 ? ` (+${raw._contractCount - 1} contracts)` : '';
+
+      lines.push(`${probEmoji} **${m.title}**${siblings}`);
       lines.push(`   Yes: \`${m.prob}\` | Vol: \`${m.volume}\`${vol24h} | Closes: \`${m.closeDateStr}\` | \`${m.ticker}\``);
-      if (i < markets.length - 1) lines.push('');
+      if (i < Math.min(grouped.length, 10) - 1) lines.push('');
+    }
+
+    if (grouped.length > 10) {
+      lines.push(`\n_...and ${grouped.length - 10} more events_`);
     }
 
     lines.push(`\n_Data via Kalshi | ${new Date().toLocaleString()}_`);
@@ -449,52 +639,68 @@ class KalshiService {
   // ── AI Betting Recommendations ──────────────────────────────────────
 
   /**
-   * Analyze markets and produce AI betting recommendations.
-   * Cross-references Kalshi odds with reasoning to find potential edge.
+   * Analyze markets and produce ONE clear high-conviction play.
+   * Users want a simple "here's your bet" — not a wall of analysis.
    */
   async analyzeBets(markets, query) {
     if (!markets || markets.length === 0) return null;
 
-    const marketSummary = markets.map(m => {
+    // Group by event first so the AI sees unique events, not duplicate strike prices
+    const grouped = this._groupByEvent(markets);
+    const topEvents = grouped.slice(0, 8);
+
+    const marketSummary = topEvents.map(m => {
       const fm = this.formatMarket(m);
-      return `- "${fm.title}" | Yes: ${fm.prob} | Volume: ${fm.volume} | Closes: ${fm.closeDateStr} | Ticker: ${fm.ticker}`;
+      const siblings = m._contractCount > 1 ? ` [${m._contractCount} contracts in this event]` : '';
+      // Include YES/NO meanings so the AI knows exactly what each side represents
+      const yesMeaning = m.yes_sub_title ? ` (YES = "${m.yes_sub_title}")` : '';
+      const noMeaning = m.no_sub_title ? ` (NO = "${m.no_sub_title}")` : '';
+      return `- "${fm.title}" | Yes: ${fm.prob}${yesMeaning}${noMeaning} | Volume: ${fm.volume} | Closes: ${fm.closeDateStr} | Ticker: ${fm.ticker}${siblings}`;
     }).join('\n');
 
-    const prompt = `You are a prediction market analyst. The user searched for "${query}" and found these Kalshi prediction markets:
+    const prompt = `You are a sharp prediction market trader. A user asked for a play on "${query}". Here are the available Kalshi markets:
 
 ${marketSummary}
 
 TODAY'S DATE: ${todayString()}
 
-For each market, analyze:
-1. Does the current Yes price (implied probability) seem accurate based on available evidence?
-2. Where might the market be WRONG? (This is where edge exists)
-3. What factors could shift this market's odds significantly before it closes?
+IMPORTANT CONTEXT:
+- Each market is a specific YES/NO question with a specific threshold (e.g. "Bitcoin above $98,000?" is DIFFERENT from "Bitcoin above $105,000?")
+- "BUY YES" = you believe the specific event described WILL happen
+- "BUY NO" = you believe the specific event described will NOT happen
+- Your recommendation must be about THIS EXACT CONTRACT at THIS EXACT threshold — do not generalize
+- Reference the specific ticker so the user knows exactly which contract to trade
 
-Then produce your TOP PICKS — markets where you see the biggest edge (probability mispricing).
+Pick your #1 HIGH CONVICTION play. The user wants ONE clear bet, not a dissertation.
 
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
+Analyze which market has the biggest mispricing — where the market odds are WRONG based on current evidence. Consider:
+- Is the market over/underpricing the probability?
+- What catalyst or trend does the market not reflect yet?
+- Volume matters — illiquid markets are riskier
 
-TOP PICKS:
+FORMAT YOUR RESPONSE EXACTLY LIKE THIS (keep it punchy):
 
-🎯 PICK 1: [market title]
-Side: YES/NO @ [current price]c
-Edge: [your estimated true probability]% vs market's [market price]%
-Reasoning: [2-3 sentences explaining why the market is mispriced]
-Confidence: [1-10]
+🎯 **THE PLAY**
+**[Full market question including the specific threshold]** (\`[TICKER]\`)
+Side: **BUY [YES/NO]** @ [current price]c
+Meaning: [1 sentence explaining what your bet means in plain English, e.g. "Betting Bitcoin stays above $98k by Feb 14"]
+My odds: [your probability]% vs market's [their probability]%
+Edge: [difference]%
 
-🎯 PICK 2: [market title]
-Side: YES/NO @ [current price]c
-Edge: [your estimated true probability]% vs market's [market price]%
-Reasoning: [2-3 sentences]
-Confidence: [1-10]
+**Why:** [2-3 sentences max — the core thesis for why this is mispriced]
 
-(Continue for up to 3 picks, only pick markets where you see real edge)
+**Key catalyst:** [1 sentence — what event/data will move this]
 
-AVOID: Markets where the current price seems about right — only recommend where you see genuine mispricing.
+**Risk:** [1 sentence — what could go wrong]
 
-End with:
-SUMMARY: One sentence with your overall take on this market category.`;
+**Conviction: [7-10]/10**
+
+${topEvents.length > 3 ? `\nIf you see a second strong play, add it as:
+
+🥈 **RUNNER-UP**
+(same format but briefer)` : ''}
+
+If you genuinely don't see edge in any of these markets, say so directly — don't force a bad pick.`;
 
     const response = await this._llmCall(prompt);
     return response;
@@ -525,12 +731,15 @@ RECENT TRADE FLOW:
     }
 
     const rulesContext = market.rules_primary ? `\nRules: ${market.rules_primary.slice(0, 500)}` : '';
+    // Include what YES/NO means so the AI doesn't misinterpret the sides
+    const yesMeaning = market.yes_sub_title ? `\nYES means: "${market.yes_sub_title}"` : '';
+    const noMeaning = market.no_sub_title ? `\nNO means: "${market.no_sub_title}"` : '';
 
-    const prompt = `You are a senior prediction market analyst specializing in probability assessment.
+    const prompt = `You are a sharp prediction market trader. Give a clear, decisive analysis.
 
 MARKET: "${fm.title}"
 ${fm.subtitle && fm.subtitle !== fm.title ? `Context: ${fm.subtitle}` : ''}
-Current Yes Price: ${fm.prob} (the market says there's a ${fm.prob} chance this happens)
+Current Yes Price: ${fm.prob} (market-implied probability)${yesMeaning}${noMeaning}
 Volume: ${fm.volume} contracts traded
 Closes: ${fm.closeDateStr}
 Ticker: ${fm.ticker}${rulesContext}
@@ -538,31 +747,25 @@ ${tradeContext}
 
 TODAY'S DATE: ${todayString()}
 
-Perform a deep probability analysis:
+IMPORTANT: "BUY YES" means you believe the specific event/threshold WILL happen. "BUY NO" means you believe it will NOT happen. Be precise about what you're betting on.
 
-1. MARKET ASSESSMENT: What is the market saying at ${fm.prob}? Is this price reflecting consensus?
-2. YOUR ESTIMATE: Based on available evidence, what do YOU think the true probability is? Explain your reasoning.
-3. TRADE FLOW: What does the recent trade flow tell us about market sentiment direction?
-4. CATALYSTS: What upcoming events could move this market significantly?
-5. EDGE ANALYSIS: Is there a bet worth making here?
+FORMAT YOUR RESPONSE (keep it punchy — traders don't read essays):
 
-FORMAT YOUR RESPONSE:
+📊 **MARKET: ${fm.prob} implied probability**
+My estimate: **[X]%** → Edge: **[diff]%**
 
-PROBABILITY ASSESSMENT:
-Market Price: ${fm.prob}
-My Estimate: [your estimate]%
-Edge: [difference]% — [explain if this is significant enough to trade]
+🎯 **VERDICT: BUY YES / BUY NO / NO BET**
+Meaning: [1 sentence in plain English, e.g. "Betting inflation stays above 3%"]
+Entry: [price]c | Conviction: [1-10]/10
 
-RECOMMENDATION:
-Side: BUY YES / BUY NO / NO BET
-Entry: [price you'd want to enter at]c
-Reasoning: [3-4 sentences with specific reasoning]
+**Thesis:** [2-3 sentences — the core reasoning]
 
-KEY RISKS:
-- [risk 1]
-- [risk 2]
+**Catalyst:** [1 sentence — what moves this next]
+${tradeContext ? '\n**Flow read:** [1 sentence on what trade flow signals]' : ''}
 
-CONVICTION: [1-10]`;
+**Risk:** [1 sentence — the bear case]
+
+Be decisive. If you see edge, say it clearly. If you don't, say "NO BET" — don't hedge.`;
 
     const response = await this._llmCall(prompt);
     return response;

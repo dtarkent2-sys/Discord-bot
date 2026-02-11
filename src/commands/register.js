@@ -294,27 +294,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('flow')
-    .setDescription('Unusual options flow — sweeps, big premium, smart money (Unusual Whales)')
-    .addStringOption(opt =>
-      opt.setName('ticker')
-        .setDescription('Stock symbol (e.g. AAPL, TSLA) — omit for market-wide flow')
-        .setRequired(false)
-    )
-    .addStringOption(opt =>
-      opt.setName('filter')
-        .setDescription('Filter type')
-        .setRequired(false)
-        .addChoices(
-          { name: 'All unusual flow', value: 'all' },
-          { name: 'Calls only', value: 'calls' },
-          { name: 'Puts only', value: 'puts' },
-          { name: 'Sweeps only (aggressive)', value: 'sweeps' },
-        )
-    ),
-
-  new SlashCommandBuilder()
-    .setName('darkpool')
-    .setDescription('Dark pool / off-exchange prints for a ticker (Unusual Whales)')
+    .setDescription('Smart money flow — insider trades + congress trades (AInvest)')
     .addStringOption(opt =>
       opt.setName('ticker')
         .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY)')
@@ -323,7 +303,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('whales')
-    .setDescription('Whale activity dashboard — flow + dark pool + shorts + insider (Unusual Whales)')
+    .setDescription('Market intelligence — analyst ratings, fundamentals, insider + congress trades (AInvest)')
     .addStringOption(opt =>
       opt.setName('ticker')
         .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY)')
