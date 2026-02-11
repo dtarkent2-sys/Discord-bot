@@ -168,23 +168,93 @@ class KalshiService {
    * Search for markets by keyword. Kalshi doesn't have a text search endpoint,
    * so we fetch markets and filter client-side across all text fields.
    * Supports multi-word queries (all words must match).
+   *
+   * Also tries events-first search and known series tickers for common queries
+   * to improve coverage when the market batch misses niche categories.
    */
   async searchMarkets(query, limit = 10) {
     const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 1);
     if (words.length === 0) return [];
 
+    const allMatches = new Map(); // ticker → market (dedupe across strategies)
+
+    // ── Strategy 1: Fetch market batch and filter (primary, fast) ──
     const allMarkets = await this._fetchMarketBatch(3);
 
-    // Filter: all query words must appear in the market's searchable text
-    const matches = allMarkets.filter(m => {
+    for (const m of allMarkets) {
       const text = this._marketSearchText(m);
-      return words.every(w => text.includes(w));
-    });
+      if (words.every(w => text.includes(w))) {
+        allMatches.set(m.ticker, m);
+      }
+    }
+
+    // ── Strategy 2: Search events with nested markets (catches categorized markets) ──
+    if (allMatches.size < limit) {
+      try {
+        let cursor = null;
+        for (let page = 0; page < 3; page++) {
+          const params = { limit: 100, with_nested_markets: true };
+          if (cursor) params.cursor = cursor;
+
+          const result = await this._fetch('/events', params);
+          const events = result.events || [];
+
+          for (const event of events) {
+            const eventText = `${event.title || ''} ${event.sub_title || ''} ${event.category || ''} ${event.event_ticker || ''}`.toLowerCase();
+            if (words.every(w => eventText.includes(w))) {
+              for (const m of (event.markets || [])) {
+                allMatches.set(m.ticker, m);
+              }
+            }
+          }
+
+          cursor = result.cursor;
+          if (!cursor || events.length === 0) break;
+          if (allMatches.size >= limit * 3) break;
+        }
+      } catch (err) {
+        log.warn(`Event search failed: ${err.message}`);
+      }
+    }
+
+    // ── Strategy 3: Known series tickers for common queries ──
+    if (allMatches.size < limit) {
+      const seriesMap = {
+        bitcoin: ['KXBTC', 'KXBTCRESERVESTATES', 'KXELSALVADORBTC', 'KXTEXASBTC'],
+        btc: ['KXBTC', 'KXBTCRESERVESTATES'],
+        crypto: ['KXBTC', 'KXBTCRESERVESTATES'],
+        fed: ['TERMINALRATE'],
+        'interest rate': ['TERMINALRATE'],
+      };
+
+      const lower = query.toLowerCase();
+      const matchingSeries = Object.entries(seriesMap)
+        .filter(([kw]) => lower.includes(kw))
+        .flatMap(([, tickers]) => tickers);
+
+      for (const seriesTicker of [...new Set(matchingSeries)]) {
+        try {
+          const result = await this._fetch('/events', {
+            series_ticker: seriesTicker,
+            with_nested_markets: true,
+            limit: 50,
+          });
+          for (const event of (result.events || [])) {
+            for (const m of (event.markets || [])) {
+              allMatches.set(m.ticker, m);
+            }
+          }
+        } catch (err) {
+          log.warn(`Series ${seriesTicker} fetch failed: ${err.message}`);
+        }
+      }
+    }
 
     // Sort by volume (most active first), then by 24h volume
-    matches.sort((a, b) => (b.volume_24h || b.volume || 0) - (a.volume_24h || a.volume || 0));
+    const sorted = [...allMatches.values()];
+    sorted.sort((a, b) => (b.volume_24h || b.volume || 0) - (a.volume_24h || a.volume || 0));
 
-    return matches.slice(0, limit);
+    return sorted.slice(0, limit);
   }
 
   /**

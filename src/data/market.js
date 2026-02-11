@@ -118,11 +118,75 @@ async function getMarketContext(ticker, opts = {}) {
         };
         context.priceHistory = snapshot.priceHistory;
       } else {
-        missing.push({ field: 'snapshot', reason: `No data returned for ${resolvedTicker}` });
+        missing.push({ field: 'snapshot', reason: `FMP returned no data for ${resolvedTicker}` });
       }
     } catch (err) {
       console.error(`[Market] FMP snapshot error for ${resolvedTicker}:`, err.message);
       missing.push({ field: 'snapshot', reason: err.message });
+    }
+
+    // ── Fallback: If FMP failed and skipAlpaca was requested, try Alpaca anyway ──
+    // skipAlpaca is a preference (to allow AInvest enrichment), not a hard ban.
+    // A partial snapshot from Alpaca is better than total failure.
+    if (!context.quote && alpaca.enabled && !yahoo.isCrypto(resolvedTicker)) {
+      console.log(`[Market] FMP failed for ${resolvedTicker} — falling back to Alpaca despite skipAlpaca preference`);
+      try {
+        const [snapshot, history] = await Promise.all([
+          alpaca.getSnapshot(resolvedTicker),
+          alpaca.getHistory(resolvedTicker, 260).catch(() => []),
+        ]);
+
+        if (snapshot && snapshot.price != null) {
+          const closes = history.map(d => d.close).filter(c => c != null);
+          const highs = history.map(d => d.high).filter(c => c != null);
+          const lows = history.map(d => d.low).filter(c => c != null);
+          const priceHistory = history.slice(-30);
+
+          context.source = 'Alpaca (fallback)';
+          context.snapshot = {
+            ticker: resolvedTicker,
+            name: resolvedTicker,
+            price: snapshot.price,
+            previousClose: snapshot.prevClose,
+            open: snapshot.open,
+            dayHigh: snapshot.high,
+            dayLow: snapshot.low,
+            volume: snapshot.volume,
+            marketCap: null,
+            change: snapshot.change,
+            changePercent: snapshot.changePercent,
+            pe: null, forwardPE: null, pb: null, eps: null, divYield: null,
+            roe: null, profitMargin: null, revenueGrowth: null, beta: null,
+            fiftyTwoWeekHigh: highs.length > 0 ? Math.max(...highs) : null,
+            fiftyTwoWeekLow: lows.length > 0 ? Math.min(...lows) : null,
+            sma50: closes.length >= 50 ? sma(closes, 50) : null,
+            sma200: closes.length >= 200 ? sma(closes, 200) : null,
+            rsi14: closes.length >= 15 ? rsi(closes, 14) : null,
+            priceHistory,
+            timestamp: snapshot.timestamp || new Date().toISOString(),
+          };
+
+          context.quote = {
+            price: snapshot.price,
+            volume: snapshot.volume,
+            mktCap: null,
+            pe: null,
+            rsi14: closes.length >= 15 ? rsi(closes, 14) : null,
+            sma50: closes.length >= 50 ? sma(closes, 50) : null,
+            sma200: closes.length >= 200 ? sma(closes, 200) : null,
+            changePercent: snapshot.changePercent,
+            timestamp: snapshot.timestamp || new Date().toISOString(),
+          };
+          context.priceHistory = priceHistory;
+
+          // Clear the FMP failure from missing since we recovered
+          const fmpIdx = missing.findIndex(m => m.field === 'snapshot');
+          if (fmpIdx !== -1) missing.splice(fmpIdx, 1);
+          console.log(`[Market] Alpaca fallback succeeded for ${resolvedTicker}: $${snapshot.price}`);
+        }
+      } catch (alpErr) {
+        console.error(`[Market] Alpaca fallback also failed for ${resolvedTicker}:`, alpErr.message);
+      }
     }
   }
 
