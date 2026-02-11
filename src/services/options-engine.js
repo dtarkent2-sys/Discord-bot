@@ -782,6 +782,178 @@ class OptionsEngine {
     }
   }
 
+  // ── Alert Trigger (TradingView → Options Engine) ─────────────────
+
+  /**
+   * Trigger the 0DTE pipeline from an external alert (TradingView webhook).
+   *
+   * Unlike the scheduled cycle, this is event-driven: a TradingView signal
+   * like "BULLISH" or "PUMP INCOMING" acts as a directional HINT, not a
+   * complete trade plan. The engine runs its own full analysis (GEX,
+   * technicals, AI conviction, contract selection) and decides independently.
+   *
+   * @param {object} alert - Parsed alert from spy-alerts.js
+   * @param {string} alert.action - 'BUY', 'SELL', 'TAKE_PROFIT', 'ALERT'
+   * @param {string} alert.ticker - Underlying symbol (default SPY)
+   * @param {number} [alert.price] - Alert trigger price
+   * @param {string} [alert.confidence] - Source confidence (LOW/MEDIUM/HIGH)
+   * @param {string} [alert.reason] - Signal text
+   * @param {string} [alert.interval] - Timeframe (1m, 5m, etc.)
+   */
+  async triggerFromAlert(alert) {
+    const cfg = policy.getConfig();
+    if (!cfg.options_enabled) return;
+    if (!alpaca.enabled) return;
+
+    if (circuitBreaker.isPaused()) {
+      this._log('alert_trigger', 'Circuit breaker active — ignoring alert trigger');
+      return;
+    }
+
+    if (!this._isMarketHours()) return;
+
+    const underlying = (alert.ticker || 'SPY').toUpperCase();
+
+    // Only process directional signals (BUY/SELL), skip TP and generic ALERT
+    if (alert.action !== 'BUY' && alert.action !== 'SELL') {
+      this._log('alert_trigger', `${underlying}: ignoring non-directional alert (${alert.action})`);
+      return;
+    }
+
+    // Map alert direction to our hint format
+    const directionHint = alert.action === 'BUY' ? 'bullish' : 'bearish';
+
+    this._log('alert_trigger', `${underlying}: TradingView ${alert.action} signal received — "${alert.reason || alert.action}" [${alert.confidence || 'no conf'}] — running full analysis`);
+
+    const et = this._getETTime();
+
+    // Skip first 15 min after open
+    const minutesSinceOpen = et.minutesToClose > 0
+      ? (MARKET_CLOSE_HOUR * 60) - et.minutesToClose - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN)
+      : 0;
+    if (minutesSinceOpen < 15) {
+      this._log('alert_trigger', `${underlying}: too early after open (${minutesSinceOpen} min) — skipping`);
+      return;
+    }
+
+    // Check position capacity
+    const optionsPositions = await alpaca.getOptionsPositions();
+    if (optionsPositions.length >= cfg.options_max_positions) {
+      this._log('alert_trigger', `${underlying}: max positions reached (${optionsPositions.length}/${cfg.options_max_positions})`);
+      return;
+    }
+
+    if (et.minutesToClose <= cfg.options_close_before_minutes) {
+      this._log('alert_trigger', `${underlying}: too close to market close (${et.minutesToClose} min)`);
+      return;
+    }
+
+    try {
+      // 1. Account info
+      const account = await alpaca.getAccount();
+      const equity = Number(account.equity || 0);
+      policy.resetDaily(equity);
+
+      // 2. Macro regime — don't block on CAUTIOUS for alert-triggered trades
+      let macroRegime = { regime: 'CAUTIOUS', score: 0 };
+      try {
+        macroRegime = await macro.getRegime();
+      } catch (err) {
+        this._log('alert_trigger', `${underlying}: macro unavailable — proceeding with CAUTIOUS`);
+      }
+
+      // Still block on RISK_OFF
+      if (macroRegime.regime === 'RISK_OFF') {
+        this._log('alert_trigger', `${underlying}: RISK_OFF — blocking alert-triggered trade`);
+        return;
+      }
+
+      // 3. GEX analysis
+      let gexSummary;
+      try {
+        gexSummary = await this._gexEngine.analyze(underlying, { include_expiries: ['0dte'] });
+        this._log('alert_trigger', `${underlying}: GEX=${gexSummary.regime.label} (${(gexSummary.regime.confidence * 100).toFixed(0)}%), spot=$${gexSummary.spot}, flip=$${gexSummary.gammaFlip || '—'}`);
+      } catch (err) {
+        this._log('alert_trigger', `${underlying}: GEX unavailable — ${err.message}`);
+        return;
+      }
+
+      // 4. Intraday technicals
+      let intradayTech;
+      try {
+        const bars = await alpaca.getIntradayBars(underlying, { timeframe: '5Min', limit: 50 });
+        if (bars.length < 10) {
+          this._log('alert_trigger', `${underlying}: not enough bars (${bars.length})`);
+          return;
+        }
+        intradayTech = this._computeIntradayTechnicals(bars, gexSummary.spot);
+      } catch (err) {
+        this._log('alert_trigger', `${underlying}: intraday data error — ${err.message}`);
+        return;
+      }
+
+      // 5. Direction assessment — factor in the alert hint
+      const directionSignals = this._assessDirection(intradayTech, gexSummary.regime, gexSummary.walls, gexSummary.gammaFlip, gexSummary.spot, macroRegime);
+
+      // Boost conviction if alert direction matches our analysis
+      let adjustedConviction = directionSignals.conviction;
+      const alertMatchesAnalysis = directionSignals.direction === directionHint;
+      if (alertMatchesAnalysis) {
+        adjustedConviction = Math.min(adjustedConviction + 1, 10);
+        directionSignals.reasons.push(`TradingView ${alert.action} signal confirms direction (+1 conviction boost)`);
+      } else {
+        directionSignals.reasons.push(`TradingView ${alert.action} signal CONFLICTS with ${directionSignals.direction} analysis (no boost)`);
+      }
+
+      this._log('alert_trigger', `${underlying}: direction=${directionSignals.direction}, conviction=${adjustedConviction}/10 (alert ${alertMatchesAnalysis ? 'confirms' : 'conflicts'}), strategy=${directionSignals.strategy}`);
+
+      if (adjustedConviction < 4) {
+        this._log('alert_trigger', `${underlying}: weak signals (${adjustedConviction}/10) even with alert — skipping`);
+        return;
+      }
+
+      // 6. AI decision — pass the alert context for extra information
+      const aiDecision = await this._askOptionsAI(underlying, gexSummary.spot, intradayTech, gexSummary, macroRegime, { ...directionSignals, conviction: adjustedConviction }, et);
+
+      if (!aiDecision || aiDecision.action === 'SKIP') {
+        const reason = aiDecision?.reason || 'AI says skip';
+        this._log('alert_trigger', `${underlying}: AI SKIP — ${reason}`);
+        return;
+      }
+
+      if (aiDecision.conviction < cfg.options_min_conviction) {
+        this._log('alert_trigger', `${underlying}: AI conviction ${aiDecision.conviction}/10 below min ${cfg.options_min_conviction}`);
+        return;
+      }
+
+      this._log('alert_trigger', `${underlying}: AI ${aiDecision.action} — conviction ${aiDecision.conviction}/10 — proceeding to execution`);
+
+      // 7. Build signal and execute
+      const signal = {
+        underlying,
+        direction: (aiDecision.action === 'BUY_CALL' || aiDecision.action === 'BUY') ? 'bullish' : 'bearish',
+        optionType: (aiDecision.action === 'BUY_CALL' || aiDecision.action === 'BUY') ? 'call' : 'put',
+        strategy: aiDecision.strategy || directionSignals.strategy,
+        conviction: aiDecision.conviction,
+        reason: `Alert trigger: "${alert.reason || alert.action}" → ${aiDecision.reason}`,
+        spot: gexSummary.spot,
+        gex: gexSummary,
+        technicals: intradayTech,
+        target: aiDecision.target,
+        stopLevel: aiDecision.stopLevel,
+      };
+
+      const result = await this._executeEntry(signal, account, optionsPositions.length, et);
+      if (result.success) {
+        this._log('alert_trigger', `${underlying}: TRADE EXECUTED from alert trigger`);
+      } else {
+        this._log('alert_trigger', `${underlying}: execution failed — ${result.reason}`);
+      }
+    } catch (err) {
+      this._log('error', `Alert trigger error for ${underlying}: ${err.message}`);
+    }
+  }
+
   // ── Manual Trade ──────────────────────────────────────────────────
 
   /**

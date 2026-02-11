@@ -30,6 +30,7 @@ const mood = require('./mood');
 const { buildFast0DTEPrompt } = require('../trading/fast-0dte-prompt');
 const { ragEnforcementBlock, todayString } = require('../date-awareness');
 const log = require('../logger')('SPYAlerts');
+const optionsEngine = require('./options-engine');
 
 // AInvest — fundamentals, analyst ratings, earnings (optional)
 let ainvest;
@@ -849,6 +850,13 @@ async function handleWebhookAlert(message) {
   const alert = parseAlert(message.content);
   log.info(`Alert received: ${alert.action} ${alert.type} @ $${alert.price || 'N/A'}`);
 
+  // ── Trigger 0DTE options engine (fire-and-forget) ──
+  if (alert.action === 'BUY' || alert.action === 'SELL') {
+    optionsEngine.triggerFromAlert(alert).catch(err => {
+      log.warn(`Options engine trigger failed: ${err.message}`);
+    });
+  }
+
   // ── Step 1: Instant ack (<1s) ──
   let ackMessage;
   try {
@@ -976,6 +984,15 @@ async function handleHttpAlert(channel, body) {
   const alert = parseAlert(body);
   log.info(`HTTP alert received: ${alert.action} ${alert.ticker} @ $${alert.price || 'N/A'} [${alert.interval || 'no tf'}] [${alert.confidence || 'no conf'}]`);
   log.info(`Signal text: ${alert.reason}`);
+
+  // ── Trigger 0DTE options engine (fire-and-forget) ──
+  // Even partial signals ("BULLISH", "PUMP INCOMING") act as directional hints.
+  // The options engine runs its own full analysis (GEX + technicals + AI).
+  if (alert.action === 'BUY' || alert.action === 'SELL') {
+    optionsEngine.triggerFromAlert(alert).catch(err => {
+      log.warn(`Options engine trigger failed: ${err.message}`);
+    });
+  }
 
   // ── Step 1: Fetch data + AI analysis (before posting anything) ──
   let analysis, chartUrl, priceData;
