@@ -141,20 +141,42 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('gex')
-    .setDescription('Gamma Exposure (GEX) analysis — options gamma by strike with chart')
-    .addStringOption(opt =>
-      opt.setName('ticker')
-        .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY, QQQ)')
-        .setRequired(true)
+    .setDescription('Gamma Exposure (GEX) analysis — single chart, multi-expiry summary, or alerts')
+    .addSubcommand(sub =>
+      sub.setName('chart')
+        .setDescription('Single-expiry GEX chart with per-strike bars')
+        .addStringOption(opt =>
+          opt.setName('ticker')
+            .setDescription('Stock symbol (e.g. AAPL, TSLA, SPY, QQQ)')
+            .setRequired(true)
+        )
+        .addStringOption(opt =>
+          opt.setName('expiration')
+            .setDescription('Expiration to analyze (default: 0DTE)')
+            .setRequired(false)
+            .addChoices(
+              { name: '0DTE (today)', value: '0dte' },
+              { name: 'Weekly (this Friday)', value: 'weekly' },
+              { name: 'Monthly OPEX (3rd Friday)', value: 'monthly' },
+            )
+        )
     )
-    .addStringOption(opt =>
-      opt.setName('expiration')
-        .setDescription('Expiration to analyze (default: 0DTE)')
-        .setRequired(false)
-        .addChoices(
-          { name: '0DTE (today)', value: '0dte' },
-          { name: 'Weekly (this Friday)', value: 'weekly' },
-          { name: 'Monthly OPEX (3rd Friday)', value: 'monthly' },
+    .addSubcommand(sub =>
+      sub.setName('summary')
+        .setDescription('Multi-expiry aggregated GEX — regime, stacked walls, playbook')
+        .addStringOption(opt =>
+          opt.setName('ticker')
+            .setDescription('Stock symbol (e.g. SPY, QQQ, AAPL)')
+            .setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
+      sub.setName('alerts')
+        .setDescription('Check break-and-hold conditions on GEX levels')
+        .addStringOption(opt =>
+          opt.setName('ticker')
+            .setDescription('Stock symbol (e.g. SPY, QQQ)')
+            .setRequired(true)
         )
     ),
 

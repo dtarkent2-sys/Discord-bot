@@ -442,6 +442,208 @@ class GammaService {
     return { strikes, gex, totalGEX, maxGEX, minGEX };
   }
 
+  // ── Detailed GEX (canonical per-strike breakdown) ─────────────────────
+
+  /**
+   * Calculate detailed per-strike Gamma Exposure with call/put breakdown.
+   *
+   * Returns canonical strike data for the multi-expiry engine:
+   *   GEX$ (dealer perspective) = OI × BS_gamma × 100 × spot
+   *   - callGEX$ is positive (dealers short calls → long gamma)
+   *   - putGEX$ is negative (dealers short puts → short gamma)
+   *   - netGEX$ = callGEX$ + putGEX$
+   *
+   * @param {Array} chain - unified options array from fetchOptionsChain
+   * @param {number} spotPrice - current underlying price
+   * @returns {{ strikes: Array<{strike,callOI,putOI,callGamma,putGamma,callGEX$,putGEX$,netGEX$}>, totalNetGEX$: number }}
+   */
+  calculateDetailedGEX(chain, spotPrice) {
+    const now = Date.now();
+    const strikeMap = new Map(); // strike → { callOI, putOI, callGamma, putGamma, callGEX$, putGEX$ }
+
+    for (const opt of chain) {
+      const strike = opt.strike;
+      const oi = opt.openInterest || 0;
+      const iv = opt.impliedVolatility || 0;
+      const type = opt.type;
+
+      if (!strike || oi === 0 || iv === 0) continue;
+
+      const expMs = opt.expirationEpoch
+        ? opt.expirationEpoch * 1000
+        : new Date(opt.expiration).getTime();
+      const T = Math.max((expMs - now) / (365.25 * 86400000), 1 / 365);
+      const gamma = this._bsGamma(spotPrice, strike, iv, T);
+      const gexDollar = oi * gamma * 100 * spotPrice;
+
+      const entry = strikeMap.get(strike) || {
+        callOI: 0, putOI: 0, callGamma: 0, putGamma: 0, 'callGEX$': 0, 'putGEX$': 0,
+      };
+
+      if (type === 'call') {
+        entry.callOI += oi;
+        entry.callGamma = gamma; // last-seen gamma (one call per strike per expiry)
+        entry['callGEX$'] += gexDollar;
+      } else if (type === 'put') {
+        entry.putOI += oi;
+        entry.putGamma = gamma;
+        entry['putGEX$'] -= gexDollar; // negative for dealer short puts
+      }
+
+      strikeMap.set(strike, entry);
+    }
+
+    const lo = spotPrice * 0.85;
+    const hi = spotPrice * 1.15;
+
+    const strikes = [...strikeMap.entries()]
+      .filter(([k]) => k >= lo && k <= hi)
+      .sort((a, b) => a[0] - b[0])
+      .map(([strike, data]) => ({
+        strike,
+        callOI: data.callOI,
+        putOI: data.putOI,
+        callGamma: data.callGamma,
+        putGamma: data.putGamma,
+        'callGEX$': data['callGEX$'],
+        'putGEX$': data['putGEX$'],
+        'netGEX$': data['callGEX$'] + data['putGEX$'],
+      }));
+
+    const totalNetGEX = strikes.reduce((sum, s) => sum + s['netGEX$'], 0);
+
+    return { strikes, 'totalNetGEX$': totalNetGEX };
+  }
+
+  /**
+   * Detailed GEX using Alpaca pre-calculated greeks.
+   * Same canonical output as calculateDetailedGEX but uses Alpaca gamma directly.
+   */
+  calculateDetailedGEXFromAlpaca(options, spotPrice, expiration) {
+    const strikeMap = new Map();
+
+    for (const opt of options) {
+      if (expiration && opt.expiration !== expiration) continue;
+
+      const strike = opt.strike;
+      const oi = opt.openInterest || 0;
+      const gamma = opt.gamma || 0;
+      const type = opt.type;
+
+      if (!strike || oi === 0 || gamma === 0) continue;
+
+      const gexDollar = oi * gamma * 100 * spotPrice;
+      const entry = strikeMap.get(strike) || {
+        callOI: 0, putOI: 0, callGamma: 0, putGamma: 0, 'callGEX$': 0, 'putGEX$': 0,
+      };
+
+      if (type === 'call') {
+        entry.callOI += oi;
+        entry.callGamma = gamma;
+        entry['callGEX$'] += gexDollar;
+      } else if (type === 'put') {
+        entry.putOI += oi;
+        entry.putGamma = gamma;
+        entry['putGEX$'] -= gexDollar;
+      }
+
+      strikeMap.set(strike, entry);
+    }
+
+    const lo = spotPrice * 0.85;
+    const hi = spotPrice * 1.15;
+
+    const strikes = [...strikeMap.entries()]
+      .filter(([k]) => k >= lo && k <= hi)
+      .sort((a, b) => a[0] - b[0])
+      .map(([strike, data]) => ({
+        strike,
+        callOI: data.callOI,
+        putOI: data.putOI,
+        callGamma: data.callGamma,
+        putGamma: data.putGamma,
+        'callGEX$': data['callGEX$'],
+        'putGEX$': data['putGEX$'],
+        'netGEX$': data['callGEX$'] + data['putGEX$'],
+      }));
+
+    const totalNetGEX = strikes.reduce((sum, s) => sum + s['netGEX$'], 0);
+    return { strikes, 'totalNetGEX$': totalNetGEX };
+  }
+
+  // ── Multi-expiry fetch ────────────────────────────────────────────────
+
+  /**
+   * Fetch available expirations for a ticker from Yahoo Finance.
+   * Returns sorted array of { epoch, date } objects.
+   */
+  async fetchAvailableExpirations(ticker) {
+    const upper = ticker.toUpperCase();
+    const initial = await this._yahooFetch(upper);
+    const epochs = initial.expirationDates || [];
+    return epochs.map(e => ({
+      epoch: e,
+      date: new Date(e * 1000).toISOString().slice(0, 10),
+    }));
+  }
+
+  /**
+   * Analyze a ticker across multiple expirations.
+   * Returns canonical structure used by gex-engine for aggregation.
+   *
+   * @param {string} ticker
+   * @param {string[]} expiryPrefs - e.g. ['0dte', 'weekly', 'monthly'] or explicit dates
+   * @returns {{ ticker, spotPrice, expirations: Array<{expiry, detailedGEX, gexData, flip}>, source }}
+   */
+  async analyzeMultiExpiry(ticker, expiryPrefs = ['0dte', 'weekly', 'monthly']) {
+    const upper = ticker.toUpperCase();
+    const results = [];
+    let spotPrice = null;
+    let source = 'Yahoo';
+
+    for (const pref of expiryPrefs) {
+      try {
+        const result = await this.analyze(upper, pref);
+        if (!spotPrice) spotPrice = result.spotPrice;
+        source = result.source;
+
+        // Now compute detailed GEX for this expiry
+        let detailedGEX;
+        if (result.source === 'Alpaca') {
+          // Re-fetch Alpaca data for detailed breakdown
+          const targetExp = this._computeTargetDate(pref);
+          const [options] = await Promise.all([
+            alpaca.getOptionsSnapshots(upper, targetExp),
+          ]);
+          const expiration = this._pickAlpacaExpiration(options, pref) || targetExp;
+          detailedGEX = this.calculateDetailedGEXFromAlpaca(options, spotPrice, expiration);
+        } else {
+          // Re-fetch Yahoo chain for detailed breakdown
+          const { chain } = await this.fetchOptionsChain(upper, pref);
+          detailedGEX = this.calculateDetailedGEX(chain, spotPrice);
+        }
+
+        results.push({
+          expiry: result.expiration,
+          detailedGEX,
+          gexData: result.gexData,
+          flip: result.flip,
+          chartBuffer: result.chartBuffer,
+        });
+      } catch (err) {
+        console.warn(`[Gamma] Multi-expiry: failed ${pref} for ${upper}: ${err.message}`);
+      }
+    }
+
+    if (results.length === 0) {
+      throw new Error(`No options data available for ${upper} across requested expirations`);
+    }
+
+    if (!spotPrice) throw new Error(`Could not determine spot price for ${upper}`);
+
+    return { ticker: upper, spotPrice, expirations: results, source };
+  }
+
   // ── Gamma flip detection ─────────────────────────────────────────────
 
   /**

@@ -9,6 +9,8 @@ const alpaca = require('../services/alpaca');
 const tradingAgents = require('../services/trading-agents');
 const agentSwarm = require('../services/agent-swarm');
 const gamma = require('../services/gamma');
+const GEXEngine = require('../services/gex-engine');
+const GEXAlertService = require('../services/gex-alerts');
 const technicals = require('../services/technicals');
 const stocktwits = require('../services/stocktwits');
 const mahoraga = require('../services/mahoraga');
@@ -671,10 +673,43 @@ async function handleResearch(interaction) {
   }
 }
 
-// ── /gex — Gamma Exposure analysis with chart ─────────────────────────
+// ── /gex — Gamma Exposure analysis (chart, summary, alerts) ───────────
+
+// Shared engine instances (lazy-initialized)
+let _gexEngine = null;
+let _gexAlerts = null;
+
+function _getGEXEngine() {
+  if (!_gexEngine) _gexEngine = new GEXEngine(gamma);
+  return _gexEngine;
+}
+
+function _getGEXAlerts() {
+  if (!_gexAlerts) _gexAlerts = new GEXAlertService();
+  return _gexAlerts;
+}
+
 async function handleGEX(interaction) {
   await interaction.deferReply();
 
+  const sub = interaction.options.getSubcommand();
+
+  switch (sub) {
+    case 'chart':
+      return handleGEXChart(interaction);
+    case 'summary':
+      return handleGEXSummary(interaction);
+    case 'alerts':
+      return handleGEXAlerts(interaction);
+    default:
+      return handleGEXChart(interaction);
+  }
+}
+
+/**
+ * /gex chart — Original single-expiry GEX chart (backward compatible)
+ */
+async function handleGEXChart(interaction) {
   const rawTicker = interaction.options.getString('ticker');
   const ticker = yahoo.sanitizeTicker(rawTicker);
   const expirationPref = interaction.options.getString('expiration') || '0dte';
@@ -691,11 +726,8 @@ async function handleGEX(interaction) {
     await interaction.editReply(`**${ticker} — Gamma Exposure (${expLabel})**\n⏳ Fetching options chain & calculating GEX...`);
 
     const result = await gamma.analyze(ticker, expirationPref);
-
-    // Build the text summary
     const summary = gamma.formatForDiscord(result);
 
-    // Attach the chart image if available
     if (result.chartBuffer) {
       const attachment = new AttachmentBuilder(result.chartBuffer, { name: `${ticker}-gex.png` });
       await interaction.editReply({
@@ -705,13 +737,112 @@ async function handleGEX(interaction) {
     } else {
       await interaction.editReply(summary + '\n\n_Chart unavailable — canvas module not loaded._');
     }
-
-    // Unusual Whales enrichment — service not yet implemented
-    // TODO: add uw (unusual-whales) service and re-enable
   } catch (err) {
     console.error(`[GEX] Error for ${ticker}:`, err);
-    const msg = err.message || 'Unknown error';
-    await interaction.editReply(`**${ticker} — Gamma Exposure**\n❌ ${msg}`);
+    await interaction.editReply(`**${ticker} — Gamma Exposure**\n❌ ${err.message || 'Unknown error'}`);
+  }
+}
+
+/**
+ * /gex summary — Multi-expiry aggregated GEX analysis
+ */
+async function handleGEXSummary(interaction) {
+  const rawTicker = interaction.options.getString('ticker');
+  const ticker = yahoo.sanitizeTicker(rawTicker);
+  if (!ticker) {
+    return interaction.editReply('Invalid ticker symbol. Use 1-12 alphanumeric characters (e.g. SPY, AAPL).');
+  }
+
+  if (!gamma.enabled) {
+    return interaction.editReply('GEX analysis is currently unavailable.');
+  }
+
+  try {
+    await interaction.editReply(`**${ticker} — Multi-Expiry GEX**\n⏳ Fetching 0DTE + weekly + monthly options data...`);
+
+    const engine = _getGEXEngine();
+    const result = await engine.analyze(ticker);
+    const summary = engine.formatSummaryForDiscord(result);
+
+    if (result.chartBuffer) {
+      const attachment = new AttachmentBuilder(result.chartBuffer, { name: `${ticker}-gex-summary.png` });
+      await interaction.editReply({
+        content: summary,
+        files: [attachment],
+      });
+    } else {
+      await interaction.editReply(summary);
+    }
+  } catch (err) {
+    console.error(`[GEX Summary] Error for ${ticker}:`, err);
+    await interaction.editReply(`**${ticker} — GEX Summary**\n❌ ${err.message || 'Unknown error'}`);
+  }
+}
+
+/**
+ * /gex alerts — Check break-and-hold conditions on GEX levels
+ */
+async function handleGEXAlerts(interaction) {
+  const rawTicker = interaction.options.getString('ticker');
+  const ticker = yahoo.sanitizeTicker(rawTicker);
+  if (!ticker) {
+    return interaction.editReply('Invalid ticker symbol. Use 1-12 alphanumeric characters (e.g. SPY, AAPL).');
+  }
+
+  if (!gamma.enabled) {
+    return interaction.editReply('GEX analysis is currently unavailable.');
+  }
+
+  try {
+    await interaction.editReply(`**${ticker} — GEX Alert Check**\n⏳ Analyzing levels and recent price action...`);
+
+    const engine = _getGEXEngine();
+    const alertSvc = _getGEXAlerts();
+
+    // Get GEX summary
+    const gexSummary = await engine.analyze(ticker);
+
+    // Fetch recent candles for break-and-hold evaluation
+    let candles = [];
+    try {
+      const bars = await alpaca.getHistory(ticker, {
+        timeframe: alertSvc.candleInterval,
+        limit: 20,
+      });
+      candles = (bars || []).map(b => ({
+        close: b.ClosePrice || b.close || b.c,
+        volume: b.Volume || b.volume || b.v,
+      }));
+    } catch (err) {
+      console.warn(`[GEX Alerts] Could not fetch candles for ${ticker}: ${err.message}`);
+    }
+
+    // Evaluate alerts
+    const alerts = alertSvc.evaluate(ticker, candles, gexSummary);
+
+    if (alerts.length > 0) {
+      const lines = alerts.map(a => a.message);
+      await interaction.editReply(lines.join('\n\n'));
+    } else {
+      const walls = gexSummary.walls;
+      const callLvl = walls.callWalls[0] ? `$${walls.callWalls[0].strike}` : '—';
+      const putLvl = walls.putWalls[0] ? `$${walls.putWalls[0].strike}` : '—';
+      const flipLvl = gexSummary.gammaFlip ? `$${gexSummary.gammaFlip}` : '—';
+
+      await interaction.editReply([
+        `**${ticker} — GEX Alert Check**`,
+        `No break-and-hold conditions triggered.`,
+        ``,
+        `Monitoring: Call wall ${callLvl} | Put wall ${putLvl} | Flip ${flipLvl}`,
+        `Criteria: ${alertSvc.holdCandles} consecutive ${alertSvc.candleInterval} closes`,
+        `Regime: ${gexSummary.regime.label} (${(gexSummary.regime.confidence * 100).toFixed(0)}%)`,
+        ``,
+        `_Alerts fire automatically when criteria are met (autonomous monitor)._`,
+      ].join('\n'));
+    }
+  } catch (err) {
+    console.error(`[GEX Alerts] Error for ${ticker}:`, err);
+    await interaction.editReply(`**${ticker} — GEX Alerts**\n❌ ${err.message || 'Unknown error'}`);
   }
 }
 

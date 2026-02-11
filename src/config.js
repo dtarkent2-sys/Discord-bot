@@ -68,4 +68,11 @@ module.exports = {
   valideaEmail: process.env.VALIDEA_EMAIL || '',
   valideaPassword: process.env.VALIDEA_PASSWORD || '',
   valideaCookie: process.env.VALIDEA_COOKIE || '', // Manual override: paste session cookie if auto-login blocked
+
+  // GEX Engine — multi-expiry gamma exposure analysis
+  gexIncludeExpiries: (process.env.GEX_INCLUDE_EXPIRIES || '0dte,weekly,monthly').split(',').map(s => s.trim()),
+  gexHoldCandles: parseInt(process.env.GEX_HOLD_CANDLES, 10) || 3,
+  gexCandleInterval: process.env.GEX_CANDLE_INTERVAL || '5Min',
+  gexMinRegimeConfidence: parseFloat(process.env.GEX_MIN_REGIME_CONFIDENCE) || 0.4,
+  gexMinAbsGex: parseFloat(process.env.GEX_MIN_ABS_GEX) || 1e6, // $1M minimum to consider dominant
 };
