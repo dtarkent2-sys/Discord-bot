@@ -126,40 +126,68 @@ class KalshiService {
   // ── Search / Discovery ─────────────────────────────────────────────
 
   /**
+   * Fetch events with nested markets, tagging each market with its event's category.
+   * Uses the /events endpoint which has an authoritative `category` field
+   * (e.g. "Sports", "Economics", "Politics") — far more reliable than
+   * guessing from ticker strings.
+   *
+   * @param {number} pages - Number of pages to fetch
+   * @param {object} opts
+   * @param {boolean} opts.excludeSports - Skip sports/esports events entirely
+   * @returns {Array} Markets enriched with _category and _eventTitle
+   */
+  async _fetchEventBatch(pages = 3, { excludeSports = false } = {}) {
+    const allMarkets = [];
+    let cursor = null;
+
+    for (let page = 0; page < pages; page++) {
+      const params = { limit: 200, with_nested_markets: true };
+      if (cursor) params.cursor = cursor;
+
+      const result = await this._fetch('/events', params);
+      const events = result.events || [];
+
+      for (const event of events) {
+        const category = (event.category || '').toLowerCase();
+
+        // Skip sports entirely if requested
+        if (excludeSports && (category === 'sports' || category === 'esports')) continue;
+
+        for (const m of (event.markets || [])) {
+          m._category = category;
+          m._eventTitle = event.title || '';
+          allMarkets.push(m);
+        }
+      }
+
+      cursor = result.cursor;
+      if (!cursor || events.length === 0) break;
+    }
+
+    return allMarkets;
+  }
+
+  /**
    * Detect if a market is a sports/game betting market.
-   * Sports dominate Kalshi by volume and drown out everything else.
+   * Primarily uses the _category tag set by _fetchEventBatch (authoritative).
+   * Falls back to ticker/title pattern matching for markets from other sources.
    */
   _isSportsMarket(m) {
-    const ticker = (m.event_ticker || m.ticker || '').toUpperCase();
-    const title = (m.title || '').toLowerCase();
-
-    // Common sports series/event ticker prefixes on Kalshi
-    const sportsTickers = [
-      'NBA', 'NFL', 'MLB', 'NHL', 'MLS', 'WNBA', 'NCAAB', 'NCAAF', 'NCAAM',
-      'UFC', 'PGA', 'LIV', 'LPGA', 'ATP', 'WTA', 'F1-', 'NASCAR',
-      'EPL', 'LALIGA', 'SOCCER', 'FIFAWC', 'CHAMP',
-      'CRICKET', 'IPL', 'T20', 'CFL', 'XFL', 'CFB',
-      'BOWL', 'MARCH', 'PLAYOFF', 'FINALS', 'SERIES-',
-      'KXNBA', 'KXNFL', 'KXMLB', 'KXNHL',
-    ];
-
-    if (sportsTickers.some(s => ticker.includes(s))) return true;
-
-    // Title-based detection for edge cases
-    const sportsTerms = [
-      'touchdown', 'home run', 'three-pointer', 'quarterback', 'pitcher',
-      'assists', 'rebounds', 'strikeout', 'rushing yard', 'passing yard',
-      'field goal', 'free throw', 'penalty kick', 'hat trick',
-      'over/under', 'spread', 'moneyline',
-      ' vs ', // "Team A vs Team B" pattern
-    ];
-    if (sportsTerms.some(t => title.includes(t))) return true;
-
-    // Category field if available
-    const cat = (m.category || '').toLowerCase();
+    // Primary: use the event category tag (set by _fetchEventBatch)
+    const cat = (m._category || m.category || '').toLowerCase();
     if (cat === 'sports' || cat === 'esports') return true;
+    // If we have a known non-sports category, trust it
+    if (cat && cat !== 'sports' && cat !== 'esports') return false;
 
-    return false;
+    // Fallback: ticker pattern matching for untagged markets (e.g., from /markets endpoint)
+    const ticker = (m.event_ticker || m.ticker || '').toUpperCase();
+    const sportsTickerParts = [
+      'NBA', 'NFL', 'MLB', 'NHL', 'MLS', 'WNBA', 'NCAAB', 'NCAAF', 'NCAAM',
+      'UFC', 'PGA', 'LIV', 'LPGA', 'ATP', 'WTA', 'NASCAR',
+      'EPL', 'LALIGA', 'SOCCER', 'FIFAWC',
+      'CRICKET', 'IPL', 'CFL', 'XFL', 'CFB',
+    ];
+    return sportsTickerParts.some(s => ticker.includes(s));
   }
 
   /**
@@ -179,29 +207,6 @@ class KalshiService {
   }
 
   /**
-   * Fetch a large batch of markets for client-side search.
-   * No status filter — the API returns active/live markets by default.
-   */
-  async _fetchMarketBatch(pages = 3) {
-    const allMarkets = [];
-    let cursor = null;
-
-    for (let page = 0; page < pages; page++) {
-      const params = { limit: 1000 };
-      if (cursor) params.cursor = cursor;
-
-      const result = await this._fetch('/markets', params);
-      const markets = result.markets || [];
-      allMarkets.push(...markets);
-
-      cursor = result.cursor;
-      if (!cursor || markets.length === 0) break;
-    }
-
-    return allMarkets;
-  }
-
-  /**
    * Search for markets by keyword. Kalshi doesn't have a text search endpoint,
    * so we fetch markets and filter client-side across all text fields.
    * Supports multi-word queries (all words must match).
@@ -215,8 +220,10 @@ class KalshiService {
 
     const allMatches = new Map(); // ticker → market (dedupe across strategies)
 
-    // ── Strategy 1: Fetch market batch and filter (primary, fast) ──
-    const allMarkets = await this._fetchMarketBatch(3);
+    // ── Strategy 1: Fetch events with nested markets (has category data) ──
+    // Uses /events endpoint which tags each market with its event category,
+    // so we can reliably distinguish sports from non-sports.
+    const allMarkets = await this._fetchEventBatch(3);
 
     for (const m of allMarkets) {
       const text = this._marketSearchText(m);
@@ -225,36 +232,7 @@ class KalshiService {
       }
     }
 
-    // ── Strategy 2: Search events with nested markets (catches categorized markets) ──
-    if (allMatches.size < limit) {
-      try {
-        let cursor = null;
-        for (let page = 0; page < 3; page++) {
-          const params = { limit: 100, with_nested_markets: true };
-          if (cursor) params.cursor = cursor;
-
-          const result = await this._fetch('/events', params);
-          const events = result.events || [];
-
-          for (const event of events) {
-            const eventText = `${event.title || ''} ${event.sub_title || ''} ${event.category || ''} ${event.event_ticker || ''}`.toLowerCase();
-            if (words.every(w => eventText.includes(w))) {
-              for (const m of (event.markets || [])) {
-                allMatches.set(m.ticker, m);
-              }
-            }
-          }
-
-          cursor = result.cursor;
-          if (!cursor || events.length === 0) break;
-          if (allMatches.size >= limit * 3) break;
-        }
-      } catch (err) {
-        log.warn(`Event search failed: ${err.message}`);
-      }
-    }
-
-    // ── Strategy 3: Known series tickers for common queries ──
+    // ── Strategy 2: Known series tickers for common queries ──
     if (allMatches.size < limit) {
       const seriesMap = {
         bitcoin: ['KXBTC', 'KXBTCRESERVESTATES', 'KXELSALVADORBTC', 'KXTEXASBTC'],
@@ -305,37 +283,17 @@ class KalshiService {
 
   /**
    * Get trending/hot markets — most 24h volume, diversified across categories.
-   * Sports markets dominate Kalshi by volume (10-100x other categories),
-   * so we cap sports at ~20% of results to show a diverse set.
+   * Uses the events endpoint (has authoritative category field) and excludes
+   * sports, which dominate Kalshi by 10-100x volume and drown out everything.
    */
   async getTrendingMarkets(limit = 15) {
-    const allMarkets = await this._fetchMarketBatch(2);
+    // Fetch non-sports markets via events endpoint (authoritative category)
+    const nonSports = await this._fetchEventBatch(3, { excludeSports: true });
 
     // Sort by 24h volume
-    allMarkets.sort((a, b) => (b.volume_24h || 0) - (a.volume_24h || 0) || (b.volume || 0) - (a.volume || 0));
+    nonSports.sort((a, b) => (b.volume_24h || 0) - (a.volume_24h || 0) || (b.volume || 0) - (a.volume || 0));
 
-    // Split into sports vs non-sports
-    const sports = [];
-    const nonSports = [];
-    for (const m of allMarkets) {
-      if (this._isSportsMarket(m)) {
-        sports.push(m);
-      } else {
-        nonSports.push(m);
-      }
-    }
-
-    // Cap sports at ~20% of results, fill rest with non-sports
-    const maxSports = Math.max(2, Math.floor(limit * 0.2));
-    const result = [
-      ...nonSports.slice(0, limit - maxSports),
-      ...sports.slice(0, maxSports),
-    ];
-
-    // Re-sort the mixed result by volume so it still feels natural
-    result.sort((a, b) => (b.volume_24h || 0) - (a.volume_24h || 0) || (b.volume || 0) - (a.volume || 0));
-
-    return result.slice(0, limit);
+    return nonSports.slice(0, limit);
   }
 
   /**
@@ -356,12 +314,10 @@ class KalshiService {
     const keywords = categoryMap[category.toLowerCase()] || [category.toLowerCase()];
 
     const isSportsCategory = category.toLowerCase() === 'sports';
-    const allMarkets = await this._fetchMarketBatch(3);
+    // Use event-based fetch — excludes sports automatically for non-sports categories
+    const allMarkets = await this._fetchEventBatch(3, { excludeSports: !isSportsCategory });
 
     const matches = allMarkets.filter(m => {
-      // Exclude sports from non-sports categories (sports bleeds into everything via volume)
-      if (!isSportsCategory && this._isSportsMarket(m)) return false;
-
       const text = this._marketSearchText(m);
       return keywords.some(kw => text.includes(kw));
     });
