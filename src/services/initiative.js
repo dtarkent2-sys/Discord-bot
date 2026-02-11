@@ -27,6 +27,7 @@ const alpaca = require('./alpaca');
 const macro = require('./macro');
 const ai = require('./ai');
 const gammaSqueeze = require('./gamma-squeeze');
+const selfAwareness = require('./self-awareness');
 const config = require('../config');
 
 // How often the brain ticks (ms)
@@ -643,7 +644,8 @@ class InitiativeEngine {
     // Ask AI for a brief reflection
     try {
       const prompt = [
-        `You are an autonomous trading bot reviewing your day. Write a 2-3 sentence honest self-reflection.`,
+        selfAwareness.buildCompactSelfKnowledge(),
+        `You are reviewing your own day as an autonomous trading bot. Write a 2-3 sentence honest self-reflection.`,
         `Today's stats: ${trades.length} trades, ${skips.length} skips, ${errors.length} errors.`,
         `Circuit breaker trips: ${cbStatus.totalTrips}. Consecutive bad trades: ${cbStatus.consecutiveBadTrades}.`,
         `Recent trade log: ${trades.slice(-5).map(t => t.message).join(' | ')}`,

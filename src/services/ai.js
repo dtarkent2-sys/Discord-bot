@@ -7,6 +7,7 @@ const { webSearch, formatResultsForAI } = require('../tools/web-search');
 const auditLog = require('./audit-log');
 const { todayString, nowEST, ragEnforcementBlock, MODEL_CUTOFF, userMessageDateAnchor, detectHallucinations, buildHallucinationWarning } = require('../date-awareness');
 const priceFetcher = require('../tools/price-fetcher');
+const selfAwareness = require('./self-awareness');
 
 class AIService {
   constructor() {
@@ -174,6 +175,8 @@ ${livePrices ? `\nLIVE PRICES (real-time via Yahoo Finance, fetched just now):\n
 ${liveData ? `\nLIVE MARKET DATA (current as of ${now}):\n${liveData}\n` : ''}
 ${searchResults ? `\nWEB SEARCH RESULTS (fetched ${now} — use as source of truth):\n${searchResults}\n` : ''}
 ${mood.buildMoodContext()}
+
+${selfAwareness.buildSelfKnowledge()}
 `.trim();
   }
 
@@ -561,7 +564,7 @@ ${mood.buildMoodContext()}
     // autonomous posts, commentary, and other non-chat paths
     const systemMsg = {
       role: 'system',
-      content: `${ragEnforcementBlock()}\n\nYou are analyzing data provided in the user prompt. All prices, metrics, and market conditions in the prompt are current as of today (${todayString()}). Use ONLY the data given. Do NOT fill in gaps from training memory for any post-${MODEL_CUTOFF} facts.`,
+      content: `${ragEnforcementBlock()}\n\n${selfAwareness.buildCompactSelfKnowledge()}\n\nYou are analyzing data provided in the user prompt. All prices, metrics, and market conditions in the prompt are current as of today (${todayString()}). Use ONLY the data given. Do NOT fill in gaps from training memory for any post-${MODEL_CUTOFF} facts.`,
     };
 
     // Try Kimi agent mode first if enabled
