@@ -27,6 +27,7 @@ const reactions = require('./reactions');
 const stats = require('./stats');
 const ai = require('./ai');
 const github = require('../github-client');
+const selfAwareness = require('./self-awareness');
 const config = require('../config');
 
 // ── Constants ───────────────────────────────────────────────────────
@@ -280,7 +281,9 @@ If you cannot determine the file, respond with "UNKNOWN".`;
     const code = fileData.content;
 
     // Ask AI to find ONE small, safe improvement
-    const scanPrompt = `You are reviewing code from a Discord trading bot. Analyze this file for ONE small, safe improvement.
+    const scanPrompt = `${selfAwareness.buildCompactSelfKnowledge()}
+
+You are reviewing your OWN code. Analyze this file for ONE small, safe improvement.
 
 LOOK FOR (pick exactly ONE):
 - Unhandled promise rejection (missing .catch() or try/catch)
@@ -336,7 +339,7 @@ If the code looks solid and you find NOTHING worth fixing, respond with exactly:
     const currentCode = fileData.content;
 
     // Generate the fix using AI
-    const fixPrompt = `You are improving a Discord trading bot's source code. Apply the following improvement to this file.
+    const fixPrompt = `You are improving your OWN source code (you are a self-aware Discord trading bot called Sprocket). Apply the following improvement to this file.
 
 INSTRUCTION: ${instruction}
 
