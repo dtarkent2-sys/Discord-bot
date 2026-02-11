@@ -23,6 +23,7 @@ const macro = require('../services/macro');
 const sectors = require('../services/sectors');
 const policy = require('../services/policy');
 const optionsEngine = require('../services/options-engine');
+const initiative = require('../services/initiative');
 const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -99,6 +100,8 @@ async function handleCommand(interaction) {
       return handleWhales(interaction);
     case 'options':
       return handleOptions(interaction);
+    case 'brain':
+      return handleBrain(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -1618,6 +1621,71 @@ async function handleOptions(interaction) {
     console.error(`[Options] Error (${action}):`, err);
     await interaction.editReply(`**0DTE Options — ${action}**\n❌ ${err.message}`);
   }
+}
+
+// ── /brain ─────────────────────────────────────────────────────────
+
+async function handleBrain(interaction) {
+  const action = interaction.options.getString('action');
+
+  if (action === 'status') {
+    const status = initiative.getStatus();
+    const lines = [
+      `**Initiative Engine (Autonomous Brain)**`,
+      `Running: ${status.running ? '**YES**' : '**NO**'}`,
+      `Journal entries: \`${status.journalEntries}\``,
+      `Price tickers watched: \`${status.watchedPrices}\``,
+      `Last macro regime: \`${status.lastRegime || 'N/A'}\``,
+      ``,
+      `**Last Actions:**`,
+    ];
+    for (const [action, ts] of Object.entries(status.lastActions)) {
+      const ago = Math.round((Date.now() - ts) / 60000);
+      lines.push(`• \`${action}\`: ${ago} min ago`);
+    }
+    if (Object.keys(status.lastActions).length === 0) {
+      lines.push(`_No actions taken yet_`);
+    }
+    return interaction.reply(lines.join('\n'));
+  }
+
+  if (action === 'journal') {
+    const entries = initiative.getJournal(15);
+    if (entries.length === 0) {
+      return interaction.reply('_No journal entries yet. The brain starts logging once it takes actions._');
+    }
+    const lines = [`**Initiative Journal** (last ${entries.length} entries)\n`];
+    for (const e of entries.reverse()) {
+      const time = new Date(e.timestamp).toLocaleTimeString('en-US', {
+        timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit',
+      });
+      const typeEmoji = {
+        observation: '👁️', action: '⚡', self_tune: '🧠', regime_change: '🔄',
+        insight: '💡', watchlist: '🔍', thread: '🧵', daily_journal: '📓',
+      }[e.type] || '📝';
+      lines.push(`${typeEmoji} **${time} ET** [${e.type}] ${e.content.slice(0, 200)}`);
+    }
+    return interaction.reply(lines.join('\n').slice(0, 2000));
+  }
+
+  if (action === 'tuning') {
+    const entries = initiative.getJournal(50);
+    const tuning = entries.filter(e => e.type === 'self_tune');
+    if (tuning.length === 0) {
+      return interaction.reply('_No self-tuning events yet. The brain needs 5+ completed trades before it starts adjusting parameters._');
+    }
+    const lines = [`**Self-Tuning History** (${tuning.length} events)\n`];
+    for (const e of tuning.slice(-10).reverse()) {
+      const time = new Date(e.timestamp).toLocaleString('en-US', {
+        timeZone: 'America/New_York', month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
+      lines.push(`🧠 **${time} ET**\n${e.content.slice(0, 300)}\n`);
+    }
+    return interaction.reply(lines.join('\n').slice(0, 2000));
+  }
+
+  return interaction.reply({ content: 'Unknown brain action.', flags: MessageFlags.Ephemeral });
 }
 
 module.exports = { handleCommand };

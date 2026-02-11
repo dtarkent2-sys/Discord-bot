@@ -27,6 +27,7 @@ const GEXEngine = require('./gex-engine');
 const GEXAlertService = require('./gex-alerts');
 const mahoraga = require('./mahoraga');
 const policy = require('./policy');
+const initiative = require('./initiative');
 const config = require('../config');
 const auditLog = require('./audit-log');
 const circuitBreaker = require('./circuit-breaker');
@@ -205,6 +206,13 @@ class AutonomousBehaviorEngine {
     }, scanMinutes * 60 * 1000);
     console.log(`[Sprocket] SHARK trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
 
+    // 7. INITIATIVE ENGINE — autonomous brain (fast loop, self-tuning, proactive)
+    initiative.init(this.client, (content) => this.postToChannel(config.tradingChannelName, content));
+    initiative.start();
+    // Create journal channel in background (non-blocking)
+    initiative.ensureJournalChannel().catch(() => {});
+    console.log(`[Sprocket] Initiative engine active — autonomous brain running`);
+
     console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
   }
 
@@ -217,6 +225,7 @@ class AutonomousBehaviorEngine {
       clearInterval(this._mahoragaInterval);
       this._mahoragaInterval = null;
     }
+    initiative.stop();
     this._stopped = true;
     console.log('[Sprocket] All scheduled behaviors stopped.');
     auditLog.log('schedule', 'All scheduled behaviors stopped');

@@ -369,6 +369,19 @@ const commands = [
           { name: 'swing — larger move, wider stops', value: 'swing' },
         )
     ),
+  new SlashCommandBuilder()
+    .setName('brain')
+    .setDescription('Initiative Engine — autonomous brain status, journal, and self-tuning history')
+    .addStringOption(opt =>
+      opt.setName('action')
+        .setDescription('What to view')
+        .setRequired(true)
+        .addChoices(
+          { name: 'status — brain status + stats', value: 'status' },
+          { name: 'journal — recent autonomous decisions', value: 'journal' },
+          { name: 'tuning — self-tuning history', value: 'tuning' },
+        )
+    ),
 ];
 
 async function registerCommands() {
