@@ -111,8 +111,14 @@ class OptionsEngine {
    */
   async runCycle() {
     const cfg = policy.getConfig();
-    if (!cfg.options_enabled) return;
-    if (!alpaca.enabled) return;
+    if (!cfg.options_enabled) {
+      this._log('cycle', 'Options engine disabled (options_enabled=false)');
+      return;
+    }
+    if (!alpaca.enabled) {
+      this._log('cycle', 'Alpaca not configured — skipping options cycle');
+      return;
+    }
 
     if (circuitBreaker.isPaused()) {
       this._log('circuit_breaker', 'Options trading paused by circuit breaker');
@@ -121,7 +127,8 @@ class OptionsEngine {
 
     const et = this._getETTime();
     if (!this._isMarketHours()) {
-      return; // Only trade during market hours
+      this._log('cycle', `Outside market hours (${et.hour}:${String(et.minute).padStart(2, '0')} ET, day=${et.day}) — skipping`);
+      return;
     }
 
     // Skip first 15 min after open (too volatile/noisy for entries)
@@ -129,7 +136,7 @@ class OptionsEngine {
       ? (MARKET_CLOSE_HOUR * 60) - et.minutesToClose - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN)
       : 0;
     if (minutesSinceOpen < 15) {
-      this._log('cycle', 'Skipping — first 15 min after open (letting price discovery settle)');
+      this._log('cycle', `Skipping — ${minutesSinceOpen} min since open (waiting for 15 min price discovery)`);
       return;
     }
 
@@ -147,9 +154,12 @@ class OptionsEngine {
       // 3. If we have room and time, scan for new entries
       const optionsPositions = await alpaca.getOptionsPositions();
       if (optionsPositions.length < cfg.options_max_positions && et.minutesToClose > cfg.options_close_before_minutes) {
+        this._log('cycle', `Scanning for entries — ${optionsPositions.length}/${cfg.options_max_positions} positions, ${et.minutesToClose} min left`);
         await this._scanForEntries(account, optionsPositions.length, et);
       } else if (et.minutesToClose <= cfg.options_close_before_minutes) {
         this._log('cycle', `Too close to market close (${et.minutesToClose} min) — exit-only mode`);
+      } else {
+        this._log('cycle', `Max positions reached (${optionsPositions.length}/${cfg.options_max_positions}) — monitoring only`);
       }
 
     } catch (err) {

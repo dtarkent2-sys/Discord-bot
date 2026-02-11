@@ -470,17 +470,17 @@ class AutonomousBehaviorEngine {
           this.gexState.set(ticker, { ...prev, flipStrike: gammaFlip, regime: regime.label, spotPrice: spot });
         }
 
-        // Break-and-hold alert check (uses candle data if available)
+        // Break-and-hold alert check (uses intraday candle data if available)
         try {
           const alpacaSvc = require('./alpaca');
           if (alpacaSvc.enabled) {
-            const bars = await alpacaSvc.getHistory(ticker, {
+            const bars = await alpacaSvc.getIntradayBars(ticker, {
               timeframe: this._gexAlerts.candleInterval,
               limit: 20,
             });
             const candles = (bars || []).map(b => ({
-              close: b.ClosePrice || b.close || b.c,
-              volume: b.Volume || b.volume || b.v,
+              close: b.close,
+              volume: b.volume,
             }));
 
             const breakAlerts = this._gexAlerts.evaluate(ticker, candles, summary);
