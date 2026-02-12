@@ -24,7 +24,6 @@ const sectors = require('../services/sectors');
 const policy = require('../services/policy');
 const optionsEngine = require('../services/options-engine');
 const initiative = require('../services/initiative');
-
 const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -40,6 +39,16 @@ async function handleCommand(interaction) {
     case 'ask':
       return handleAsk(interaction);
     case 'memory':
+      // User has no stored memory yet — friendly nudge to start interacting
+      const userId = interaction.user.id;
+      const hasMemory = memory.getUser(userId);
+
+      if (!hasMemory || hasMemory.interactionCount === 0) {
+        return interaction.reply({
+          content: `Welcome! I don't have any info about you yet. 👋\nStart chatting with me — ask a question, check your profile, or add a ticker to your watchlist.\nI'll remember our conversation as we go!`,
+          flags: MessageFlags.Ephemeral,
+        });
+      }
       return handleMemory(interaction);
     case 'model':
       return handleModel(interaction);
@@ -191,7 +200,6 @@ async function handleModel(interaction) {
 
 async function handleStats(interaction) {
   try {
-    const memoryError = false;
     const summary = stats.getSummary();
     const reactionStats = reactions.getStats();
 
@@ -1647,8 +1655,7 @@ async function handleBrain(interaction) {
   }
 
   if (action === 'tuning') {
-    const entries = initiative.getJournal(50);
-    const tuning = entries.filter(e => e.type === 'self_tune');
+    const tuning = initiative.getJournal(50).filter(e => e.type === 'self_tune');
     if (tuning.length === 0) {
       return interaction.reply('_No self-tuning events yet. The brain needs 5+ completed trades before it starts adjusting parameters._');
     }
