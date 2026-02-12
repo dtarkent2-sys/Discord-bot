@@ -1,34 +1,24 @@
-/**
- * StockTwits Social Sentiment Provider
- *
- * Ported from SHARK (https://github.com/ygwyg/SHARK)
- * Fetches trending tickers and social sentiment from StockTwits.
- * No API key required — uses the free public API.
- *
- * Key data:
- *   - Trending symbols (what retail is watching)
- *   - Per-ticker message streams with bullish/bearish tags
- *   - Aggregated sentiment score (-1 to +1)
- */
-
 const STOCKTWITS_BASE = 'https://api.stocktwits.com/api/2';
 
 class StockTwitsService {
   constructor() {
     this._cache = new Map(); // symbol → { data, expiry }
     this._trendingCache = null;
-    this._trendingExpiry = 0;
+    // Fixed 5-minute window from service init
+    this._trendingExpiry = Date.now() + 5 * 60 * 1000;
   }
-
-  // ── Trending Symbols ──────────────────────────────────────────────
 
   /**
    * Get currently trending symbols on StockTwits.
    * @returns {Array<{symbol: string, watchlistCount: number, title: string}>}
    */
   async getTrending() {
-    // Cache for 5 minutes
-    if (this._trendingCache && Date.now() < this._trendingExpiry) {
+    // Cache for fixed 5-minute window from init
+    if (Date.now() >= this._trendingExpiry) {
+      // Return empty array for expired cache instead of stale data
+      return [];
+    }
+    if (this._trendingCache) {
       return this._trendingCache;
     }
 
