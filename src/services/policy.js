@@ -22,7 +22,10 @@ const Storage = require('./storage');
 // Config version — increment when defaults change to trigger migration
 const CONFIG_VERSION = 2;
 
-// Dangerous mode — aggressive trading overrides
+// Dangerous mode — aggressive but NOT reckless trading overrides
+// NOTE: The options engine has HARD LIMITS (max 3 trades/hr/symbol, max 15/day,
+// consecutive loss cooldowns, correlated position limits) that dangerous mode
+// CANNOT override. Those protect against the overtrading seen on 2026-02-12.
 const DANGEROUS_CONFIG = {
   max_positions: 10,
   max_notional_per_trade: 10000,      // $10,000
@@ -37,11 +40,11 @@ const DANGEROUS_CONFIG = {
   position_size_pct: 0.40,             // 40% of cash per trade
   scan_interval_minutes: 2,            // scan every 2 min
   options_max_premium_per_trade: 1000, // $1,000
-  options_max_daily_loss: 2500,        // $2,500
-  options_max_positions: 5,
-  options_min_conviction: 3,           // lower bar
-  options_cooldown_minutes: 2,         // rapid re-entry
-  options_max_spread_pct: 0.15,        // accept wider spreads
+  options_max_daily_loss: 1500,        // $1,500 (was $2,500 — too much rope)
+  options_max_positions: 3,            // 3 (was 5 — correlated positions = same bet)
+  options_min_conviction: 5,           // 5 (was 3 — low conviction = coin flip)
+  options_cooldown_minutes: 8,         // 8 min (was 2 — too fast for 0DTE)
+  options_max_spread_pct: 0.12,        // 12% (was 15% — wider = worse fills)
 };
 
 // Default configuration — tunable via /agent set or runtime
