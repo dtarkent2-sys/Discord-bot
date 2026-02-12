@@ -35,6 +35,10 @@ function createRedisClient(redisUrl) {
       let buffer = '';
       const pending = [];
 
+      function rejectAll(err) {
+        while (pending.length > 0) pending.shift().reject(err);
+      }
+
       function sendCommand(...args) {
         return new Promise((res, rej) => {
           const parts = [`*${args.length}`];
@@ -42,7 +46,19 @@ function createRedisClient(redisUrl) {
             const str = String(arg);
             parts.push(`$${Buffer.byteLength(str)}`, str);
           }
-          pending.push({ resolve: res, reject: rej });
+          // Per-command timeout so a stuck command can never block the boot chain
+          const entry = {
+            resolve: (val) => { clearTimeout(timer); res(val); },
+            reject: (err) => { clearTimeout(timer); rej(err); },
+          };
+          const timer = setTimeout(() => {
+            const idx = pending.indexOf(entry);
+            if (idx !== -1) {
+              pending.splice(idx, 1);
+              rej(new Error('Redis command timeout (10s)'));
+            }
+          }, 10_000);
+          pending.push(entry);
           socket.write(parts.join('\r\n') + '\r\n');
         });
       }
@@ -84,9 +100,8 @@ function createRedisClient(redisUrl) {
       }
 
       socket.on('data', (data) => parseResponse(data.toString()));
-      socket.on('error', (err) => {
-        if (pending.length > 0) pending.shift().reject(err);
-      });
+      socket.on('error', (err) => rejectAll(err));
+      socket.on('close', () => rejectAll(new Error('Redis connection closed')));
 
       const client = {
         sendCommand,
