@@ -649,12 +649,12 @@ class InitiativeEngine {
         `Today's stats: ${trades.length} trades, ${skips.length} skips, ${errors.length} errors.`,
         `Circuit breaker trips: ${cbStatus.totalTrips}. Consecutive bad trades: ${cbStatus.consecutiveBadTrades}.`,
         `Recent trade log: ${trades.slice(-5).map(t => t.message).join(' | ')}`,
-        `What went well? What should you change tomorrow? Be specific and actionable.`,
+        `Summarize what happened today — what went well, what didn't. Do NOT suggest new features, code changes, or tomorrow's plans. Just reflect on today's actual results.`,
       ].join('\n');
 
       const reflection = await ai.complete(prompt);
       if (reflection) {
-        entry.reflection = reflection.slice(0, 500);
+        entry.reflection = reflection.slice(0, 280);
       }
     } catch {}
 

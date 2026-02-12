@@ -728,14 +728,17 @@ class OptionsEngine {
         maxDelta = Math.min(0.90, maxDelta + 0.10);
       }
 
-      // Filter to our delta range
+      // Filter by delta range and minimum open interest
+      const minOI = cfg.options_min_open_interest || 500;
       const candidates = options.filter(opt => {
         const absDelta = Math.abs(opt.delta || 0);
-        return absDelta >= minDelta && absDelta <= maxDelta;
+        if (absDelta < minDelta || absDelta > maxDelta) return false;
+        if ((opt.openInterest || 0) < minOI) return false;
+        return true;
       });
 
       if (candidates.length === 0) {
-        this._log('contract', `${underlying}: no contracts in delta range [${minDelta.toFixed(2)}-${maxDelta.toFixed(2)}] (${options.length} options checked)`);
+        this._log('contract', `${underlying}: no contracts matching delta [${minDelta.toFixed(2)}-${maxDelta.toFixed(2)}] + OI >= ${minOI} (${options.length} options checked)`);
         return null;
       }
 
