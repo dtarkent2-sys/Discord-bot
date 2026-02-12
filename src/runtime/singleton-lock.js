@@ -44,9 +44,9 @@ async function acquireLock() {
     _redis = await createRedisClient(redisUrl);
     _lockValue = _generateLockValue();
 
-    // Try to acquire the lock, retrying up to TTL seconds if a stale lock exists.
-    // This handles the common case where a previous instance crashed without releasing.
-    const maxAttempts = Math.ceil(DEFAULT_TTL / 5) + 1;
+    // Try to acquire the lock. Retry a few times to handle the common case
+    // where the previous instance's lock hasn't expired yet during a deploy.
+    const maxAttempts = 6; // ~30s total — enough for TTL-based expiry during deploys
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const result = await _redis.sendCommand('SET', LOCK_KEY, _lockValue, 'NX', 'EX', String(DEFAULT_TTL));
 
@@ -59,8 +59,9 @@ async function acquireLock() {
           } catch (err) {
             log.error(`Lock renewal failed: ${err.message}`);
             _stopRenewal();
-            log.error('Lost leader lock — exiting to allow another instance to take over');
-            process.exit(0);
+            // Don't exit — keep running, just lose leader exclusivity.
+            // Exiting with code 0 under ON_FAILURE restart policy kills the bot permanently.
+            log.warn('Lost leader lock — continuing without lock');
           }
         }, DEFAULT_RENEW * 1000);
 
@@ -75,9 +76,11 @@ async function acquireLock() {
         log.info(`Leader lock held by another instance (TTL ${ttl}s). Retrying in ${waitSec}s... (attempt ${attempt}/${maxAttempts})`);
         await new Promise(r => setTimeout(r, waitSec * 1000));
       } else {
-        log.info(`Leader lock NOT acquired after ${maxAttempts} attempts — exiting gracefully.`);
+        // Don't process.exit(0) — Railway's ON_FAILURE restart policy won't restart
+        // a process that exits with code 0, killing the bot permanently.
+        log.warn(`Leader lock NOT acquired after ${maxAttempts} attempts — proceeding WITHOUT lock`);
         _redis.quit();
-        process.exit(0);
+        _redis = null;
       }
     }
   } catch (err) {
