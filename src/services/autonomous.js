@@ -1,58 +1,12 @@
-/**
- * autonomous-behaviors.js — Sprocket's Internal Clock
- *
- * Scheduled behaviors that run automatically:
- * 1. Pre-market briefing (8:30 AM ET, Mon-Fri)
- * 2. Market health pulse (every 2h during market hours)
- * 3. Unprompted observations (random, ~30% chance at 11 AM)
- * 4. Weekend reflection (Saturday 10 AM)
- *
- * All data comes from provider methods — never invented.
- * If a data fetch fails, Sprocket says so honestly.
- *
- * HARDENED:
- * - Rate-limited Discord posting (min 2s between messages per channel)
- * - Emergency stop kills autonomous loop + writes post-mortem
- * - All scheduled actions logged to audit trail
- */
-
-const schedule = require('node-schedule');
-const { persona } = require('../personality');
-const { getMarketContext } = require('../data/market');
-const mood = require('./mood');
-const commentary = require('./commentary');
-const stats = require('./stats');
-const gamma = require('./gamma');
-const GEXEngine = require('./gex-engine');
-const GEXAlertService = require('./gex-alerts');
-const mahoraga = require('./mahoraga');
-const policy = require('./policy');
-const initiative = require('./initiative');
-const gammaSqueeze = require('./gamma-squeeze');
-const yoloMode = require('./yolo-mode');
-const config = require('../config');
-const auditLog = require('./audit-log');
-const circuitBreaker = require('./circuit-breaker');
-const { classifySendError, contentPreview, notifyOwner } = require('../utils/safe-send');
-
-// Rate limit: minimum ms between Discord posts per channel
-const RATE_LIMIT_MS = 2000;
-
 class AutonomousBehaviorEngine {
   constructor(client) {
     this.client = client;
     this.jobs = [];
-    this._stopped = false; // emergency stop flag
-
-    // Rate limiting state: channelName → last post timestamp
+    this._stopped = false;
     this._lastPostTime = new Map();
-
-    // GEX monitor state — tracks last-known regime so we only alert on flips
-    // Key: ticker, Value: { flipStrike, regime, spotPrice, lastAlertTime }
     this.gexState = new Map();
     this.gexWatchlist = ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'MSFT', 'AMD', 'META', 'AMZN', 'IWM'];
 
-    // Multi-expiry GEX engine + break-and-hold alert service
     this._gexEngine = new GEXEngine(gamma);
     this._gexAlerts = new GEXAlertService();
   }
@@ -61,59 +15,71 @@ class AutonomousBehaviorEngine {
     console.log(`[Sprocket] Starting autonomous behavior schedules...`);
     this._stopped = false;
 
-    // 1. PRE-MARKET BRIEFING (8:30 AM ET, Monday-Friday)
+    this._addPreMarketBriefing();
+    this._addMarketHealthPulse();
+    this._addUnpromptedObservations();
+    this._addWeekendReflection();
+    this._addGexMonitor();
+    this._addSharkAutonomousTrading();
+    this._addInitiativeEngine();
+    this._addGammaSqueeze();
+    this._addYoloMode();
+
+    console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
+  }
+
+  _addPreMarketBriefing() {
     this.jobs.push(
       schedule.scheduleJob({ rule: '30 8 * * 1-5', tz: 'America/New_York' }, async () => {
         if (this._stopped) return;
         auditLog.log('schedule', 'Running pre-market briefing');
+
         try {
           const spyData = await this.getPreMarketMove('SPY');
-
-          // Update mood from market signal
           if (spyData.available) {
             mood.updateFromPnL(spyData.change);
-          }
+            const opener = await commentary.briefingOpener();
+            const direction = spyData.change >= 0 ? 'higher' : 'lower';
+            const body = await commentary.marketMove('SPY', spyData.change);
+            const message = [
+              `**${persona.name}'s Pre-Market Briefing**`,
+              ``,
+              opener,
+              ``,
+              body,
+              ``,
+              `Not financial advice.`,
+            ].join('\n');
 
-          // Use AI commentary for a unique opener
-          const opener = await commentary.briefingOpener();
-          const direction = spyData.change >= 0 ? 'higher' : 'lower';
-
-          let body;
-          if (spyData.available) {
-            body = await commentary.marketMove('SPY', spyData.change);
+            await this.postToChannel(config.tradingChannelName, message);
           } else {
-            body = `Pre-market data unavailable right now. I'll check back later.`;
+            const message = [
+              `**${persona.name}'s Pre-Market Briefing**`,
+              ``,
+              `Pre-market data unavailable right now. I'll check back later.`,
+              ``,
+              `Not financial advice.`,
+            ].join('\n');
+
+            await this.postToChannel(config.tradingChannelName, message);
           }
-
-          const message = [
-            `**${persona.name}'s Pre-Market Briefing**`,
-            ``,
-            opener,
-            ``,
-            body,
-            ``,
-            `Not financial advice.`,
-          ].join('\n');
-
-          await this.postToChannel(config.tradingChannelName, message);
         } catch (err) {
           console.error('[Sprocket] Pre-market briefing error:', err.message);
           auditLog.log('error', `Pre-market briefing error: ${err.message}`);
         }
       })
     );
+  }
 
-    // 2. MARKET HEALTH PULSE (Every 2 hours during market hours: 10, 12, 2, 4 PM ET)
+  _addMarketHealthPulse() {
     this.jobs.push(
       schedule.scheduleJob({ rule: '0 10,12,14,16 * * 1-5', tz: 'America/New_York' }, async () => {
         if (this._stopped) return;
         auditLog.log('schedule', 'Running market health pulse');
+
         try {
-          // Decay mood toward neutral between updates
           mood.decay();
-
           const heatmap = await this.generateSectorHeatmap();
-
           const message = [
             `**Sector Pulse Update** *(${persona.name} is feeling ${mood.getMood()})*`,
             ``,
@@ -129,18 +95,18 @@ class AutonomousBehaviorEngine {
         }
       })
     );
+  }
 
-    // 3. UNPROMPTED OBSERVATIONS (11 AM ET, 30% chance)
+  _addUnpromptedObservations() {
     this.jobs.push(
       schedule.scheduleJob({ rule: '0 11 * * 1-5', tz: 'America/New_York' }, async () => {
         if (this._stopped) return;
-        if (Math.random() > 0.3) return; // 30% chance to trigger
+        if (Math.random() > 0.3) return;
         auditLog.log('schedule', 'Running unprompted observation');
         try {
           const observation = await this.scanForUnusualActivity();
           if (!observation) return;
 
-          // Use AI to phrase the observation in Sprocket's voice
           const aiComment = await commentary.unusualActivity(observation.ticker, observation.detail);
           const message = `*${persona.name} whispers* ${aiComment || observation.detail + ' Not financial advice.'}`;
           await this.postToChannel(config.tradingChannelName, message);
@@ -150,15 +116,15 @@ class AutonomousBehaviorEngine {
         }
       })
     );
+  }
 
-    // 4. WEEKEND REFLECTION (Saturday 10 AM ET)
+  _addWeekendReflection() {
     this.jobs.push(
       schedule.scheduleJob({ rule: '0 10 * * 6', tz: 'America/New_York' }, async () => {
         if (this._stopped) return;
         auditLog.log('schedule', 'Running weekend reflection');
         try {
           const reflection = await this.generateWeeklyReflection();
-
           const message = [
             `**${persona.name}'s Weekly Review**`,
             ``,
@@ -174,9 +140,9 @@ class AutonomousBehaviorEngine {
         }
       })
     );
+  }
 
-    // 5. GAMMA EXPOSURE MONITOR (every 30 min during market hours, Mon-Fri)
-    // Scans watchlist tickers for gamma flip breaches and alerts the trading channel
+  _addGexMonitor() {
     if (gamma.enabled) {
       this.jobs.push(
         schedule.scheduleJob({ rule: '*/30 9-16 * * 1-5', tz: 'America/New_York' }, async () => {
@@ -187,45 +153,49 @@ class AutonomousBehaviorEngine {
       );
       console.log(`[Sprocket] GEX monitor active — watching: ${this.gexWatchlist.join(', ')}`);
     }
+  }
 
-    // 6. SHARK AUTONOMOUS TRADING (configurable interval during market hours)
-    // Signal ingestion → technical analysis → AI decision → trade execution
-    mahoraga.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
+  _addSharkAutonomousTrading() {
     const scanMinutes = policy.getConfig().scan_interval_minutes || 5;
+    mahoraga.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
+
     this._mahoragaInterval = setInterval(async () => {
       if (this._stopped) return;
       if (!mahoraga.enabled) return;
-      // Only trade during market hours (Mon-Fri, roughly 9:30-16:00 ET)
+
       const now = new Date();
       const etOptions = { timeZone: 'America/New_York', hour: 'numeric', minute: 'numeric', hour12: false };
       const etParts = new Intl.DateTimeFormat('en-US', etOptions).formatToParts(now);
       const etHour = parseInt(etParts.find(p => p.type === 'hour').value, 10);
       const day = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' })).getDay();
-      if (day === 0 || day === 6) return; // weekend
-      if (etHour < 9 || etHour >= 16) return; // outside market hours
+
+      if (day === 0 || day === 6) return;
+      if (etHour < 9 || etHour >= 16) return;
+
       auditLog.log('schedule', 'Running SHARK autonomous trading cycle');
       await mahoraga.runCycle();
     }, scanMinutes * 60 * 1000);
-    console.log(`[Sprocket] SHARK trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
 
-    // 7. INITIATIVE ENGINE — autonomous brain (fast loop, self-tuning, proactive)
+    console.log(`[Sprocket] SHARK trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
+  }
+
+  _addInitiativeEngine() {
     initiative.init(this.client, (content) => this.postToChannel(config.tradingChannelName, content));
     initiative.start();
-    // Create journal channel in background (non-blocking)
     initiative.ensureJournalChannel().catch(() => {});
     console.log(`[Sprocket] Initiative engine active — autonomous brain running`);
+  }
 
-    // 8. GAMMA SQUEEZE ENGINE — real-time squeeze detection + sector GEX monitoring
+  _addGammaSqueeze() {
     gammaSqueeze.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
     gammaSqueeze.start();
     console.log(`[Sprocket] Gamma squeeze engine active — watching ${gammaSqueeze.getWatchlist().join(', ')}`);
+  }
 
-    // 9. YOLO MODE — autonomous self-improvement engine
+  _addYoloMode() {
     yoloMode.init(this.client, (content) => this.postToChannel(config.tradingChannelName, content));
     yoloMode.start();
     console.log(`[Sprocket] YOLO mode ${yoloMode.enabled ? 'ACTIVE — autonomous self-improvement running' : 'standby — use /yolo enable to activate'}`);
-
-    console.log(`[Sprocket] ${this.jobs.length} scheduled behaviors active.`);
   }
 
   stopAllSchedules() {
@@ -245,49 +215,6 @@ class AutonomousBehaviorEngine {
     auditLog.log('schedule', 'All scheduled behaviors stopped');
   }
 
-  /**
-   * Emergency stop — kills the autonomous loop, the trading engine,
-   * closes all positions, and writes a post-mortem log.
-   * Triggered by !emergency prefix command.
-   * @returns {{ postMortemPath: string, message: string }}
-   */
-  async emergencyStop() {
-    auditLog.log('emergency', 'EMERGENCY STOP INITIATED');
-
-    // 1. Stop all scheduled behaviors immediately
-    this.stopAllSchedules();
-
-    // 2. Kill the trading engine (closes positions, writes post-mortem)
-    let postMortemPath = null;
-    try {
-      postMortemPath = await mahoraga.kill();
-    } catch (err) {
-      auditLog.log('error', `Emergency kill error: ${err.message}`);
-    }
-
-    // 3. Post to trading channel
-    try {
-      await this.postToChannel(config.tradingChannelName, [
-        `🚨 **EMERGENCY STOP ACTIVATED**`,
-        ``,
-        `All autonomous behaviors have been halted.`,
-        `Kill switch activated — all orders cancelled, positions closing.`,
-        `Post-mortem log written for debugging.`,
-        ``,
-        `_Use /agent enable and restart schedules to resume._`,
-      ].join('\n'));
-    } catch {
-      // Best effort — don't fail the emergency stop
-    }
-
-    const message = 'Emergency stop complete. All schedules stopped, kill switch active, positions closing.';
-    auditLog.log('emergency', message);
-
-    return { postMortemPath, message };
-  }
-
-  // ── Channel posting (rate-limited) ──────────────────────────────────
-
   async postToChannel(channelName, content) {
     const channel = this.client.channels.cache.find(
       ch => ch.name === channelName && ch.isTextBased()
@@ -298,7 +225,6 @@ class AutonomousBehaviorEngine {
       return;
     }
 
-    // Rate limiting: enforce minimum gap between posts to same channel
     const lastPost = this._lastPostTime.get(channelName) || 0;
     const elapsed = Date.now() - lastPost;
     if (elapsed < RATE_LIMIT_MS) {
@@ -320,7 +246,6 @@ class AutonomousBehaviorEngine {
         await notifyOwner(this.client, `${known.type} posting to #${channelName} (<#${channel.id}>): ${known.detail}`);
       }
 
-      // Handle Discord rate limit (429) with retry
       if (err.httpStatus === 429 || err.message?.includes('rate limit')) {
         const retryAfter = err.retryAfter || 5000;
         console.warn(`[Sprocket] Discord rate limited on #${channelName}, waiting ${retryAfter}ms`);
@@ -339,13 +264,6 @@ class AutonomousBehaviorEngine {
     }
   }
 
-  // ── Data providers (stub implementations — replace with real APIs) ─
-
-  /**
-   * Get pre-market move for a ticker.
-   * TODO: Replace with Alpaca, Polygon, or other market data API.
-   * Expected: { change: number (percent), available: boolean }
-   */
   async getPreMarketMove(ticker) {
     try {
       const ctx = await getMarketContext(ticker);
@@ -362,10 +280,6 @@ class AutonomousBehaviorEngine {
     }
   }
 
-  /**
-   * Generate sector heatmap string.
-   * TODO: Replace with real sector ETF data (XLK, XLF, XLE, XLV, etc.)
-   */
   async generateSectorHeatmap() {
     const sectors = ['XLK', 'XLF', 'XLE', 'XLV', 'XLI', 'XLC', 'XLY', 'XLP', 'XLU', 'XLRE', 'XLB'];
     const results = [];
@@ -380,25 +294,17 @@ class AutonomousBehaviorEngine {
     }
 
     if (results.length === 0) {
-      return null; // No data available
+      return null;
     }
 
     return results.join('\n');
   }
 
-  /**
-   * Scan for unusual volume or price activity.
-   * TODO: Replace with real screener/scanner API.
-   */
   async scanForUnusualActivity() {
-    // Watchlist to scan — expand as needed
     const watchlist = ['AAPL', 'TSLA', 'NVDA', 'AMD', 'META', 'AMZN', 'GOOGL', 'MSFT'];
-
     for (const ticker of watchlist) {
       const ctx = await getMarketContext(ticker);
       if (ctx.error || !ctx.quote) continue;
-
-      // Flag anything with > 3% move as "unusual" (simple heuristic)
       const pct = Math.abs(ctx.quote.changePercent ?? 0);
       if (pct > 3) {
         const direction = ctx.quote.changePercent > 0 ? 'up' : 'down';
@@ -408,21 +314,11 @@ class AutonomousBehaviorEngine {
         };
       }
     }
-
     return null;
   }
 
-  // ── GEX Flip Monitor (upgraded: multi-expiry engine + break-and-hold) ─
-
-  /**
-   * Scan watchlist tickers using the multi-expiry GEX engine.
-   * Alerts on:
-   *   1. Regime changes (long → short gamma or vice versa)
-   *   2. Gamma flip level shifts (> 2%)
-   *   3. Break-and-hold conditions on stacked walls
-   */
   async _runGEXMonitor() {
-    const cooldown = 2 * 60 * 60 * 1000; // 2h cooldown per ticker between regime alerts
+    const cooldown = 2 * 60 * 60 * 1000;
     let consecutiveFailures = 0;
 
     for (const ticker of this.gexWatchlist) {
@@ -430,18 +326,13 @@ class AutonomousBehaviorEngine {
         console.warn(`[Sprocket] GEX monitor: 3 consecutive failures, skipping remaining tickers`);
         break;
       }
-
       try {
-        // Use multi-expiry engine for richer analysis
         const summary = await this._gexEngine.analyze(ticker);
         consecutiveFailures = 0;
-
         const { spot, regime, gammaFlip } = summary;
-
         const prev = this.gexState.get(ticker);
         const now = Date.now();
 
-        // First run — record state, don't alert
         if (!prev) {
           this.gexState.set(ticker, {
             flipStrike: gammaFlip,
@@ -452,7 +343,6 @@ class AutonomousBehaviorEngine {
           continue;
         }
 
-        // Check for regime change
         const regimeChanged = prev.regime !== regime.label;
         const flipMoved = prev.flipStrike && gammaFlip
           ? Math.abs(prev.flipStrike - gammaFlip) / prev.flipStrike > 0.02
@@ -462,7 +352,6 @@ class AutonomousBehaviorEngine {
           const emoji = regime.label === 'Long Gamma' ? '🟢'
             : regime.label === 'Short Gamma' ? '🔴' : '🟡';
           const confPct = (regime.confidence * 100).toFixed(0);
-
           const callWall = summary.walls.callWalls[0];
           const putWall = summary.walls.putWalls[0];
 
@@ -493,7 +382,6 @@ class AutonomousBehaviorEngine {
           this.gexState.set(ticker, { ...prev, flipStrike: gammaFlip, regime: regime.label, spotPrice: spot });
         }
 
-        // Break-and-hold alert check (uses intraday candle data if available)
         try {
           const alpacaSvc = require('./alpaca');
           if (alpacaSvc.enabled) {
@@ -513,7 +401,6 @@ class AutonomousBehaviorEngine {
             }
           }
         } catch (candleErr) {
-          // Non-fatal: candle data not available
           if (!candleErr.message?.includes('not configured')) {
             console.warn(`[Sprocket] GEX break-hold check failed for ${ticker}: ${candleErr.message}`);
           }
@@ -527,10 +414,6 @@ class AutonomousBehaviorEngine {
     }
   }
 
-  /**
-   * Generate a weekly reflection summary.
-   * TODO: Replace with portfolio/performance tracking API.
-   */
   async generateWeeklyReflection() {
     const botStats = stats.getSummary();
     const moodSummary = mood.getSummary();
