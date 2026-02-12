@@ -1,15 +1,20 @@
-/**
- * Market data client using Financial Modeling Prep (FMP) API.
- * Requires an API key — set FMP_API_KEY in your .env file.
- * Get your free key at https://financialmodelingprep.com/developer
- * Supports stocks AND crypto (BTC, ETH, SOL, etc.)
- */
+const CONFIG_SCHEMA = {
+  fmpApiKey: { type: 'string', required: true, env: 'FMP_API_KEY' },
+};
 
-const config = require('../config');
+function validateConfig(config) {
+  const errors = Object.keys(CONFIG_SCHEMA)
+    .filter(key => CONFIG_SCHEMA[key].required && !config[key])
+    .map(key => `Missing required ${key} (${CONFIG_SCHEMA[key].env})`);
+  return errors;
+}
+
+if (validateConfig(config).length > 0) {
+  throw new Error('Configuration error: ' + validateConfig(config).join(', '));
+}
 
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
 
-// Common crypto symbols → FMP format (BTCUSD, not BTC-USD)
 const CRYPTO_MAP = {
   BTC: 'BTCUSD', ETH: 'ETHUSD', SOL: 'SOLUSD', XRP: 'XRPUSD',
   DOGE: 'DOGEUSD', ADA: 'ADAUSD', AVAX: 'AVAXUSD', DOT: 'DOTUSD',
@@ -72,7 +77,7 @@ class MarketDataClient {
     return !!CRYPTO_MAP[upper];
   }
 
-  // ── FMP API fetch helper ──────────────────────────────────────────────
+  // ── FMP API fetch helper ──────────────────────────────────────────────────────
 
   async _fmpFetch(endpoint, params = {}) {
     if (!config.fmpApiKey) throw new Error('FMP API key not configured — set FMP_API_KEY in .env');
@@ -97,7 +102,7 @@ class MarketDataClient {
     return res.json();
   }
 
-  // ── Retry helper ──────────────────────────────────────────────────────
+  // ── Retry helper ────────────────────────────────────────────────────────────────
 
   async _retry(fn, label, maxRetries = 2) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -121,7 +126,7 @@ class MarketDataClient {
     }
   }
 
-  // ── Quote — current price + key stats ─────────────────────────────────
+  // ── Quote — current price + key stats ─────────────────────────────────────────
 
   async getQuote(ticker) {
     const upper = ticker.toUpperCase();
