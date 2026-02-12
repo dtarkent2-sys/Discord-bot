@@ -18,45 +18,23 @@ class AIService {
     this.ollama = new Ollama(ollamaOptions);
     this.model = config.ollamaModel;
     this.ollamaAvailable = false;
-
-    // NEW: Track Ollama connectivity status for startup-time indicator
-    this.ollamaConnectivity = 'unknown'; // 'available' | 'unavailable' | 'error'
-
     this.conversationHistory = new Map();
     this.maxHistory = 20;
 
     // Kimi K2.5 agent mode — uses Moonshot API with built-in web search
     this.kimiEnabled = !!(config.kimiApiKey && this._isKimiModel());
 
-    // PRE-INITIALIZATION: Show service availability intent immediately
-    console.log(`[AI] ✅ AI Service est. ${new Date().toISOString().slice(0,10)}`);
-    this._printStartupStatus();
+    console.log(`[AI] Ollama host: ${config.ollamaHost}`);
+    console.log(`[AI] Ollama model: ${this.model}`);
+    console.log(`[AI] API key: ${config.ollamaApiKey ? 'set' : 'NOT SET'}`);
+    if (this.kimiEnabled) {
+      console.log(`[AI] Kimi agent mode ENABLED (${config.kimiBaseUrl}, model: ${config.kimiModel})`);
+    }
 
     // Log data source availability at startup (priority order)
     console.log(`[AI] Price sources (priority order): AInvest=${config.ainvestApiKey ? 'YES' : 'NO'}, FMP=${config.fmpApiKey ? 'YES' : 'NO'}, Alpaca=${config.alpacaApiKey ? 'YES' : 'NO'}, yahoo-finance2=${priceFetcher.isAvailable() ? 'YES' : 'NO'}`);
     console.log(`[AI] Search sources (priority order): AInvest=${config.ainvestApiKey ? 'YES' : 'NO'}, SearXNG=${config.searxngUrl || 'fallbacks only'}, DuckDuckGo=YES, AlpacaNews=${config.alpacaApiKey ? 'YES' : 'NO'}`);
-  }
 
-  _printStartupStatus() {
-    // NEW: Clear startup-time status indicator with graceful degradation mode
-    const timestamp = nowEST();
-    const dateStr = todayString();
-
-    if (this.ollamaConnectivity === 'available') {
-      console.log(`[AI] Status: ✅ Ollama available — full LLM functionality active (${timestamp})`);
-    } else if (this.ollamaConnectivity === 'unavailable') {
-      console.log(`[AI] Status: ⚠️ Ollama unavailable — entering graceful degradation mode (${timestamp})`);
-      console.log(`[AI]   • I'll answer with fallback knowledge`);
-      console.log(`[AI]   • Web search and price auto-fetch will be OFF`);
-      console.log(`[AI]   • Hallucination detection disabled`);
-      console.log(`[AI]   • Market data updates will be disabled`);
-      console.log(`[AI]   • Bot remains online for 1m waiting for recovery`);
-    } else {
-      console.log(`[AI] Status: ❌ Ollama unreachable — system running in nominal fallback (${timestamp})`);
-      console.log(`[AI]   • All AI responses will be generic/local`);
-      console.log(`[AI]   • No real-time data possible`);
-      console.log(`[AI]   • Expect no price history or recent news`);
-    }
   }
 
   async initialize() {
@@ -64,7 +42,6 @@ class AIService {
       const res = await this.ollama.list();
       const models = res.models || [];
       this.ollamaAvailable = true;
-      this.ollamaConnectivity = 'available';
       console.log(`[AI] Ollama connected. Available models: ${models.map(m => m.name).join(', ') || 'none listed'}`);
 
       const match = models.find(m => m.name === this.model || m.name.startsWith(this.model));
@@ -75,11 +52,8 @@ class AIService {
         console.log(`[AI] Model "${this.model}" not found in list, will try anyway (cloud models may not be listed).`);
       }
     } catch (err) {
-      this.ollamaAvailable = false;
-      this.ollamaConnectivity = 'unavailable';
       console.error(`[AI] Ollama connection FAILED: ${err.message}`);
       if (err.cause) console.error(`[AI] Cause: ${err.cause.message || err.cause}`);
-
       console.log('[AI] Bot will respond with fallback messages until Ollama is reachable.');
     }
   }
@@ -97,6 +71,12 @@ class AIService {
     return this.model;
   }
 
+  /**
+   * Kimi K2.5 agent mode — calls Moonshot API directly with built-in $web_search tool.
+   * The model autonomously decides when to search the web for current information.
+   * Implements the tool call loop: when the model requests a search, we return the
+   * arguments as-is (Moonshot handles the actual search server-side) and re-submit.
+   */
   async _kimiAgentChat(messages) {
     const url = `${config.kimiBaseUrl}/chat/completions`;
     const headers = {
@@ -138,6 +118,7 @@ class AIService {
       const message = choice.message;
 
       if (finishReason === 'tool_calls' && message.tool_calls) {
+        // Model wants to use a tool — add its message and process each call
         conversationMessages.push(message);
 
         for (const toolCall of message.tool_calls) {
@@ -146,6 +127,7 @@ class AIService {
 
           let toolResult;
           if (name === '$web_search') {
+            // Built-in search: return arguments as-is; Moonshot executes the search server-side
             toolResult = args;
           } else {
             toolResult = JSON.stringify({ error: `Unknown tool: ${name}` });
@@ -198,9 +180,14 @@ ${selfAwareness.buildSelfKnowledge()}
 `.trim();
   }
 
+  /**
+   * Detect whether a message likely needs a live web search to answer well.
+   * Uses simple keyword heuristics — not perfect, but catches most real-time questions.
+   */
   _needsWebSearch(message) {
     const lower = message.toLowerCase();
 
+    // Current events / real-time triggers
     const realtimePatterns = [
       /\bwho(?:'s| is| are)\b.*\b(?:playing|winning|leading|fighting|competing|running)\b/,
       /\b(?:super\s?bowl|world\s?series|world\s?cup|olympics|nba finals|stanley cup|march madness)\b/,
@@ -213,14 +200,19 @@ ${selfAwareness.buildSelfKnowledge()}
       /\b(?:who won|who lost|who died|who got)\b/,
       /\b(?:when (?:is|does|did|will))\b/,
       /\b(?:is .{3,} (?:open|closed|canceled|cancelled|delayed|postponed))\b/,
+      // Year references that need current data
       /\b202[5-9]\b/,
       /\b(?:this year|next year|last year|this quarter|next quarter|last quarter)\b/,
-      /\bq[1-4]\s*20\b/i,
+      /\b(?:q[1-4]\s*20)\b/i,
+      // Market / finance current events
+      /\b(?:earnings|ipo|fed meeting|fomc|cpi|jobs report|nonfarm|gdp report)\b/,
       /\b(?:interest rate|rate cut|rate hike|inflation)\b.*\b(?:now|current|latest|today)\b/,
-      /\bmarket|stock|crypto)\b.*\b(?:crash|rally|surge|dump|moon|tank)\b/,
-      /\bwhat is|tell me about|who is|explain)\b.*\b[A-Z]{2,5}\b/,
+      /\b(?:market|stock|crypto)\b.*\b(?:crash|rally|surge|dump|moon|tank)\b/,
+      // Specific lookups
+      /\b(?:what is|tell me about|who is|explain)\b.*\b[A-Z]{2,5}\b/,
     ];
 
+    // Question patterns that suggest "look this up"
     const questionPatterns = [
       /\bwhat(?:'s| is| are| was| were)\b.*\b(?:price|cost|worth|salary|net worth|market cap)\b/,
       /\bhow (?:much|many|old|tall|far|long)\b/,
@@ -243,12 +235,17 @@ ${selfAwareness.buildSelfKnowledge()}
     return false;
   }
 
+  /**
+   * Build a concise search query from a user message.
+   */
   _buildSearchQuery(message) {
+    // Strip common filler and just keep the substance
     let q = message
       .replace(/^(hey|hi|yo|ok|okay|so|well|um|hmm|please|can you|could you|do you know|tell me|what's|who's)\s+/i, '')
       .replace(/[?!.]+$/, '')
       .trim();
 
+    // If still too long, truncate to first ~80 chars
     if (q.length > 80) {
       q = q.slice(0, 80).replace(/\s\S*$/, '');
     }
@@ -256,7 +253,13 @@ ${selfAwareness.buildSelfKnowledge()}
     return q || message.slice(0, 80);
   }
 
+  /**
+   * Extract potential stock/crypto tickers from a message.
+   * Returns uppercase symbols like ['TSLA', 'AAPL', 'BTC'].
+   * Also resolves common market names like "dow", "nasdaq", "s&p" to tickers.
+   */
   _extractTickers(message) {
+    // Common market names → actual tickers (case-insensitive lookup)
     const MARKET_ALIASES = {
       'dow': 'DIA', 'djia': 'DIA', 'dow jones': 'DIA',
       'nasdaq': 'QQQ', 'naz': 'QQQ', 'nazzy': 'QQQ',
@@ -269,9 +272,11 @@ ${selfAwareness.buildSelfKnowledge()}
       'gold': 'GLD', 'oil': 'USO', 'bonds': 'TLT', 'treasuries': 'TLT',
     };
 
+    // Check for common market names (case-insensitive) in the message
     const lower = message.toLowerCase();
     const aliasTickers = [];
     for (const [alias, ticker] of Object.entries(MARKET_ALIASES)) {
+      // Use word boundary matching for short aliases, substring for multi-word
       const pattern = alias.includes(' ')
         ? alias
         : new RegExp(`\\b${alias.replace(/[&]/g, '\\$&')}\\b`);
@@ -280,9 +285,9 @@ ${selfAwareness.buildSelfKnowledge()}
       }
     }
 
+    // Match $TICKER format or standalone uppercase 1-5 char words
     const dollarTickers = (message.match(/\$([A-Za-z]{1,5})\b/g) || [])
       .map(t => t.slice(1).toUpperCase());
-
     const upperWords = (message.match(/\b[A-Z]{1,5}\b/g) || []);
 
     const stopWords = new Set([
@@ -295,8 +300,8 @@ ${selfAwareness.buildSelfKnowledge()}
       'ALSO', 'BUY', 'SELL', 'HOLD', 'IPO', 'ETF', 'GDP', 'FED', 'SEC',
       'LOL', 'OMG', 'WTF', 'IMO', 'TBH', 'NGL', 'IDK', 'LMAO',
     ]);
-
     const filtered = upperWords.filter(w => !stopWords.has(w));
+
     return [...new Set([...aliasTickers, ...dollarTickers, ...filtered])].slice(0, 5);
   }
 
@@ -305,11 +310,12 @@ ${selfAwareness.buildSelfKnowledge()}
 
     memory.recordInteraction(userId, username, userMessage);
 
+    // ── Pre-fetch: Auto-fetch prices for any tickers mentioned ──
     let livePrices = null;
     const tickers = this._extractTickers(userMessage);
     if (tickers.length > 0) {
       if (!priceFetcher.isAvailable()) {
-        console.warn(`[AI] No price sources available — cannot fetch: ${tickers.join(', ')}`);
+        console.warn(`[AI] No price sources available (yahoo-finance2 + FMP both unavailable) — cannot fetch: ${tickers.join(', ')}`);
       } else {
         try {
           const prices = await priceFetcher.getMultiplePrices(tickers);
@@ -328,6 +334,9 @@ ${selfAwareness.buildSelfKnowledge()}
       }
     }
 
+    // ── Auto-search for real-time questions ──
+    // Skip when Kimi agent mode handles search natively.
+    // Also search when tickers were found but prices failed (belt-and-suspenders).
     let searchResults = null;
     const needsSearch = this._needsWebSearch(userMessage);
     const pricesFailed = tickers.length > 0 && !livePrices;
@@ -349,8 +358,11 @@ ${selfAwareness.buildSelfKnowledge()}
       }
     }
 
+    // Track all live data provided to the model (for hallucination cross-reference)
     const liveDataContext = { livePrices, liveData, searchResults };
+
     const systemPrompt = this.buildSystemPrompt({ liveData, searchResults, livePrices });
+
     const memoryContext = memory.buildContext(userId);
     let fullSystemPrompt = systemPrompt;
     if (memoryContext) {
@@ -362,6 +374,8 @@ ${selfAwareness.buildSelfKnowledge()}
     }
     const history = this.conversationHistory.get(userId);
 
+    // Prepend date anchor to the user message so the model sees
+    // the current date at the message level, not just system prompt
     let fullMessage = `${userMessageDateAnchor()} ${userMessage}`;
     if (imageDescription) {
       fullMessage = `${userMessageDateAnchor()} [Image in message: ${imageDescription}]\n${userMessage}`;
@@ -378,29 +392,38 @@ ${selfAwareness.buildSelfKnowledge()}
       ...history,
     ];
 
+    // ── Kimi agent mode path (Moonshot API with built-in web search) ──
     if (this.kimiEnabled) {
       try {
         const assistantMessage = await this._kimiAgentChat(chatMessages);
-        if (assistantMessage && assistantMessage.trim()) {
+        if (!assistantMessage || !assistantMessage.trim()) {
+          console.warn('[AI] Kimi returned empty response, falling back to Ollama');
+          // Fall through to Ollama
+        } else {
           const cleaned = this._cleanResponse(assistantMessage);
           if (cleaned) {
             return this._finalizeResponse(cleaned, history, liveDataContext);
           }
+          console.warn('[AI] Kimi response empty after cleaning, falling back to Ollama');
         }
       } catch (err) {
         console.error(`[AI] Kimi agent error: ${err.message}`);
         console.log('[AI] Falling back to Ollama...');
+        // Fall through to Ollama
       }
     }
 
+    // ── Standard Ollama path ──
     try {
       let assistantMessage = await this._ollamaChat(chatMessages);
 
+      // Clean thinking tags and validate
       const cleaned = this._cleanResponse(assistantMessage);
       if (cleaned) {
         return this._finalizeResponse(cleaned, history, liveDataContext);
       }
 
+      // Ollama returned empty — try non-streaming as fallback
       console.warn(`[AI] Ollama streaming returned empty (model: ${this.model}), trying non-streaming...`);
       try {
         const result = await this.ollama.chat({
@@ -417,6 +440,7 @@ ${selfAwareness.buildSelfKnowledge()}
         console.warn(`[AI] Non-streaming retry also failed: ${retryErr.message}`);
       }
 
+      // Last resort: try Kimi even if not the primary model
       if (!this.kimiEnabled && config.kimiApiKey) {
         console.warn('[AI] Ollama empty — attempting Kimi API as last resort...');
         try {
@@ -430,7 +454,8 @@ ${selfAwareness.buildSelfKnowledge()}
         }
       }
 
-      console.error(`[AI] ALL LLM backends returned empty (model: ${this.model}, host: ${config.ollamaHost}, nim: ${config.kimiApiKey ? 'configured' : 'not set'})`);
+      // Everything failed
+      console.error(`[AI] ALL LLM backends returned empty (model: ${this.model}, host: ${config.ollamaHost}, kimi: ${config.kimiApiKey ? 'configured' : 'not set'})`);
       return `My AI brain isn't responding right now (model: ${this.model}). Try again in a moment, or check if the AI server is running.`;
     } catch (err) {
       console.error(`[AI] Chat error: ${err.message}`);
@@ -446,23 +471,36 @@ ${selfAwareness.buildSelfKnowledge()}
     }
   }
 
+  /**
+   * Finalize a response: scan for hallucinations, append warning if needed, truncate.
+   * All chat return paths should go through this.
+   * @param {string} cleaned — The cleaned LLM response
+   * @param {Array} history — Conversation history to push to
+   * @param {object} [liveDataContext] — The live data provided to the model (for cross-reference)
+   * @returns {string} — The final response to send to the user
+   */
   _finalizeResponse(cleaned, history, liveDataContext = {}) {
+    // Scan for hallucinations
     const scan = detectHallucinations(cleaned, liveDataContext);
     let final = cleaned;
 
     if (scan.flagged) {
       console.warn(`[AI] Hallucination detector flagged response (confidence: ${scan.confidence}%): ${scan.warnings.join('; ')}`);
 
+      // Only append warning to user-facing response if confidence is high enough
       if (scan.confidence >= 50) {
         const warning = buildHallucinationWarning(scan.warnings);
         final = cleaned + warning;
       }
     }
 
-    history.push({ role: 'assistant', content: cleaned });
+    history.push({ role: 'assistant', content: cleaned }); // Store clean version in history
     return final.length > 1990 ? final.slice(0, 1990) + '...' : final;
   }
 
+  /**
+   * Stream a chat response from Ollama, returning the raw text.
+   */
   async _ollamaChat(messages) {
     const stream = await this.ollama.chat({
       model: this.model,
@@ -482,28 +520,37 @@ ${selfAwareness.buildSelfKnowledge()}
     return result;
   }
 
+  /**
+   * Clean an LLM response: strip thinking tags, trim, validate non-empty.
+   * Returns the cleaned string or null if empty.
+   */
   _cleanResponse(text) {
     if (!text) return null;
 
+    // Strip thinking tags from models that use them (qwen3, deepseek, etc.)
     let cleaned = text
-      .replace(/ Think[\\s\\S]*?<\\/think>\\/gi, '')
-      .replace(/<|think|>([\\s\\S]*?)<\\/think|>/gi, '')
+      .replace(/ Think[\s\S]*?<\/think>/gi, '')
+      .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
       .trim();
 
+    // If stripping removed everything, try to salvage the thinking content
     if (!cleaned && text.trim()) {
-      const thinkMatch = text.match(/ Think([\\s\\S]*?)<\\/think>/i)
-        || text.match(/<|think|>([\\s\\S]*?)<\\/think|>/i);
+      const thinkMatch = text.match(/ Think([\s\S]*?)<\/think>/i)
+        || text.match(/<\|think\|>([\s\S]*?)<\|\/think\|>/i);
       if (thinkMatch) {
+        // The model only produced thinking — use the last sentence as a response
         const thoughts = thinkMatch[1].trim();
+        // Extract the last meaningful line as the "answer"
         const lines = thoughts.split('\n').filter(l => l.trim().length > 5);
         if (lines.length > 0) {
           cleaned = lines[lines.length - 1].trim();
-          console.warn(`[AI] Response was only content tags — salvaged: "${cleaned.slice(0, 80)}"`);
+          console.warn(`[AI] Response was only  Think tags — salvaged: "${cleaned.slice(0, 80)}"`);
         }
       }
 
+      // If still empty, just use the raw text (better than nothing)
       if (!cleaned) {
-        cleaned = text.replace(/<\\/think|<|think|>/gi, '').trim();
+        cleaned = text.replace(/<\/?think>/gi, '').replace(/<\|\/?think\|>/gi, '').trim();
       }
     }
 
@@ -513,11 +560,14 @@ ${selfAwareness.buildSelfKnowledge()}
   async complete(prompt) {
     const startTime = Date.now();
 
+    // Always include RAG enforcement for completions — prevents hallucination in
+    // autonomous posts, commentary, and other non-chat paths
     const systemMsg = {
       role: 'system',
       content: `${ragEnforcementBlock()}\n\n${selfAwareness.buildCompactSelfKnowledge()}\n\nYou are analyzing data provided in the user prompt. All prices, metrics, and market conditions in the prompt are current as of today (${todayString()}). Use ONLY the data given. Do NOT fill in gaps from training memory for any post-${MODEL_CUTOFF} facts.`,
     };
 
+    // Try Kimi agent mode first if enabled
     if (this.kimiEnabled) {
       try {
         const result = await this._kimiAgentChat([systemMsg, { role: 'user', content: prompt }]);
