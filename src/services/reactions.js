@@ -67,6 +67,14 @@ class ReactionLearningService {
     };
   }
 
+  // Get recent negative feedback (for the AI to learn what NOT to do)
+  getRecentNegative(count = 3) {
+    const feedback = this.store.get('feedback', []);
+    return feedback
+      .filter(f => !f.positive)
+      .slice(-count);
+  }
+
   // Get stats for a specific user
   getUserStats(userId) {
     return this.store.get(`user_${userId}`, { thumbsUp: 0, thumbsDown: 0 });

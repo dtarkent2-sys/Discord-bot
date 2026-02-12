@@ -47,7 +47,7 @@ module.exports = {
   botOwnerId: process.env.BOT_OWNER_ID || '',
   botPrefix: process.env.BOT_PREFIX || '!',
   port: parseInt(process.env.PORT, 10) || 3000,
-  dataDir: path.join(__dirname, '..', 'data'),
+  dataDir: process.env.DATA_DIR || path.join(__dirname, '..', 'data'),
   tradingChannelName: process.env.TRADING_CHANNEL || 'trading-floor',
   generalChannelName: process.env.GENERAL_CHANNEL || 'general',
   sharkAutoEnable: (process.env.SHARK_AUTO_ENABLE || '').toLowerCase() === 'true',

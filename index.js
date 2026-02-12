@@ -68,6 +68,10 @@ try {
 }
 
 log.info('Health server started, all modules loaded');
+log.info(`Data directory: ${config.dataDir} (${process.env.DATA_DIR ? 'volume-backed' : 'ephemeral — set DATA_DIR for persistence'})`);
+if (process.env.RAILWAY_ENVIRONMENT && !process.env.DATA_DIR) {
+  log.warn('⚠ DATA_DIR not set on Railway — memory, reactions, trade journal will be LOST on every deploy. Create a Railway volume and set DATA_DIR to the mount path.');
+}
 
 // ── Discord Client Setup ─────────────────────────────────────────────
 const client = new Client({
@@ -87,8 +91,19 @@ client.on('error', (err) => {
   console.error('[Discord Client Error]', err);
 });
 
-// Track recent bot replies so we can link reactions to original messages
-const recentBotReplies = new Map(); // botMessageId -> { userMessage, botResponse, userId }
+// Track recent bot replies so we can link reactions to original messages.
+// Backed by Storage so reactions still work after restarts/redeploys.
+const Storage = require('./src/services/storage');
+const _replyStore = new Storage('bot-replies.json');
+const recentBotReplies = new Map(Object.entries(_replyStore.get('replies', {})));
+
+// Persist the reply map to disk whenever it changes
+function _persistReplies() {
+  // Only keep last 200 entries in storage
+  const entries = [...recentBotReplies.entries()];
+  const trimmed = entries.slice(-200);
+  _replyStore.set('replies', Object.fromEntries(trimmed));
+}
 
 // ── Ready Event ──────────────────────────────────────────────────────
 client.once(Events.ClientReady, async (c) => {
@@ -217,13 +232,14 @@ client.on(Events.MessageCreate, async (message) => {
       userId: message.author.id,
     });
 
-    // Clean up old tracked replies (keep last 100)
-    if (recentBotReplies.size > 100) {
+    // Clean up old tracked replies (keep last 200) and persist
+    if (recentBotReplies.size > 200) {
       const keys = [...recentBotReplies.keys()];
-      for (let i = 0; i < keys.length - 100; i++) {
+      for (let i = 0; i < keys.length - 200; i++) {
         recentBotReplies.delete(keys[i]);
       }
     }
+    _persistReplies();
   } catch (err) {
     log.error('Message handling error:', err);
     stats.recordError();
