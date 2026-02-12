@@ -21,11 +21,13 @@
  *   - GEX Engine (gamma regime, walls, flip levels)
  *   - Technicals (RSI, MACD, Bollinger, ATR on intraday bars)
  *   - Macro (risk regime, sector rotation)
- *   - Alpaca (options chain, quotes, execution)
+ *   - Public.com (preferred: real-time options chain + greeks)
+ *   - Alpaca (fallback: indicative options chain, quotes, execution)
  *   - AI (Ollama decision engine)
  */
 
 const alpaca = require('./alpaca');
+const publicApi = require('./public');
 const gamma = require('./gamma');
 const GEXEngine = require('./gex-engine');
 const gammaSqueeze = require('./gamma-squeeze');
@@ -722,18 +724,38 @@ class OptionsEngine {
     const et = this._getETTime();
 
     try {
-      // Fetch options chain for today's expiration
-      const options = await alpaca.getOptionsSnapshots(underlying, et.todayString, optionType);
+      // Try Public.com first (real-time greeks), fall back to Alpaca
+      let options = [];
+      let hasRealGreeks = false;
+
+      if (publicApi.enabled) {
+        try {
+          options = await publicApi.getOptionsWithGreeks(underlying, et.todayString, optionType);
+          hasRealGreeks = options.some(o => o.delta && Math.abs(o.delta) > 0.01);
+          if (options.length > 0) {
+            this._log('contract', `${underlying}: using Public.com data (${options.length} contracts, greeks=${hasRealGreeks ? 'real' : 'missing'})`);
+          }
+        } catch (err) {
+          console.error(`[0DTE] Public.com chain error for ${underlying}: ${err.message} — falling back to Alpaca`);
+          options = [];
+        }
+      }
+
+      // Fallback: Alpaca indicative feed
+      if (options.length === 0) {
+        options = await alpaca.getOptionsSnapshots(underlying, et.todayString, optionType);
+        hasRealGreeks = options.some(o => o.delta && Math.abs(o.delta) > 0.01);
+        if (options.length > 0) {
+          this._log('contract', `${underlying}: using Alpaca data (${options.length} contracts, greeks=${hasRealGreeks ? 'real' : 'indicative'})`);
+        }
+      }
 
       if (options.length === 0) {
         this._log('contract', `${underlying}: no ${optionType} options for ${et.todayString}`);
         return null;
       }
 
-      // Check if the feed provides real delta values
-      // Alpaca's free 'indicative' feed often returns delta=0 for all contracts
-      const hasRealGreeks = options.some(o => o.delta && Math.abs(o.delta) > 0.01);
-
+      // If neither source has real greeks, estimate from moneyness
       if (!hasRealGreeks && spot) {
         this._log('contract', `${underlying}: no delta data from feed — estimating from moneyness (spot=$${spot})`);
         // Approximate delta from moneyness for 0DTE:
