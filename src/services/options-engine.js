@@ -53,6 +53,23 @@ const MARKET_OPEN_MIN = 30;
 const MARKET_CLOSE_HOUR = 16;
 const MARKET_CLOSE_MIN = 0;
 
+// Correlated underlyings — same directional bet
+const CORRELATED_GROUPS = [
+  new Set(['SPY', 'QQQ', 'IWM', 'DIA', 'SPX', 'NDX']),
+];
+
+// Hard limits that dangerous mode CANNOT override
+const HARD_LIMITS = {
+  maxTradesPerSymbolPerHour: 3,   // max 3 round trips per underlying per hour
+  maxTradesPerDay: 10,            // max 10 total options trades per day (user: "2-10 trades a day MAX")
+  maxCorrelatedPositions: 2,      // max 2 simultaneous positions in correlated underlyings
+  consecutiveLossCooldownMin: 30, // 30 min pause after 2 consecutive losses ("stop trading after 2 losses in a row")
+  consecutiveLossThreshold: 2,    // how many losses trigger the cooldown
+  minCooldownAfterLoss: 10,       // 10 min minimum cooldown after any loss (overrides config)
+  maxScalpHoldMinutes: 15,        // "don't hold more than 10-15 mins"
+  scalpBailMinutes: 5,            // "if it's not working in 5, get out"
+};
+
 class OptionsEngine {
   constructor() {
     this._storage = new Storage('options-engine-state.json');
@@ -60,6 +77,11 @@ class OptionsEngine {
     this._logs = [];
     this._postToChannel = null;
     this._activeTrades = new Map(); // occSymbol → { entry, strategy, underlying, ... }
+
+    // ── Trade discipline tracking ──
+    this._tradeHistory = [];          // [{ underlying, time, pnl, won }] — rolling 24h
+    this._consecutiveLosses = new Map(); // underlying → count of consecutive losses
+    this._lossCooldowns = new Map();     // underlying → timestamp when loss cooldown expires
 
     // Restore state
     const savedTrades = this._storage.get('activeTrades', []);
@@ -107,6 +129,162 @@ class OptionsEngine {
     const openMinute = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN;
     const closeMinute = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MIN;
     return minuteOfDay >= openMinute && minuteOfDay < closeMinute;
+  }
+
+  // ── Trade Discipline (hard limits) ──────────────────────────────
+
+  /**
+   * Check ALL throttle/discipline rules before allowing a new entry.
+   * Returns { allowed: true } or { allowed: false, reason: string }.
+   * These are HARD limits that dangerous mode cannot override.
+   */
+  _checkTradeDiscipline(underlying) {
+    const now = Date.now();
+
+    // Prune old history (keep last 24h)
+    this._tradeHistory = this._tradeHistory.filter(t => now - t.time < 24 * 60 * 60 * 1000);
+
+    // 1. Consecutive loss cooldown per underlying
+    const lossCooldownExpiry = this._lossCooldowns.get(underlying) || 0;
+    if (now < lossCooldownExpiry) {
+      const minsLeft = Math.ceil((lossCooldownExpiry - now) / 60000);
+      return { allowed: false, reason: `CONSECUTIVE_LOSS_COOLDOWN: ${underlying} paused for ${minsLeft} more min after ${HARD_LIMITS.consecutiveLossThreshold} consecutive losses` };
+    }
+
+    // 2. Per-symbol hourly trade cap
+    const oneHourAgo = now - 60 * 60 * 1000;
+    const symbolTradesThisHour = this._tradeHistory.filter(
+      t => t.underlying === underlying && t.time > oneHourAgo
+    ).length;
+    if (symbolTradesThisHour >= HARD_LIMITS.maxTradesPerSymbolPerHour) {
+      return { allowed: false, reason: `HOURLY_CAP: ${underlying} hit ${HARD_LIMITS.maxTradesPerSymbolPerHour} trades/hr limit (${symbolTradesThisHour} trades)` };
+    }
+
+    // 3. Daily total trade cap
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const tradesToday = this._tradeHistory.filter(t => t.time > todayStart.getTime()).length;
+    if (tradesToday >= HARD_LIMITS.maxTradesPerDay) {
+      return { allowed: false, reason: `DAILY_CAP: ${tradesToday}/${HARD_LIMITS.maxTradesPerDay} trades today — done for the day` };
+    }
+
+    // 4. Correlated position limit
+    const activeUnderlyings = new Set();
+    for (const trade of this._activeTrades.values()) {
+      activeUnderlyings.add(trade.underlying);
+    }
+    for (const group of CORRELATED_GROUPS) {
+      if (group.has(underlying)) {
+        const correlatedActive = [...activeUnderlyings].filter(u => group.has(u) && u !== underlying).length;
+        // Count current underlying's active positions too
+        const totalCorrelated = correlatedActive + (activeUnderlyings.has(underlying) ? 1 : 0);
+        if (totalCorrelated >= HARD_LIMITS.maxCorrelatedPositions) {
+          const active = [...activeUnderlyings].filter(u => group.has(u));
+          return { allowed: false, reason: `CORRELATED_LIMIT: already have ${active.join(', ')} (max ${HARD_LIMITS.maxCorrelatedPositions} correlated positions)` };
+        }
+      }
+    }
+
+    // 5. Post-loss minimum cooldown (longer than normal cooldown)
+    const lastLoss = this._tradeHistory
+      .filter(t => t.underlying === underlying && !t.won)
+      .sort((a, b) => b.time - a.time)[0];
+    if (lastLoss) {
+      const minsSinceLoss = (now - lastLoss.time) / 60000;
+      if (minsSinceLoss < HARD_LIMITS.minCooldownAfterLoss) {
+        return { allowed: false, reason: `POST_LOSS_COOLDOWN: ${underlying} last loss ${minsSinceLoss.toFixed(0)} min ago (need ${HARD_LIMITS.minCooldownAfterLoss} min)` };
+      }
+    }
+
+    return { allowed: true };
+  }
+
+  /**
+   * Record a completed trade for discipline tracking + trade journal.
+   * Called after every exit (both P&L and forced exits).
+   * "journal EVERY trade. I need to track WHY I entered, not just what happened"
+   */
+  _recordTradeResult(underlying, pnl, exitReason) {
+    const won = pnl > 0;
+    const now = Date.now();
+    this._tradeHistory.push({ underlying, time: now, pnl, won });
+
+    // ── Trade Journal (persistent) ──
+    // "review losers within 24hrs. figure out if it was a bad read or bad timing"
+    const tracked = [...this._activeTrades.values()].find(t => t.underlying === underlying);
+    const journal = this._storage.get('tradeJournal', []);
+    journal.push({
+      date: new Date().toISOString(),
+      underlying,
+      symbol: tracked?.symbol || underlying,
+      direction: tracked?.optionType || 'unknown',
+      strategy: tracked?.strategy || 'scalp',
+      conviction: tracked?.conviction || 0,
+      entryReason: tracked?.reason || 'unknown',
+      entryPrice: tracked?.entryPrice || 0,
+      entryTime: tracked?.entryTime || null,
+      exitTime: new Date().toISOString(),
+      holdMinutes: tracked?.entryTime ? ((now - new Date(tracked.entryTime).getTime()) / 60000).toFixed(1) : 'N/A',
+      exitReason: exitReason || 'unknown',
+      pnl: Number(pnl.toFixed(2)),
+      won,
+    });
+    // Keep last 200 journal entries
+    while (journal.length > 200) journal.shift();
+    this._storage.set('tradeJournal', journal);
+
+    if (won) {
+      // Reset consecutive losses on a win
+      this._consecutiveLosses.set(underlying, 0);
+    } else {
+      // Increment consecutive losses
+      const current = this._consecutiveLosses.get(underlying) || 0;
+      const newCount = current + 1;
+      this._consecutiveLosses.set(underlying, newCount);
+
+      // If threshold hit, set cooldown
+      // "stop trading after 2 losses in a row. tilt is real"
+      if (newCount >= HARD_LIMITS.consecutiveLossThreshold) {
+        const cooldownExpiry = Date.now() + HARD_LIMITS.consecutiveLossCooldownMin * 60 * 1000;
+        this._lossCooldowns.set(underlying, cooldownExpiry);
+        this._log('discipline', `${underlying}: ${newCount} consecutive losses — PAUSED for ${HARD_LIMITS.consecutiveLossCooldownMin} min`);
+
+        // Post to Discord
+        if (this._postToChannel) {
+          this._postToChannel(
+            `⛔ **${underlying} PAUSED** — ${newCount} consecutive losses. Cooling down for ${HARD_LIMITS.consecutiveLossCooldownMin} min.\n` +
+            `_Trade discipline: preventing tilt/revenge trading_`
+          ).catch(() => {});
+        }
+      }
+    }
+
+    // Log daily stats periodically
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayTrades = this._tradeHistory.filter(t => t.time > todayStart.getTime());
+    const wins = todayTrades.filter(t => t.won).length;
+    const losses = todayTrades.length - wins;
+    const totalPnL = todayTrades.reduce((sum, t) => sum + t.pnl, 0);
+    this._log('discipline', `Daily stats: ${todayTrades.length} trades (${wins}W/${losses}L), net P&L: $${totalPnL.toFixed(2)}`);
+  }
+
+  /**
+   * Get recent trade journal entries for review.
+   * "review losers within 24hrs"
+   */
+  getTradeJournal(count = 20) {
+    const journal = this._storage.get('tradeJournal', []);
+    return journal.slice(-count);
+  }
+
+  /**
+   * Get today's losers for review.
+   */
+  getTodayLosers() {
+    const journal = this._storage.get('tradeJournal', []);
+    const todayStr = new Date().toISOString().slice(0, 10);
+    return journal.filter(j => j.date.startsWith(todayStr) && !j.won);
   }
 
   // ── Main Cycle ────────────────────────────────────────────────────
@@ -200,6 +378,66 @@ class OptionsEngine {
       for (const pos of optionsPositions) {
         const tracked = this._activeTrades.get(pos.symbol);
         const strategy = tracked?.strategy || 'scalp';
+        const pnlPct = Number(pos.unrealized_plpc || 0);
+
+        // ── Scalp time-based exits (hard limits) ──
+        // "don't hold more than 10-15 mins. if it's not working in 5, get out"
+        if (strategy === 'scalp' && tracked?.entryTime) {
+          const holdMinutes = (Date.now() - new Date(tracked.entryTime).getTime()) / 60000;
+
+          // Bail at 5 min if not profitable
+          if (holdMinutes >= HARD_LIMITS.scalpBailMinutes && pnlPct <= 0) {
+            const pnl = Number(pos.unrealized_pl || 0);
+            this._log('monitor', `${pos.symbol}: SCALP BAIL — held ${holdMinutes.toFixed(0)} min, not profitable (${(pnlPct * 100).toFixed(1)}%)`);
+            try {
+              await alpaca.closeOptionsPosition(pos.symbol);
+              policy.recordOptionsTradeResult(pnl);
+              circuitBreaker.recordExit(pos.symbol, 'scalp_bail', pnlPct);
+              const parsed1 = alpaca._parseOccSymbol(pos.symbol);
+              this._recordTradeResult(parsed1.underlying, pnl, 'scalp_bail_5min');
+              this._activeTrades.delete(pos.symbol);
+              this._persistTrades();
+              if (this._postToChannel) {
+                await this._postToChannel(
+                  `⏱️ **Scalp Bail: ${parsed1.underlying} $${parsed1.strike} ${parsed1.type.toUpperCase()}**\n` +
+                  `Held ${holdMinutes.toFixed(0)} min, not working — cutting it.\n` +
+                  `P/L: \`$${pnl.toFixed(2)}\` (${(pnlPct * 100).toFixed(1)}%)\n` +
+                  `_${alpaca.isPaper ? 'Paper' : 'LIVE'} | "if it's not working in 5, get out"_`
+                );
+              }
+              continue; // Already closed, skip to next position
+            } catch (err) {
+              this._log('error', `Scalp bail failed for ${pos.symbol}: ${err.message}`);
+            }
+          }
+
+          // Hard max hold — 15 min regardless of P&L
+          if (holdMinutes >= HARD_LIMITS.maxScalpHoldMinutes) {
+            const pnl = Number(pos.unrealized_pl || 0);
+            this._log('monitor', `${pos.symbol}: SCALP TIME LIMIT — held ${holdMinutes.toFixed(0)} min (max ${HARD_LIMITS.maxScalpHoldMinutes})`);
+            try {
+              await alpaca.closeOptionsPosition(pos.symbol);
+              policy.recordOptionsTradeResult(pnl);
+              circuitBreaker.recordExit(pos.symbol, 'scalp_time_limit', pnlPct);
+              const parsed1 = alpaca._parseOccSymbol(pos.symbol);
+              this._recordTradeResult(parsed1.underlying, pnl, 'scalp_time_limit_15min');
+              this._activeTrades.delete(pos.symbol);
+              this._persistTrades();
+              if (this._postToChannel) {
+                const emoji = pnl >= 0 ? '🟢' : '🔴';
+                await this._postToChannel(
+                  `${emoji} **Scalp Time Exit: ${parsed1.underlying} $${parsed1.strike} ${parsed1.type.toUpperCase()}**\n` +
+                  `Max hold time reached (${HARD_LIMITS.maxScalpHoldMinutes} min)\n` +
+                  `P/L: \`$${pnl.toFixed(2)}\` (${(pnlPct * 100).toFixed(1)}%)\n` +
+                  `_${alpaca.isPaper ? 'Paper' : 'LIVE'} | "don't hold more than 10-15 mins"_`
+                );
+              }
+              continue; // Already closed, skip to next position
+            } catch (err) {
+              this._log('error', `Scalp time exit failed for ${pos.symbol}: ${err.message}`);
+            }
+          }
+        }
 
         const exits = policy.checkOptionsExits([pos], strategy, minutesToClose);
         for (const exit of exits) {
@@ -211,6 +449,10 @@ class OptionsEngine {
             const pnl = Number(pos.unrealized_pl || 0);
             policy.recordOptionsTradeResult(pnl);
             circuitBreaker.recordExit(exit.symbol, exit.reason, exit.pnlPct);
+
+            // Record for trade discipline (consecutive loss tracking, hourly caps, etc.)
+            const parsed0 = alpaca._parseOccSymbol(exit.symbol);
+            this._recordTradeResult(parsed0.underlying, pnl, exit.reason);
 
             // Remove from tracking
             this._activeTrades.delete(exit.symbol);
@@ -293,6 +535,13 @@ class OptionsEngine {
    */
   async _analyzeUnderlying(underlying, macroRegime, et) {
     const cfg = policy.getConfig();
+
+    // ── Hard trade discipline checks (cannot be overridden by dangerous mode) ──
+    const discipline = this._checkTradeDiscipline(underlying);
+    if (!discipline.allowed) {
+      this._log('discipline', `${underlying}: BLOCKED — ${discipline.reason}`);
+      return null;
+    }
 
     // Cooldown per-underlying — only applies after a TRADE was executed (not after analysis skips).
     // This lets the engine re-evaluate quickly as conditions change, while preventing
@@ -1019,6 +1268,13 @@ class OptionsEngine {
 
     this._log('alert_trigger', `${underlying}: TradingView ${alert.action} signal received — "${alert.reason || alert.action}" [${alert.confidence || 'no conf'}] — running full analysis`);
 
+    // Hard trade discipline check (consecutive losses, hourly cap, daily cap, correlation)
+    const discipline = this._checkTradeDiscipline(underlying);
+    if (!discipline.allowed) {
+      this._log('alert_trigger', `${underlying}: BLOCKED by discipline — ${discipline.reason}`);
+      return;
+    }
+
     const et = this._getETTime();
 
     // Skip first 15 min after open
@@ -1208,6 +1464,12 @@ class OptionsEngine {
       return { success: false, message: 'Kill switch is active — trading halted.' };
     }
 
+    // Hard trade discipline check
+    const discipline = this._checkTradeDiscipline(underlying);
+    if (!discipline.allowed) {
+      return { success: false, message: `Trade blocked: ${discipline.reason}` };
+    }
+
     const et = this._getETTime();
     const steps = [];
 
@@ -1349,6 +1611,37 @@ class OptionsEngine {
         minConviction: cfg.options_min_conviction,
         underlyings: cfg.options_underlyings,
       },
+      // Trade discipline stats
+      discipline: (() => {
+        const now = Date.now();
+        const todayStart = new Date();
+        todayStart.setHours(0, 0, 0, 0);
+        const todayTrades = this._tradeHistory.filter(t => t.time > todayStart.getTime());
+        const oneHourAgo = now - 60 * 60 * 1000;
+        const wins = todayTrades.filter(t => t.won).length;
+        const losses = todayTrades.length - wins;
+        const netPnl = todayTrades.reduce((sum, t) => sum + t.pnl, 0);
+        const paused = [];
+        for (const [sym, expiry] of this._lossCooldowns) {
+          if (now < expiry) paused.push(`${sym} (${Math.ceil((expiry - now) / 60000)} min)`);
+        }
+        return {
+          tradesToday: todayTrades.length,
+          maxTradesPerDay: HARD_LIMITS.maxTradesPerDay,
+          wins,
+          losses,
+          winRate: todayTrades.length > 0 ? `${((wins / todayTrades.length) * 100).toFixed(0)}%` : 'N/A',
+          netPnl: `$${netPnl.toFixed(2)}`,
+          perSymbolThisHour: Object.fromEntries(
+            (cfg.options_underlyings || ['SPY', 'QQQ']).map(sym => [
+              sym,
+              `${this._tradeHistory.filter(t => t.underlying === sym && t.time > oneHourAgo).length}/${HARD_LIMITS.maxTradesPerSymbolPerHour}`,
+            ])
+          ),
+          consecutiveLosses: Object.fromEntries(this._consecutiveLosses),
+          pausedSymbols: paused,
+        };
+      })(),
       recentLogs: this._logs.slice(-10),
     };
   }
@@ -1385,6 +1678,21 @@ class OptionsEngine {
     lines.push(`Swing: TP \`${status.config.swingTP}\` / SL \`${status.config.swingSL}\``);
     lines.push(`Min Conviction: \`${status.config.minConviction}/10\``);
     lines.push(`Underlyings: \`${status.config.underlyings.join(', ')}\``);
+
+    // Trade discipline
+    if (status.discipline) {
+      const d = status.discipline;
+      lines.push(``);
+      lines.push(`**Trade Discipline**`);
+      lines.push(`Trades today: \`${d.tradesToday}/${d.maxTradesPerDay}\` | Win rate: \`${d.winRate}\` (${d.wins}W/${d.losses}L) | Net: \`${d.netPnl}\``);
+      if (d.perSymbolThisHour) {
+        const hourly = Object.entries(d.perSymbolThisHour).map(([s, c]) => `${s}:${c}`).join(' ');
+        lines.push(`Hourly trades: \`${hourly}\``);
+      }
+      if (d.pausedSymbols && d.pausedSymbols.length > 0) {
+        lines.push(`⛔ Paused: \`${d.pausedSymbols.join(', ')}\``);
+      }
+    }
 
     return lines.join('\n');
   }

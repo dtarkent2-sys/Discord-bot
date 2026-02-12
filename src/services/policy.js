@@ -20,9 +20,12 @@ const config = require('../config');
 const Storage = require('./storage');
 
 // Config version — increment when defaults change to trigger migration
-const CONFIG_VERSION = 2;
+const CONFIG_VERSION = 3;
 
-// Dangerous mode — aggressive trading overrides
+// Dangerous mode — aggressive but NOT reckless trading overrides
+// NOTE: The options engine has HARD LIMITS (max 3 trades/hr/symbol, max 10/day,
+// consecutive loss cooldowns, correlated position limits) that dangerous mode
+// CANNOT override. Those protect against the overtrading seen on 2026-02-12.
 const DANGEROUS_CONFIG = {
   max_positions: 10,
   max_notional_per_trade: 10000,      // $10,000
@@ -37,11 +40,11 @@ const DANGEROUS_CONFIG = {
   position_size_pct: 0.40,             // 40% of cash per trade
   scan_interval_minutes: 2,            // scan every 2 min
   options_max_premium_per_trade: 1000, // $1,000
-  options_max_daily_loss: 2500,        // $2,500
-  options_max_positions: 5,
-  options_min_conviction: 3,           // lower bar
-  options_cooldown_minutes: 2,         // rapid re-entry
-  options_max_spread_pct: 0.15,        // accept wider spreads
+  options_max_daily_loss: 1500,        // $1,500 (was $2,500 — too much rope)
+  options_max_positions: 3,            // 3 (was 5 — correlated positions = same bet)
+  options_min_conviction: 5,           // 5 (was 3 — low conviction = coin flip)
+  options_cooldown_minutes: 8,         // 8 min (was 2 — too fast for 0DTE)
+  options_max_spread_pct: 0.12,        // 12% (was 15% — wider = worse fills)
 };
 
 // Default configuration — tunable via /agent set or runtime
@@ -66,10 +69,10 @@ const DEFAULT_CONFIG = {
   options_max_premium_per_trade: 500,   // max $ premium per single options trade
   options_max_daily_loss: 1000,         // max $ options loss per day before halt
   options_max_positions: 3,             // max concurrent options positions
-  options_scalp_take_profit_pct: 0.30,  // 30% profit target for scalps
-  options_scalp_stop_loss_pct: 0.25,    // 25% stop loss for scalps
-  options_swing_take_profit_pct: 0.75,  // 75% profit target for swings
-  options_swing_stop_loss_pct: 0.40,    // 40% stop loss for swings
+  options_scalp_take_profit_pct: 0.20,  // 20% profit target for scalps (quick in/out)
+  options_scalp_stop_loss_pct: 0.10,    // 10% stop loss for scalps ("tight stops, 5-10% max on the premium")
+  options_swing_take_profit_pct: 0.50,  // 50% profit target for swings
+  options_swing_stop_loss_pct: 0.25,    // 25% stop loss for swings
   options_min_conviction: 5,            // min AI conviction (1-10) to enter a trade
   options_close_before_minutes: 30,     // close 0DTE positions X min before market close
   options_min_delta: 0.15,              // min option delta for contract selection (widened for 0DTE)
@@ -271,6 +274,27 @@ class PolicyEngine {
       if (this.config.options_max_delta === 0.60) {
         this.config.options_max_delta = DEFAULT_CONFIG.options_max_delta;
         console.log(`[Policy] Migrated options_max_delta: 0.60 → ${DEFAULT_CONFIG.options_max_delta}`);
+      }
+    }
+
+    if (fromVersion < 3) {
+      // v2 → v3: tighter scalp stops (25%→10%), lower scalp TP (30%→20%), lower swing SL/TP
+      // "tight stops. like 5-10% max on the premium"
+      if (this.config.options_scalp_stop_loss_pct === 0.25) {
+        this.config.options_scalp_stop_loss_pct = DEFAULT_CONFIG.options_scalp_stop_loss_pct;
+        console.log(`[Policy] Migrated options_scalp_stop_loss_pct: 0.25 → ${DEFAULT_CONFIG.options_scalp_stop_loss_pct}`);
+      }
+      if (this.config.options_scalp_take_profit_pct === 0.30) {
+        this.config.options_scalp_take_profit_pct = DEFAULT_CONFIG.options_scalp_take_profit_pct;
+        console.log(`[Policy] Migrated options_scalp_take_profit_pct: 0.30 → ${DEFAULT_CONFIG.options_scalp_take_profit_pct}`);
+      }
+      if (this.config.options_swing_stop_loss_pct === 0.40) {
+        this.config.options_swing_stop_loss_pct = DEFAULT_CONFIG.options_swing_stop_loss_pct;
+        console.log(`[Policy] Migrated options_swing_stop_loss_pct: 0.40 → ${DEFAULT_CONFIG.options_swing_stop_loss_pct}`);
+      }
+      if (this.config.options_swing_take_profit_pct === 0.75) {
+        this.config.options_swing_take_profit_pct = DEFAULT_CONFIG.options_swing_take_profit_pct;
+        console.log(`[Policy] Migrated options_swing_take_profit_pct: 0.75 → ${DEFAULT_CONFIG.options_swing_take_profit_pct}`);
       }
     }
 
