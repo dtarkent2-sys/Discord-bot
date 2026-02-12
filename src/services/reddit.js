@@ -1,3 +1,19 @@
+/**
+ * Reddit Social Sentiment Scraper
+ *
+ * Scrapes trending stock discussions from 4 subreddits (matching MAHORAGA reference):
+ *   - r/wallstreetbets (retail / YOLO plays)
+ *   - r/stocks (general stock discussion)
+ *   - r/investing (longer-term / conservative)
+ *   - r/options (options plays, flow)
+ *
+ * Uses Reddit's public JSON API — no auth required, just proper User-Agent.
+ * Rate limit: ~60 requests/minute without auth.
+ *
+ * Extracts ticker mentions ($AAPL, AAPL, etc.) from post titles and
+ * calculates aggregate sentiment (upvote ratio, engagement, flair).
+ */
+
 const SUBREDDITS = ['wallstreetbets', 'stocks', 'investing', 'options'];
 
 const REDDIT_HEADERS = {
@@ -5,9 +21,12 @@ const REDDIT_HEADERS = {
   'Accept': 'application/json',
 };
 
+// Common ticker pattern: $AAPL or standalone uppercase 2-5 letter symbols
 const TICKER_REGEX = /\$([A-Z]{1,5})\b/g;
+// More aggressive: standalone uppercase words that look like tickers (3-5 chars, not common words)
 const LOOSE_TICKER_REGEX = /\b([A-Z]{2,5})\b/g;
 
+// Common English words to exclude from loose ticker matching
 const NOT_TICKERS = new Set([
   'THE', 'AND', 'FOR', 'ARE', 'BUT', 'NOT', 'YOU', 'ALL', 'CAN', 'HAD', 'HER',
   'WAS', 'ONE', 'OUR', 'OUT', 'HAS', 'HIS', 'HOW', 'ITS', 'LET', 'MAY', 'NEW',
@@ -37,32 +56,6 @@ class RedditService {
     this._mentionCacheMs = 10 * 60 * 1000; // 10 min aggregate cache
   }
 
-  _extractTickers(text) {
-    if (!text) return [];
-    const tickers = new Set();
-
-    // First pass: explicit $TICKER mentions (high confidence)
-    let match;
-    TICKER_REGEX.lastIndex = 0;
-    while ((match = TICKER_REGEX.exec(text)) !== null) {
-      const sym = match[1];
-      if (sym.length >= 1 && sym.length <= 5 && !NOT_TICKERS.has(sym)) {
-        tickers.add(sym);
-      }
-    }
-
-    // Second pass: loose uppercase words (lower confidence)
-    LOOSE_TICKER_REGEX.lastIndex = 0;
-    while ((match = LOOSE_TICKER_REGEX.exec(text)) !== null) {
-      const sym = match[1];
-      if (sym.length >= 2 && sym.length <= 5 && !NOT_TICKERS.has(sym)) {
-        tickers.add(sym);
-      }
-    }
-
-    return [...tickers];
-  }
-
   /**
    * Fetch hot posts from a single subreddit.
    * @param {string} subreddit
@@ -85,7 +78,7 @@ class RedditService {
       if (!res.ok) {
         if (res.status === 429) {
           console.warn(`[Reddit] Rate limited on r/${subreddit}`);
-          return [];
+          return cached?.posts || [];
         }
         throw new Error(`Reddit ${res.status}`);
       }
@@ -117,7 +110,7 @@ class RedditService {
       return posts;
     } catch (err) {
       console.warn(`[Reddit] Fetch failed for r/${subreddit}: ${err.message}`);
-      return [];
+      return cached?.posts || [];
     }
   }
 
@@ -253,6 +246,34 @@ class RedditService {
         flair: p.flair,
       })),
     };
+  }
+
+  /**
+   * Extract ticker symbols from text.
+   */
+  _extractTickers(text) {
+    const tickers = new Set();
+
+    // First pass: explicit $TICKER mentions (high confidence)
+    let match;
+    TICKER_REGEX.lastIndex = 0;
+    while ((match = TICKER_REGEX.exec(text)) !== null) {
+      const sym = match[1];
+      if (sym.length >= 1 && sym.length <= 5 && !NOT_TICKERS.has(sym)) {
+        tickers.add(sym);
+      }
+    }
+
+    // Second pass: loose uppercase words (lower confidence, need more validation)
+    LOOSE_TICKER_REGEX.lastIndex = 0;
+    while ((match = LOOSE_TICKER_REGEX.exec(text)) !== null) {
+      const sym = match[1];
+      if (sym.length >= 2 && sym.length <= 5 && !NOT_TICKERS.has(sym)) {
+        tickers.add(sym);
+      }
+    }
+
+    return [...tickers];
   }
 
   clearCache() {

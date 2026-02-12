@@ -90,29 +90,13 @@ Output the complete fixed file:
             return message.channel.send(`📝 Proposed fix:\n\`\`\`diff\n${aiResult.newCode}\n\`\`\``);
         }
 
-        // 6. Commit the fix to a self-heal branch (never directly to main)
-        const today = new Date().toISOString().slice(0, 10);
-        const branchName = `self-heal/${today}`;
-        const branch = await github.ensureBranch(branchName);
-        if (!branch) {
-            return thinkingMsg.edit('❌ Failed to create self-heal branch.');
-        }
-
+        // 6. Commit the fix automatically
         const commitMsg = `🔧 SELF-HEAL: Critical fix for ${filePath}`;
-        const updateResult = await github.updateFileOnBranch(filePath, aiResult.newCode, commitMsg, branchName);
+        const updateResult = await github.updateFile(filePath, aiResult.newCode, commitMsg);
 
         if (updateResult.success) {
             selfhealCooldowns.set(filePath, Date.now());
-
-            // Create/find PR for review
-            const pr = await github.ensurePullRequest(
-              branchName,
-              `Self-heal fixes ${today}`,
-              `Automated critical fixes from \`!selfheal\` on ${today}.`
-            );
-            const prLink = pr ? `\nPR for review: ${pr.url}` : '';
-
-            await thinkingMsg.edit(`✅ **Self-healed \`${filePath}\`!** Fix committed to branch \`${branchName}\`.\n${updateResult.url}${prLink}\n\n_Review & merge the PR when ready — main stays safe._`);
+            await thinkingMsg.edit(`✅ **Self-healed \`${filePath}\`!** Fix committed automatically.\n${updateResult.url}\n\n**Bot restart required on Railway.**`);
         } else {
             await thinkingMsg.edit(`❌ Commit failed: ${updateResult.error}`);
         }
