@@ -15,7 +15,9 @@ const cryptoMap = {
 function sanitizeTicker(ticker) {
   if (!ticker || typeof ticker !== 'string') return null;
   const cleaned = ticker.replace(/[^A-Za-z0-9.\-]/g, '').trim();
-  if (!cleaned || cleaned.length > 12) return null;
+  // Reject tickers prefixed with $ or / unless they resolve cleanly to uppercase symbol only
+  if (/^[^A-Za-z0-9]+/.test(ticker.trim())) return null;
+  if (cleaned.length > 12) return null;
   return cleaned.toUpperCase();
 }
 
