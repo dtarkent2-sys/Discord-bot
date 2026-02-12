@@ -347,6 +347,118 @@ class MarketDataClient {
     }));
   }
 
+  // ── Screening — advanced stock screener ─────────────────────────────
+
+  /**
+   * Screen stocks using FMP's company-screener endpoint.
+   * @param {object} filters — screening criteria:
+   *   marketCapMin/marketCapMax, volumeMin/volumeMax, priceMin/priceMax,
+   *   betaMin/betaMax, dividendMin/dividendMax,
+   *   sector, industry, exchange, country,
+   *   isActivelyTrading, isEtf, isFund, limit
+   * @returns {Array} — matching stocks with quote data
+   */
+  async screenStocks(filters = {}) {
+    const params = {};
+
+    // Market cap
+    if (filters.marketCapMin != null) params.marketCapMoreThan = filters.marketCapMin;
+    if (filters.marketCapMax != null) params.marketCapLowerThan = filters.marketCapMax;
+
+    // Volume
+    if (filters.volumeMin != null) params.volumeMoreThan = filters.volumeMin;
+    if (filters.volumeMax != null) params.volumeLowerThan = filters.volumeMax;
+
+    // Price
+    if (filters.priceMin != null) params.priceMoreThan = filters.priceMin;
+    if (filters.priceMax != null) params.priceLowerThan = filters.priceMax;
+
+    // Beta
+    if (filters.betaMin != null) params.betaMoreThan = filters.betaMin;
+    if (filters.betaMax != null) params.betaLowerThan = filters.betaMax;
+
+    // Dividend yield
+    if (filters.dividendMin != null) params.dividendMoreThan = filters.dividendMin;
+    if (filters.dividendMax != null) params.dividendLowerThan = filters.dividendMax;
+
+    // Classification
+    if (filters.sector) params.sector = filters.sector;
+    if (filters.industry) params.industry = filters.industry;
+    if (filters.exchange) params.exchange = filters.exchange;
+    if (filters.country) params.country = filters.country || 'US';
+
+    // Flags
+    if (filters.isActivelyTrading != null) params.isActivelyTrading = filters.isActivelyTrading;
+    if (filters.isEtf != null) params.isEtf = filters.isEtf;
+    if (filters.isFund != null) params.isFund = filters.isFund;
+
+    // Results limit (default 50, max 1000)
+    params.limit = Math.min(filters.limit || 50, 1000);
+
+    const data = await this._retry(
+      () => this._fmpFetch('/company-screener', params),
+      'screener'
+    );
+
+    if (!Array.isArray(data) || data.length === 0) return [];
+
+    return data.map(q => ({
+      symbol: q.symbol,
+      shortName: q.companyName || q.name,
+      regularMarketPrice: q.price,
+      regularMarketChangePercent: q.changesPercentage ?? null,
+      regularMarketVolume: q.volume ?? null,
+      marketCap: q.marketCap ?? null,
+      sector: q.sector || null,
+      industry: q.industry || null,
+      exchange: q.exchangeShortName || q.exchange || null,
+      beta: q.beta ?? null,
+      lastDividend: q.lastAnnualDividend ?? null,
+      country: q.country || null,
+      isActivelyTrading: q.isActivelyTrading ?? null,
+    }));
+  }
+
+  // ── Screening — top losers ──────────────────────────────────────────
+
+  async screenByLosers() {
+    const data = await this._retry(
+      () => this._fmpFetch('/biggest-losers'),
+      'losers'
+    );
+
+    if (!Array.isArray(data) || data.length === 0) return [];
+
+    return data.slice(0, 20).map(q => ({
+      symbol: q.symbol,
+      shortName: q.name,
+      regularMarketPrice: q.price,
+      regularMarketChangePercent: q.changesPercentage,
+      regularMarketVolume: q.volume || null,
+      marketCap: q.marketCap || null,
+    }));
+  }
+
+  // ── Screening — most active by volume ───────────────────────────────
+
+  async screenByMostActive() {
+    const data = await this._retry(
+      () => this._fmpFetch('/most-active'),
+      'most-active'
+    );
+
+    if (!Array.isArray(data) || data.length === 0) return [];
+
+    return data.slice(0, 20).map(q => ({
+      symbol: q.symbol,
+      shortName: q.name,
+      regularMarketPrice: q.price,
+      regularMarketChangePercent: q.changesPercentage,
+      regularMarketVolume: q.volume || null,
+      marketCap: q.marketCap || null,
+    }));
+  }
+
   // ── Format helpers ────────────────────────────────────────────────────
 
   formatQuoteForDiscord(quote) {

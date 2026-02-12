@@ -307,7 +307,7 @@ async function handlePrice(interaction) {
   }
 }
 
-// ── /screen — Run a stock screen (trending) ─────────────────────────
+// ── /screen — Run a stock screen ─────────────────────────────────────
 async function handleScreen(interaction) {
   await interaction.deferReply();
 
@@ -315,20 +315,115 @@ async function handleScreen(interaction) {
   const rulesStr = interaction.options.getString('rules');
 
   try {
-    // Use FMP top gainers as a screen
-    const quotes = await yahoo.screenByGainers();
+    let quotes;
+    let screenLabel = 'Top Gainers';
 
-    if (quotes.length === 0) {
+    // Parse rules into screener filters if provided
+    if (rulesStr) {
+      const filters = _parseScreenRules(rulesStr, universe);
+      quotes = await yahoo.screenStocks(filters);
+      screenLabel = 'Screener';
+    } else {
+      // Default: use universe to pick screen type
+      const lower = (universe || '').toLowerCase();
+      if (lower.includes('loser') || lower.includes('drop')) {
+        quotes = await yahoo.screenByLosers();
+        screenLabel = 'Top Losers';
+      } else if (lower.includes('active') || lower.includes('volume')) {
+        quotes = await yahoo.screenByMostActive();
+        screenLabel = 'Most Active';
+      } else {
+        quotes = await yahoo.screenByGainers();
+        screenLabel = 'Top Gainers';
+      }
+    }
+
+    if (!quotes || quotes.length === 0) {
       await interaction.editReply('No screen results available right now. Try again later.');
       return;
     }
 
     const formatted = yahoo.formatScreenForDiscord(quotes);
-    await interaction.editReply(`**Screen: ${universe}**${rulesStr ? ` | Rules: ${rulesStr}` : ''}\n${formatted}\n\n_Top gainers via FMP_`);
+    await interaction.editReply(`**Screen: ${universe}** (${screenLabel})${rulesStr ? ` | Rules: ${rulesStr}` : ''}\n${formatted}\n\n_Data via FMP_`);
   } catch (err) {
     console.error(`[Screen] Error:`, err);
     await interaction.editReply(`Screen failed: ${err.message}`);
   }
+}
+
+/**
+ * Parse user-provided screen rules into FMP screener filters.
+ * Examples: "PE < 15, MktCap > 1e9", "volume > 5M, sector = tech"
+ */
+function _parseScreenRules(rulesStr, universe) {
+  const filters = { country: 'US', isActivelyTrading: true };
+  const rules = rulesStr.split(',').map(r => r.trim().toLowerCase());
+
+  for (const rule of rules) {
+    // Match patterns like "mktcap > 1e9", "pe < 15", "volume > 5M", "sector = tech"
+    const match = rule.match(/^(\w+)\s*([<>=!]+)\s*(.+)$/);
+    if (!match) continue;
+
+    const [, key, op, rawVal] = match;
+    const val = _parseNumericValue(rawVal.trim());
+
+    switch (key) {
+      case 'mktcap': case 'marketcap': case 'cap':
+        if (op.includes('>')) filters.marketCapMin = val;
+        else if (op.includes('<')) filters.marketCapMax = val;
+        break;
+      case 'volume': case 'vol':
+        if (op.includes('>')) filters.volumeMin = val;
+        else if (op.includes('<')) filters.volumeMax = val;
+        break;
+      case 'price':
+        if (op.includes('>')) filters.priceMin = val;
+        else if (op.includes('<')) filters.priceMax = val;
+        break;
+      case 'beta':
+        if (op.includes('>')) filters.betaMin = val;
+        else if (op.includes('<')) filters.betaMax = val;
+        break;
+      case 'dividend': case 'div': case 'yield':
+        if (op.includes('>')) filters.dividendMin = val;
+        else if (op.includes('<')) filters.dividendMax = val;
+        break;
+      case 'sector':
+        filters.sector = _normalizeSector(rawVal.trim());
+        break;
+      case 'industry':
+        filters.industry = rawVal.trim();
+        break;
+      case 'exchange':
+        filters.exchange = rawVal.trim().toUpperCase();
+        break;
+    }
+  }
+
+  return filters;
+}
+
+function _parseNumericValue(str) {
+  const lower = str.toLowerCase().replace(/,/g, '');
+  if (lower.endsWith('t')) return parseFloat(lower) * 1e12;
+  if (lower.endsWith('b')) return parseFloat(lower) * 1e9;
+  if (lower.endsWith('m')) return parseFloat(lower) * 1e6;
+  if (lower.endsWith('k')) return parseFloat(lower) * 1e3;
+  if (lower.includes('e')) return Number(lower);
+  return parseFloat(lower);
+}
+
+function _normalizeSector(raw) {
+  const map = {
+    tech: 'Technology', technology: 'Technology',
+    health: 'Healthcare', healthcare: 'Healthcare',
+    energy: 'Energy', finance: 'Financial Services',
+    financial: 'Financial Services', consumer: 'Consumer Cyclical',
+    industrial: 'Industrials', 'real estate': 'Real Estate',
+    utilities: 'Utilities', materials: 'Basic Materials',
+    communication: 'Communication Services',
+  };
+  return map[raw.toLowerCase()] || raw;
 }
 
 // ── /help — List all available commands ──────────────────────────────
