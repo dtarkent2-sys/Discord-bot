@@ -172,8 +172,12 @@ class AuditLog {
         if (prefixFiles.length > MAX_LOG_FILES) {
           const toDelete = prefixFiles.slice(0, prefixFiles.length - MAX_LOG_FILES);
           for (const file of toDelete) {
-            fs.unlinkSync(path.join(LOG_DIR, file));
-            console.log(`[AuditLog] Cleaned old log: ${file}`);
+            try {
+              fs.unlinkSync(path.join(LOG_DIR, file));
+              console.log(`[AuditLog] Cleaned old log: ${file}`);
+            } catch (unlinkErr) {
+              console.error(`[AuditLog] Could not delete ${file}:`, unlinkErr.message);
+            }
           }
         }
       }
