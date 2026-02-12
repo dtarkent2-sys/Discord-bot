@@ -217,7 +217,7 @@ class SharkEngine {
       let macroRegime = { regime: 'CAUTIOUS', score: 0, positionMultiplier: 1.0, topSectors: [], bottomSectors: [] };
       try {
         macroRegime = await macro.getRegime();
-        this._log('macro', `Market regime: ${macroRegime.regime} (score: ${macroRegime.score}, sizing: ${macroRegime.positionMultiplier}x)`;
+        this._log('macro', `Market regime: ${macroRegime.regime} (score: ${macroRegime.score}, sizing: ${macroRegime.positionMultiplier}x)`);
 
         // In RISK_OFF, skip scanning for new positions entirely (just monitor exits)
         if (macroRegime.regime === 'RISK_OFF') {

@@ -710,7 +710,7 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
 
         result = result
           .replace(/ Thought[\s\S]*?<\/think>/gi, '')
-          .replace(/<|think>[\s\S]*?<|\\/think>/gi, '')
+          .replace(/<think>[\s\S]*?<\/think>/gi, '')
           .trim();
 
         if (!result || result.trim().length < 30) {
