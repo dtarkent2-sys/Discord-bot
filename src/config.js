@@ -60,6 +60,10 @@ module.exports = {
   alertMinConviction: parseInt(process.env.ALERT_MIN_CONVICTION, 10) || 4, // Only post alerts with conviction >= this (1-10, default 4 = show most signals)
   webhookSecret: process.env.WEBHOOK_SECRET || '', // Optional auth for TradingView webhook
 
+  // Public.com API (real-time options chain + greeks)
+  publicApiKey: process.env.PUBLIC_API_KEY || '',
+  publicAccountId: process.env.PUBLIC_ACCOUNT_ID || '',
+
   // AInvest API (news, candles, fundamentals, analyst ratings, earnings)
   ainvestApiKey: process.env.AINVEST_API_KEY || '',
   ainvestBaseUrl: process.env.AINVEST_BASE_URL || 'https://openapi.ainvest.com/open',
