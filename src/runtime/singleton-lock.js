@@ -138,7 +138,7 @@ function _createRedisClient(redisUrl) {
       } else {
         resolve(client);
       }
-    });
+    }
 
     socket.on('error', reject);
     setTimeout(() => reject(new Error('Redis connection timeout')), 5000);
