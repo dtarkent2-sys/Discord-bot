@@ -1,19 +1,3 @@
-/**
- * TradingAgents — Multi-agent LLM trading analysis pipeline.
- *
- * Inspired by https://github.com/TauricResearch/TradingAgents
- *
- * Pipeline:
- *   1. Four analyst agents run in parallel (Market, Fundamentals, News, Sentiment)
- *   2. Bull vs Bear debate synthesizes the analyst reports
- *   3. Trader agent makes a BUY / SELL / HOLD decision
- *   4. Three risk managers (aggressive, moderate, conservative) review
- *   5. Final signal is produced with confidence level
- *
- * All LLM calls go through the existing Ollama client.
- * AInvest data is fetched per-analyst for maximum richness.
- */
-
 const { Ollama } = require('ollama');
 const config = require('../config');
 const yahoo = require('./yahoo');
@@ -746,9 +730,9 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
 
         clearTimeout(timeout);
 
-        // Strip thinking tags (qwen3, deepseek, etc. wrap responses in <think> blocks)
+        // Strip thinking tags (qwen3, deepseek, etc. wrap responses in  ...>
         result = result
-          .replace(/<think>[\s\S]*?<\/think>/gi, '')
+          .replace(/ Think[\s\S]*?<\/think>/gi, '')
           .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
           .trim();
 
@@ -917,117 +901,7 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
     const sentences = text.split(/[.!]\s+/).filter(s => s.length > 20 && !s.startsWith('SIGNAL') && !s.startsWith('CONFIDENCE'));
     return sentences.length > 0 ? sentences[0].trim().slice(0, 300) + '.' : text.slice(0, 300);
   }
-
-  // ── Discord Formatting ────────────────────────────────────────────────
-
-  formatForDiscord(result) {
-    const emoji = { BUY: '🟢', SELL: '🔴', HOLD: '🟡' };
-    const sig = result.signal || 'HOLD';
-    const conf = result.confidence || 5;
-    const confBar = '█'.repeat(conf) + '░'.repeat(10 - conf);
-
-    const lines = [
-      `${emoji[sig] || '🟡'} **TradingAgents Analysis: ${result.ticker}** ${emoji[sig] || '🟡'}`,
-      '',
-      `**Signal: ${sig}** | Confidence: ${conf}/10 [${confBar}]`,
-      '',
-      `> ${result.summary || 'Analysis complete.'}`,
-      '',
-    ];
-
-    // Analyst ratings summary — use robust extraction
-    lines.push('**Analyst Ratings:**');
-    for (const [name, report] of Object.entries(result.analysts)) {
-      const { rating, confidence } = this._extractRating(report);
-      const rEmoji = { BULLISH: '🟢', BEARISH: '🔴', NEUTRAL: '🟡' };
-      lines.push(`  ${rEmoji[rating] || '⚪'} **${name.charAt(0).toUpperCase() + name.slice(1)}:** ${rating} (${confidence}/10)`);
-    }
-
-    // Bull/Bear summary
-    lines.push('');
-    lines.push('**Debate:**');
-    const bullSnippet = (result.debate.bull || '').split('\n').find(l => l.trim().length > 10) || result.debate.bull || '(no bull case)';
-    const bearSnippet = (result.debate.bear || '').split('\n').find(l => l.trim().length > 10) || result.debate.bear || '(no bear case)';
-    lines.push(`  🐂 Bull: ${bullSnippet.slice(0, 150)}${bullSnippet.length > 150 ? '...' : ''}`);
-    lines.push(`  🐻 Bear: ${bearSnippet.slice(0, 150)}${bearSnippet.length > 150 ? '...' : ''}`);
-
-    // Risk verdicts — use robust extraction
-    lines.push('');
-    lines.push('**Risk Committee:**');
-    for (const [style, review] of Object.entries(result.risk)) {
-      const { verdict, riskLevel } = this._extractVerdict(review);
-      const vEmoji = verdict === 'APPROVE' ? '✅' : verdict === 'REJECT' ? '❌' : '❓';
-      lines.push(`  ${vEmoji} **${style.charAt(0).toUpperCase() + style.slice(1)}:** ${verdict} (Risk: ${riskLevel})`);
-    }
-
-    // Data sources
-    if (result.dataSources && result.dataSources.length > 0) {
-      lines.push('');
-      const sourceIcons = result.dataSources.map(s => {
-        if (s.startsWith('ainvest')) return '📊';
-        if (s === 'live-price') return '💹';
-        return '📈';
-      });
-      lines.push(`_Data: ${result.dataSources.length} sources | ${[...new Set(sourceIcons)].join('')}_`);
-    }
-
-    lines.push('');
-    lines.push(`_Multi-agent analysis via TradingAgents | ${new Date().toLocaleString()}_`);
-
-    let output = lines.join('\n');
-    if (output.length > 1950) {
-      output = output.slice(0, 1950) + '\n...';
-    }
-    return output;
-  }
-
-  /**
-   * Format a detailed report (for follow-up messages or file upload).
-   */
-  formatDetailedReport(result) {
-    const sections = [
-      `# TradingAgents Deep Analysis: ${result.ticker}`,
-      `Signal: ${result.signal} | Confidence: ${result.confidence}/10`,
-      `Generated: ${result.timestamp}`,
-      `Data Sources: ${(result.dataSources || []).join(', ')}`,
-      '',
-      '## Summary',
-      result.summary,
-      '',
-      '## Market/Technical Analysis',
-      result.analysts.market,
-      '',
-      '## Fundamental Analysis',
-      result.analysts.fundamentals,
-      '',
-      '## Sentiment Analysis',
-      result.analysts.sentiment,
-      '',
-      '## News/Macro Analysis',
-      result.analysts.news,
-      '',
-      '## Bull Case',
-      result.debate.bull,
-      '',
-      '## Bear Case',
-      result.debate.bear,
-      '',
-      '## Trader Decision',
-      result.trader,
-      '',
-      '## Risk Management',
-      '### Aggressive Risk Manager',
-      result.risk.aggressive,
-      '',
-      '### Moderate Risk Manager',
-      result.risk.moderate,
-      '',
-      '### Conservative Risk Manager',
-      result.risk.conservative,
-    ];
-
-    return sections.join('\n');
-  }
 }
 
+// Export as a singleton instance
 module.exports = new TradingAgents();
