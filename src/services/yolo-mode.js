@@ -98,6 +98,10 @@ class YoloMode {
 
     // History of improvements made
     this._history = this._storage.get('history', []);
+
+    // Daily branch tracking — Billy never commits to main
+    this._currentBranch = null;
+    this._branchCreatedDate = null;
   }
 
   // ── Lifecycle ───────────────────────────────────────────────────
@@ -535,10 +539,68 @@ If you can't think of anything valuable, respond: NO_EVOLUTION`;
     );
   }
 
+  // ── Branch Management — Billy never touches main ────────────────
+
+  async _ensureDailyBranch() {
+    const today = new Date().toISOString().slice(0, 10);
+
+    // Reuse today's branch if already created
+    if (this._currentBranch && this._branchCreatedDate === today) {
+      return this._currentBranch;
+    }
+
+    const branchName = `billy/yolo-${today}`;
+    const result = await github.createBranch(branchName);
+    if (!result.success) {
+      console.error(`[YOLO] Failed to create daily branch: ${result.error}`);
+      return null;
+    }
+
+    this._currentBranch = branchName;
+    this._branchCreatedDate = today;
+    console.log(`[YOLO] Using daily branch: ${branchName}`);
+    return branchName;
+  }
+
+  async _ensurePullRequest() {
+    if (!this._currentBranch) return null;
+
+    // Check if a PR already exists for this branch
+    const existing = await github.findOpenPR(this._currentBranch);
+    if (existing) return existing.html_url;
+
+    const today = new Date().toISOString().slice(0, 10);
+    const result = await github.createPullRequest(
+      this._currentBranch,
+      `Billy YOLO improvements — ${today}`,
+      `Automated improvements from Billy's YOLO self-evolution engine.\n\n` +
+      `**Branch:** \`${this._currentBranch}\`\n` +
+      `**Date:** ${today}\n\n` +
+      `These changes are sandboxed to this branch and require manual review before merging.`
+    );
+
+    if (result.success) {
+      this._post(
+        `**YOLO Pull Request Created**\n` +
+        `All of today's improvements are in: ${result.url}\n` +
+        `_Review and merge when ready._`
+      );
+      return result.url;
+    }
+    return null;
+  }
+
   // ── Core: Generate fix & apply via GitHub ───────────────────────
 
   async _generateAndApplyFix(filePath, instruction, source) {
-    // Fetch current code
+    // Ensure we have a daily branch — never commit to main
+    const branch = await this._ensureDailyBranch();
+    if (!branch) {
+      console.error('[YOLO] Cannot proceed without a daily branch.');
+      return null;
+    }
+
+    // Fetch current code from the daily branch (so stacked edits work)
     const fileData = await github.getFileContent(filePath);
     if (!fileData) return null;
 
@@ -595,9 +657,9 @@ ${currentCode}`;
       }
     }
 
-    // Commit the change
+    // Commit the change to the daily branch (never main)
     const commitMsg = `YOLO: ${instruction.slice(0, 70)}`;
-    const result = await github.updateFile(filePath, newCode, commitMsg);
+    const result = await github.updateFile(filePath, newCode, commitMsg, branch);
 
     if (result.success) {
       this._dailyCount++;
@@ -611,25 +673,30 @@ ${currentCode}`;
         instruction: instruction.slice(0, 200),
         linesChanged,
         commitUrl: result.url || null,
+        branch,
       };
       this._history.push(entry);
       if (this._history.length > 50) this._history.shift();
       this._storage.set('history', this._history);
 
       this._addJournal('improvement', filePath, `${instruction.slice(0, 150)} (${linesChanged} lines)`, source);
-      auditLog.log('yolo', `Improvement applied: ${filePath} (${linesChanged} lines, source: ${source})`);
+      auditLog.log('yolo', `Improvement applied: ${filePath} on ${branch} (${linesChanged} lines, source: ${source})`);
+
+      // Ensure a PR exists for today's branch
+      const prUrl = await this._ensurePullRequest();
 
       // Notify via Discord
       this._post(
-        `**YOLO Self-Improvement**\n` +
+        `**YOLO Self-Improvement** (branch: \`${branch}\`)\n` +
         `Applied to \`${filePath}\` (${linesChanged} lines changed)\n` +
         `**What:** ${instruction.slice(0, 150)}\n` +
         `**Source:** ${source.replace('_', ' ')}\n` +
         `${result.url ? result.url : ''}\n` +
+        `${prUrl ? `**PR:** ${prUrl}\n` : ''}` +
         `_Improvements today: ${this._dailyCount}/${MAX_IMPROVEMENTS_PER_DAY}_`
       );
 
-      console.log(`[YOLO] Improvement committed: ${filePath} (${linesChanged} lines)`);
+      console.log(`[YOLO] Improvement committed to ${branch}: ${filePath} (${linesChanged} lines)`);
       return entry;
     } else {
       console.error(`[YOLO] Commit failed for ${filePath}:`, result.error);
