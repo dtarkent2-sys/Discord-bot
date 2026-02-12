@@ -219,8 +219,8 @@ class GitHubClient {
     const n = newLines.length;
 
     // For very large files, use a space-optimized LCS (two-row DP)
-    let prev = new Uint16Array(n + 1);
-    let curr = new Uint16Array(n + 1);
+    let prev = new Uint16Array(n + 1).fill(0);
+    let curr = new Uint16Array(n + 1).fill(0);
 
     for (let i = 1; i <= m; i++) {
       for (let j = 1; j <= n; j++) {
@@ -237,7 +237,6 @@ class GitHubClient {
 
     const lcsLength = prev[n];
     // Lines changed = lines removed + lines added
-    // removed = old lines not in LCS, added = new lines not in LCS
     return (m - lcsLength) + (n - lcsLength);
   }
 }
