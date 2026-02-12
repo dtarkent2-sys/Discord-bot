@@ -114,5 +114,33 @@ class Storage {
   }
 }
 
+/**
+ * Return a snapshot of all store data for backup purposes.
+ * Returns { "store:filename.json": { ...data }, ... }
+ */
+function getAllStoreData() {
+  const snapshot = {};
+  for (const inst of _instances) {
+    snapshot[inst.redisKey] = inst.getAll();
+  }
+  return snapshot;
+}
+
+/**
+ * Restore all stores from a backup snapshot.
+ * @param {Object} snapshot - { "store:filename.json": { ...data }, ... }
+ */
+async function restoreFromBackup(snapshot) {
+  for (const inst of _instances) {
+    if (snapshot[inst.redisKey]) {
+      inst.data = snapshot[inst.redisKey];
+      inst.save();
+    }
+  }
+  log.info(`Restored ${Object.keys(snapshot).length} stores from backup`);
+}
+
 module.exports = Storage;
 module.exports.initRedisStorage = initRedisStorage;
+module.exports.getAllStoreData = getAllStoreData;
+module.exports.restoreFromBackup = restoreFromBackup;

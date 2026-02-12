@@ -82,4 +82,12 @@ module.exports = {
 
   // Alpha Vantage API (market data, technicals, fundamentals, news sentiment)
   alphaApiKey: process.env.ALPHA_API_KEY || '',
+
+  // Railway Object Storage (S3-compatible bucket for Redis backups)
+  s3Endpoint: process.env.S3_ENDPOINT || process.env.BUCKET_ENDPOINT || '',
+  s3Region: process.env.S3_REGION || process.env.BUCKET_REGION || 'auto',
+  s3Bucket: process.env.S3_BUCKET || process.env.BUCKET_NAME || '',
+  s3AccessKeyId: process.env.S3_ACCESS_KEY_ID || process.env.BUCKET_ACCESS_KEY_ID || '',
+  s3SecretAccessKey: process.env.S3_SECRET_ACCESS_KEY || process.env.BUCKET_SECRET_ACCESS_KEY || '',
+  backupRetentionDays: parseInt(process.env.BACKUP_RETENTION_DAYS, 10) || 30,
 };

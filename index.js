@@ -14,6 +14,7 @@ process.on('unhandledRejection', (reason) => {
 // holds the lock (during Railway deploys), this process exits gracefully.
 const { acquireLock } = require('./src/runtime/singleton-lock');
 const { initRedisStorage } = require('./src/services/storage');
+const { initS3Backup } = require('./src/services/s3-backup');
 
 // ── Start health server IMMEDIATELY ─────────────────────────────────
 // Railway's healthcheck begins as soon as the container launches.
@@ -299,6 +300,9 @@ log.info(`WebSearch: ${websearchEnabled ? 'ENABLED' : 'DISABLED'}${!websearchEna
 // Acquire singleton lock, hydrate storage from Redis, then login to Discord
 acquireLock().then(() => {
   return initRedisStorage();
+}).then(() => {
+  // Start S3 backups after Redis is ready (non-blocking)
+  initS3Backup();
 }).then(() => {
   client.login(config.token).catch((err) => {
     log.error('Discord login failed:', err.message);
