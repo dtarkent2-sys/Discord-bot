@@ -112,6 +112,17 @@ class OptionsEngine {
    * Called on schedule by the SHARK engine during market hours.
    */
   async runCycle() {
+    // Prevent overlapping cycles (SHARK + independent interval can both call this)
+    if (this._cycleRunning) return;
+    this._cycleRunning = true;
+    try {
+      await this._runCycleInner();
+    } finally {
+      this._cycleRunning = false;
+    }
+  }
+
+  async _runCycleInner() {
     const cfg = policy.getConfig();
     if (!cfg.options_enabled) {
       this._log('cycle', 'Options engine disabled (options_enabled=false)');

@@ -30,6 +30,7 @@ const policy = require('./policy');
 const initiative = require('./initiative');
 const gammaSqueeze = require('./gamma-squeeze');
 const yoloMode = require('./yolo-mode');
+const optionsEngine = require('./options-engine');
 const config = require('../config');
 const auditLog = require('./audit-log');
 const circuitBreaker = require('./circuit-breaker');
@@ -213,6 +214,22 @@ class AutonomousBehaviorEngine {
     }, scanMinutes * 60 * 1000);
     console.log(`[Sprocket] SHARK trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
 
+    // 6b. 0DTE OPTIONS ENGINE — independent scan (runs even when SHARK is disabled)
+    // SHARK calls optionsEngine.runCycle() too, but the engine has per-underlying
+    // cooldowns so duplicate calls are harmless (just silently skipped).
+    optionsEngine.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
+    const optionsScanMinutes = policy.getConfig().options_scan_interval_minutes || scanMinutes;
+    this._optionsInterval = setInterval(async () => {
+      if (this._stopped) return;
+      try {
+        await optionsEngine.runCycle();
+      } catch (err) {
+        console.error('[Sprocket] Options engine cycle error:', err.message);
+        auditLog.log('error', `Options engine cycle error: ${err.message}`);
+      }
+    }, optionsScanMinutes * 60 * 1000);
+    console.log(`[Sprocket] 0DTE options engine active — every ${optionsScanMinutes}min (independent of SHARK)`);
+
     // 7. INITIATIVE ENGINE — autonomous brain (fast loop, self-tuning, proactive)
     initiative.init(this.client, (content) => this.postToChannel(config.tradingChannelName, content));
     initiative.start();
@@ -241,6 +258,10 @@ class AutonomousBehaviorEngine {
     if (this._mahoragaInterval) {
       clearInterval(this._mahoragaInterval);
       this._mahoragaInterval = null;
+    }
+    if (this._optionsInterval) {
+      clearInterval(this._optionsInterval);
+      this._optionsInterval = null;
     }
     initiative.stop();
     gammaSqueeze.stop();
