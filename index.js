@@ -9,6 +9,11 @@ process.on('unhandledRejection', (reason) => {
   process.exit(1);
 });
 
+// ── Singleton Lock ───────────────────────────────────────────────────
+// Acquire leader lock BEFORE doing anything else. If another instance
+// holds the lock (during Railway deploys), this process exits gracefully.
+const { acquireLock } = require('./src/runtime/singleton-lock');
+
 // ── Start health server IMMEDIATELY ─────────────────────────────────
 // Railway's healthcheck begins as soon as the container launches.
 // Bind the HTTP server before loading heavy modules (canvas, chartjs)
@@ -262,7 +267,21 @@ if (!config.token) {
   process.exit(1);
 }
 
-client.login(config.token).catch((err) => {
-  log.error('Discord login failed:', err.message);
-  process.exit(1);
+// Log WebSearch status at boot
+const websearchEnabled = (process.env.WEBSEARCH_ENABLED || (process.env.RAILWAY_ENVIRONMENT ? 'false' : 'true')).toLowerCase() === 'true';
+log.info(`WebSearch: ${websearchEnabled ? 'ENABLED' : 'DISABLED'}${!websearchEnabled ? ' (set WEBSEARCH_ENABLED=true to enable)' : ''}`);
+
+// Acquire singleton lock, then login to Discord
+acquireLock().then(() => {
+  client.login(config.token).catch((err) => {
+    log.error('Discord login failed:', err.message);
+    process.exit(1);
+  });
+}).catch((err) => {
+  log.error('Singleton lock error:', err.message);
+  // Still try to login — lock failure shouldn't block in fallback mode
+  client.login(config.token).catch((loginErr) => {
+    log.error('Discord login failed:', loginErr.message);
+    process.exit(1);
+  });
 });

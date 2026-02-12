@@ -15,6 +15,20 @@
 
 const config = require('../config');
 
+// ── WebSearch Feature Flag ───────────────────────────────────────────────
+// Default: true in dev, false in production (Railway)
+const WEBSEARCH_ENABLED = (process.env.WEBSEARCH_ENABLED || (process.env.RAILWAY_ENVIRONMENT ? 'false' : 'true')).toLowerCase() === 'true';
+
+const DISABLED_RESULT = Object.freeze({
+  results: [],
+  query: '',
+  resultCount: 0,
+  timestamp: new Date().toISOString(),
+  instance: 'disabled',
+  disabled: true,
+  message: 'WebSearch is disabled in this environment (WEBSEARCH_ENABLED=false)',
+});
+
 // AInvest news — high-quality financial news (paid API, very reliable)
 let ainvestClient;
 try {
@@ -304,6 +318,11 @@ function _decodeHtml(text) {
 async function webSearch(query, numResults = 3) {
   if (!query || typeof query !== 'string' || query.trim().length === 0) {
     return { error: 'Search query is required.', query };
+  }
+
+  // Feature flag: return disabled result without any network requests
+  if (!WEBSEARCH_ENABLED) {
+    return { ...DISABLED_RESULT, query: query.trim() };
   }
 
   // Check cache first

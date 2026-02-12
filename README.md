@@ -105,6 +105,91 @@ All settings are configured through environment variables. See `.env.example`.
 | `GEX_CANDLE_INTERVAL` | Candle interval for break-and-hold: `1Min`, `5Min`, `15Min`, `1Hour` | `5Min` |
 | `GEX_MIN_REGIME_CONFIDENCE` | Minimum confidence (0-1) before emitting regime alerts | `0.4` |
 | `GEX_MIN_ABS_GEX` | Minimum absolute GEX ($) to consider an expiry dominant | `1000000` |
+| `REDIS_URL` | Redis connection string for singleton leader lock (Railway prod) | — |
+| `LEADER_LOCK_TTL_SECONDS` | Leader lock TTL in seconds | `60` |
+| `LEADER_LOCK_RENEW_SECONDS` | Leader lock renewal interval in seconds | `30` |
+| `WEBSEARCH_ENABLED` | Enable/disable WebSearch (default `true` in dev, `false` on Railway) | auto |
+| `RATE_LIMITS` | JSON override for per-provider rate limits | — |
+| `CACHE_TTLS` | JSON override for endpoint cache TTLs | — |
+
+---
+
+## Singleton Lock (Railway Production)
+
+Railway can briefly run two instances during deploys/restarts. To guarantee only ONE instance connects to Discord, set `REDIS_URL` to a Redis instance. The bot acquires a distributed lock (`discord-bot:leader`) with NX + EX before logging in. If the lock is held by another instance, the new process exits gracefully.
+
+- **With Redis**: Leader election via `SET NX EX`. Renewed every 30s (configurable).
+- **Without Redis**: Warning logged, boot proceeds (single-instance fallback).
+
+### Railway Variables
+
+| Variable | Where to set | Value |
+|---|---|---|
+| `REDIS_URL` | Railway Variables | Your Redis connection string |
+| `LEADER_LOCK_TTL_SECONDS` | Railway Variables (optional) | `60` |
+| `LEADER_LOCK_RENEW_SECONDS` | Railway Variables (optional) | `30` |
+| `WEBSEARCH_ENABLED` | Railway Variables | `false` (recommended for prod) |
+
+---
+
+## Provider Resilience Layer
+
+All outbound API calls (AInvest, FMP, SearXNG) are wrapped with:
+
+1. **Per-provider token bucket rate limiting** — Prevents 429 spam
+2. **Endpoint-level TTL cache** — Reduces redundant API calls
+3. **Circuit breaker** — Automatically disables failing providers
+
+### Cache TTL Defaults
+
+| Data Type | TTL |
+|---|---|
+| Profile/company info | 24 hours |
+| Insider/ownership/analyst | 12 hours |
+| News headlines | 20 minutes |
+| 1-min candles | 20 seconds |
+| 5-min candles | 90 seconds |
+
+### Circuit Breaker Rules
+
+| Error | Action |
+|---|---|
+| HTTP 429 | Disable provider/endpoint for 15 minutes |
+| AInvest error 4014 | Disable for 60 minutes |
+| HTTP 404 for MCP tool | Disable permanently until restart |
+| 5 consecutive errors | Disable for 5 minutes |
+
+When the circuit is open, cached data is returned if available; otherwise a `ProviderUnavailableError` is thrown.
+
+---
+
+## 0DTE Options Decision Engine
+
+Rule-based dominance hierarchy for 0DTE options trading:
+
+| Gate | Name | Function |
+|---|---|---|
+| 0 | Safety | Market hours, missing data, wide spreads → NO_TRADE |
+| 1 | Macro | Sets allowed directions {CALL, PUT, NO_TRADE} |
+| 2 | Gamma | Sets bias; squeeze ONLY if shortGamma≥60% AND netGEX≤-$300M |
+| 3 | Trigger | MANDATORY price action confirmation (VWAP, breakout + RSI/MACD) |
+| 4 | AI Overlay | Adjusts conviction ±2, cannot flip direction |
+
+### Risk Controls (every trade)
+- Premium stop: -40%
+- Time stop: 12 minutes (no favorable move)
+- VWAP fail exit: 2 rejections
+- Price invalidation at support/resistance
+
+### Throttle Controls
+- Max 3 trades per symbol per hour
+- 2 consecutive losses → 30 min cooldown
+- Max 2 correlated positions (SPY, QQQ, IWM, XLF)
+
+### Strike Selection
+- Delta: 0.35–0.55
+- Distance: ≤0.3% (scalp), ≤0.6% (breakout)
+- Spread: ≤3% bid/ask
 
 ---
 
