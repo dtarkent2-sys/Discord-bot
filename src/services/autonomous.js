@@ -219,6 +219,17 @@ class AutonomousBehaviorEngine {
     // cooldowns so duplicate calls are harmless (just silently skipped).
     optionsEngine.setChannelPoster((content) => this.postToChannel(config.tradingChannelName, content));
     const optionsScanMinutes = policy.getConfig().options_scan_interval_minutes || scanMinutes;
+    // Fire first options cycle 30s after boot (let all modules finish init)
+    setTimeout(async () => {
+      if (this._stopped) return;
+      try {
+        console.log('[Sprocket] Running initial 0DTE options cycle...');
+        await optionsEngine.runCycle();
+      } catch (err) {
+        console.error('[Sprocket] Initial options cycle error:', err.message);
+      }
+    }, 30 * 1000);
+    // Then repeat on interval
     this._optionsInterval = setInterval(async () => {
       if (this._stopped) return;
       try {
@@ -228,7 +239,7 @@ class AutonomousBehaviorEngine {
         auditLog.log('error', `Options engine cycle error: ${err.message}`);
       }
     }, optionsScanMinutes * 60 * 1000);
-    console.log(`[Sprocket] 0DTE options engine active — every ${optionsScanMinutes}min (independent of SHARK)`);
+    console.log(`[Sprocket] 0DTE options engine active — first run in 30s, then every ${optionsScanMinutes}min`);
 
     // 7. INITIATIVE ENGINE — autonomous brain (fast loop, self-tuning, proactive)
     initiative.init(this.client, (content) => this.postToChannel(config.tradingChannelName, content));

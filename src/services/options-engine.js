@@ -33,7 +33,9 @@ const { analyzeMTFEMA, formatMTFForPrompt } = require('./mtf-ema');
 const technicals = require('./technicals');
 const macro = require('./macro');
 const policy = require('./policy');
-const ai = require('./ai');
+// NOTE: ai.js is NOT required here to avoid circular dependency:
+//   options-engine → ai → self-awareness → mahoraga → options-engine
+// Instead, ai is lazy-required inside _askOptionsAI().
 const auditLog = require('./audit-log');
 const circuitBreaker = require('./circuit-breaker');
 const signalCache = require('./signal-cache');
@@ -680,6 +682,8 @@ class OptionsEngine {
     ].filter(Boolean).join('\n');
 
     try {
+      // Lazy-require to break circular dependency chain
+      const ai = require('./ai');
       const startTime = Date.now();
       const response = await ai.complete(prompt);
       const durationMs = Date.now() - startTime;
