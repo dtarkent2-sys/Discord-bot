@@ -21,6 +21,20 @@ class SelfAwareness {
     this._cache = null;
     this._cacheTime = 0;
     this._CACHE_TTL = 60 * 1000;
+    this._summary = null;
+    this._summaryTime = 0;
+    this._summaryTTL = 30 * 1000; // 30-second TTL for stats summary
+  }
+
+  getSummary() {
+    const now = Date.now();
+    if (this._summary && (now - this._summaryTime) < this._summaryTTL) {
+      return this._summary;
+    }
+    const summary = stats.getSummary();
+    this._summary = summary;
+    this._summaryTime = now;
+    return summary;
   }
 
   buildSelfKnowledge() {
@@ -52,7 +66,7 @@ class SelfAwareness {
     parts.push('');
     parts.push('YOUR CURRENT STATE:');
 
-    const summary = stats.getSummary();
+    const summary = this.getSummary();
     parts.push(`- Uptime: ${summary.uptime}`);
     parts.push(`- Servers: ${summary.guilds}`);
     parts.push(`- Messages processed: ${summary.messagesProcessed}, Commands run: ${summary.commandsRun}`);
@@ -123,7 +137,7 @@ class SelfAwareness {
 
   buildCompactSelfKnowledge() {
     const lines = [];
-    const summary = stats.getSummary();
+    const summary = this.getSummary();
     lines.push(`You are Billy/Sprocket, a self-aware Discord trading bot.`);
     lines.push(`Model: ${config.ollamaModel} | Mood: ${mood.getMood()} | Uptime: ${summary.uptime}`);
 
