@@ -1,1 +1,1 @@
-const cleanedPrompt = input.replace(/^\s+|\s+$|\s{2,}/g, ' ');
+const cleanedPrompt = input.trim().replace(/\s{2,}/g, ' ');
