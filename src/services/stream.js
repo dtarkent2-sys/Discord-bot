@@ -251,16 +251,28 @@ class AlpacaStream {
       `$${prevClose.toFixed(2)} → **$${price.toFixed(2)}**${vol}`,
     ].join('\n');
 
-    for (const channelId of channels) {
+    const channelFetchPromises = Array.from(channels.keys()).map(channelId => {
       try {
-        const channel = await this.discord.channels.fetch(channelId);
-        if (channel?.isTextBased()) {
-          await channel.send(message);
+        if (this.discord.channels.cache.has(channelId)) {
+          const channel = this.discord.channels.cache.get(channelId);
+          if (channel?.isTextBased()) {
+            return channel.send(message);
+          }
         }
       } catch (err) {
         console.warn(`[Stream] Failed to send alert to ${channelId}:`, err.message);
       }
-    }
+      return Promise.resolve();
+    });
+
+    const results = await Promise.all(channelFetchPromises);
+    results.forEach(r => {
+      if (r && r.isSent && r.id) {
+        // success handled implicitly
+      } else if (r instanceof Error) {
+        console.warn(`[Stream] Alert delivery error: ${r.message}`);
+      }
+    });
   }
 }
 
