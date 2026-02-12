@@ -46,21 +46,35 @@ function createRedisClient(redisUrl) {
             const str = String(arg);
             parts.push(`$${Buffer.byteLength(str)}`, str);
           }
-          // Per-command timeout so a stuck command can never block the boot chain
+          // Per-command timeout so a stuck command can never block the boot chain.
+          // IMPORTANT: on timeout we mark the entry dead but do NOT splice it from
+          // the queue. Redis still sends its response, and the parser must consume
+          // it in order. Splicing would offset every subsequent response by one,
+          // permanently corrupting the connection.
+          let settled = false;
           const entry = {
-            resolve: (val) => { clearTimeout(timer); res(val); },
-            reject: (err) => { clearTimeout(timer); rej(err); },
+            dead: false,
+            resolve: (val) => { if (!settled) { settled = true; clearTimeout(timer); res(val); } },
+            reject: (err) => { if (!settled) { settled = true; clearTimeout(timer); rej(err); } },
           };
           const timer = setTimeout(() => {
-            const idx = pending.indexOf(entry);
-            if (idx !== -1) {
-              pending.splice(idx, 1);
-              rej(new Error('Redis command timeout (10s)'));
-            }
+            entry.dead = true;
+            if (!settled) { settled = true; rej(new Error('Redis command timeout (10s)')); }
           }, 10_000);
           pending.push(entry);
           socket.write(parts.join('\r\n') + '\r\n');
         });
+      }
+
+      // Consume the front pending entry. If it timed out (dead), discard silently.
+      function settle(val, isError) {
+        while (pending.length > 0) {
+          const entry = pending.shift();
+          if (entry.dead) continue; // Response for a timed-out command — discard
+          if (isError) entry.reject(val);
+          else entry.resolve(val);
+          return;
+        }
       }
 
       function parseResponse(data) {
@@ -74,24 +88,24 @@ function createRedisClient(redisUrl) {
 
           if (type === '+') {
             buffer = buffer.slice(nlIndex + 2);
-            if (pending.length > 0) pending.shift().resolve(line);
+            settle(line, false);
           } else if (type === '-') {
             buffer = buffer.slice(nlIndex + 2);
-            if (pending.length > 0) pending.shift().reject(new Error(line));
+            settle(new Error(line), true);
           } else if (type === ':') {
             buffer = buffer.slice(nlIndex + 2);
-            if (pending.length > 0) pending.shift().resolve(parseInt(line, 10));
+            settle(parseInt(line, 10), false);
           } else if (type === '$') {
             const len = parseInt(line, 10);
             if (len === -1) {
               buffer = buffer.slice(nlIndex + 2);
-              if (pending.length > 0) pending.shift().resolve(null);
+              settle(null, false);
             } else {
               const totalLen = nlIndex + 2 + len + 2;
               if (buffer.length < totalLen) break;
               const val = buffer.slice(nlIndex + 2, nlIndex + 2 + len);
               buffer = buffer.slice(totalLen);
-              if (pending.length > 0) pending.shift().resolve(val);
+              settle(val, false);
             }
           } else {
             buffer = buffer.slice(nlIndex + 2);

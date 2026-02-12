@@ -30,12 +30,20 @@ async function initRedisStorage() {
     _redisReady = true;
     log.info('Redis storage connection established');
 
-    // Hydrate every Storage instance that was created before Redis connected.
-    // Timeout after 15s so a stuck Redis connection can never block Discord login.
-    const hydration = Promise.all(_instances.map(inst => inst._loadFromRedis()));
-    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('hydration timeout (15s)')), 15_000));
-    await Promise.race([hydration, timeout]);
-    log.info(`Hydrated ${_instances.length} stores from Redis`);
+    // Hydrate every Storage instance sequentially (not pipelined) so the
+    // minimal RESP parser processes one response at a time.
+    // Timeout after 15s so a stuck Redis can never block Discord login.
+    const deadline = Date.now() + 15_000;
+    let hydrated = 0;
+    for (const inst of _instances) {
+      if (Date.now() > deadline) {
+        log.warn(`Hydration timeout — loaded ${hydrated}/${_instances.length} stores, proceeding with file data for the rest`);
+        break;
+      }
+      await inst._loadFromRedis();
+      hydrated++;
+    }
+    log.info(`Hydrated ${hydrated}/${_instances.length} stores from Redis`);
   } catch (err) {
     log.warn(`Redis storage init problem: ${err.message} — using file-backed data (will sync later)`);
   }
