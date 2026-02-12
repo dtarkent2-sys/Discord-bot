@@ -1,39 +1,6 @@
-/**
- * AInvest API Client — PRIORITY data source for the entire bot.
- *
- * Dual transport:
- *   1. MCP (Model Context Protocol) — via https://docsmcp.ainvest.com
- *   2. REST fallback — via https://openapi.ainvest.com/open
- *
- * MCP tool names (discovered at runtime, 11 tools):
- *   get-marketdata-candles, get-marketdata-trades, get-news-headlines,
- *   get-analyst-ratings, get-analyst-ratings-history, get-analyst-ratings-firms,
- *   get-ownership-insider, get-ownership-congress, securities-search,
- *   get-calendar-dividends, get-calendar-earnings
- *
- * REST endpoints (23 total):
- *   /marketdata/candles, /marketdata/trades,
- *   /news/v1/wire/page/history, /news/v1/wire/info/:id,
- *   /news/v1/article/page/history, /news/v1/article/info/:id,
- *   /analysis-ratings/consensus, /analysis-ratings/history,
- *   /securities/stock/financials, /securities/stock/financials/earnings,
- *   /securities/stock/financials/statements, /securities/stock/financials/dividends,
- *   /securities/search, /securities/etf/profile, /securities/etf/holdings,
- *   /ownership/insider, /ownership/congress,
- *   /calendar/economics, /calendar/earnings, /calendar/dividends,
- *   /calendar/corporateactions, /calendar/ipo, /calendar/earnings/backtesting
- *
- * Auth: Authorization: Bearer <AINVEST_API_KEY>
- * Docs: https://docs.ainvest.com
- */
-
-const config = require('../config');
-
-const BASE_URL = config.ainvestBaseUrl || 'https://openapi.ainvest.com/open';
-
-// MCP client — loaded defensively (non-blocking if MCP fails)
-let mcp = null;
-let mcpReady = false;
+const CONFIG_MIN_INTERVAL_MS = 60_000; // 1 minute
+const CONFIG_MAX_INTERVAL_MS = 86_400_000; // 24 hours
+const CONFIG_MAX_COUNT = 1_000; // safeguard against runaway requests
 
 class AInvestService {
   constructor() {
@@ -45,12 +12,6 @@ class AInvestService {
     return !!config.ainvestApiKey;
   }
 
-  // ── MCP initialization (background, non-blocking) ─────────────────────
-
-  /**
-   * Initialize the MCP connection in the background.
-   * Call this once at startup. Does NOT block — the REST API works immediately.
-   */
   async initMCP() {
     if (!this.enabled) return;
     if (this._mcpInitPromise) return this._mcpInitPromise;
@@ -70,12 +31,9 @@ class AInvestService {
     return this._mcpInitPromise;
   }
 
-  /** Whether MCP transport is available */
   get mcpEnabled() {
     return mcpReady && mcp;
   }
-
-  // ── REST helpers ──────────────────────────────────────────────────────
 
   _getHeaders() {
     if (!this._headers) {
@@ -114,84 +72,62 @@ class AInvestService {
     return json.data !== undefined ? json.data : json;
   }
 
-  /**
-   * Try MCP first, fall back to REST.
-   * @param {string} mcpToolName — MCP tool name (hyphenated, e.g. 'get-marketdata-candles')
-   * @param {object} mcpArgs — MCP tool arguments
-   * @param {string} restPath — REST endpoint path
-   * @param {object} restParams — REST query params
-   */
   async _mcpOrRest(mcpToolName, mcpArgs, restPath, restParams) {
-    // Try MCP first (faster, single connection, richer data)
     if (mcpReady && mcp) {
       try {
         const result = await mcp.callTool(mcpToolName, mcpArgs);
-        if (result != null) {
-          // Detect MCP error responses (404, 500, etc. returned as "data")
-          if (result.error || (result.status && result.status >= 400)) {
-            console.warn(`[AInvest] MCP ${mcpToolName} returned error: ${result.status || ''} ${result.error || ''} — falling back to REST`);
-            // Fall through to REST below
-          }
-          // Unwrap REST envelope: MCP returns the full {data, status_code, status_msg} wrapper
-          // that REST's _fetch() automatically strips. Unwrap it here for consistency.
-          else if (result.status_code !== undefined) {
-            if (result.status_code !== 0) {
-              console.warn(`[AInvest] MCP ${mcpToolName} API error ${result.status_code}: ${result.status_msg || ''} — falling back to REST`);
-              // Fall through to REST below
-            } else {
-              const unwrapped = result.data !== undefined ? result.data : result;
-              console.log(`[AInvest] ${mcpToolName} via MCP OK`);
-              return unwrapped;
-            }
+        if (result == null) {
+          console.warn(`[AInvest] MCP tool ${mcpToolName} returned null, falling back to REST`);
+        } else if (result.error || (result.status && result.status >= 400)) {
+          console.warn(`[AInvest] MCP ${mcpToolName} returned error: ${result.status || ''} ${result.error || ''} — falling back to REST`);
+        } else if (result.status_code !== undefined) {
+          if (result.status_code !== 0) {
+            console.warn(`[AInvest] MCP ${mcpToolName} API error ${result.status_code}: ${result.status_msg || ''} — falling back to REST`);
           } else {
-            // No envelope — return as-is (some tools may return raw data)
-            console.log(`[AInvest] ${mcpToolName} via MCP OK (raw)`);
-            return result;
+            const unwrapped = result.data !== undefined ? result.data : result;
+            console.log(`[AInvest] ${mcpToolName} via MCP OK`);
+            return unwrapped;
           }
         } else {
-          console.warn(`[AInvest] MCP tool ${mcpToolName} returned null, falling back to REST`);
+          console.log(`[AInvest] ${mcpToolName} via MCP OK (raw)`);
+          return result;
         }
       } catch (err) {
         console.warn(`[AInvest] MCP tool ${mcpToolName} failed, falling back to REST: ${err.message}`);
       }
     }
 
-    // REST fallback
     const result = await this._fetch(restPath, restParams);
     console.log(`[AInvest] ${restPath} via REST OK`);
     return result;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  MARKET DATA
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Fetch OHLCV candles.
-   * @param {string} ticker
-   * @param {object} [opts]
-   * @param {string} [opts.interval='day'] - 'min' | 'day' | 'week' | 'month'
-   * @param {number} [opts.step=1] - Aggregation multiplier (e.g. 15 for 15-min candles)
-   * @param {number} [opts.count=20] - How many candles to request (used to compute 'from')
-   */
   async getCandles(ticker, { interval = 'day', step = 1, count = 20 } = {}) {
     const tkr = ticker.toUpperCase();
 
-    // Compute 'from' timestamp (ms) based on count + interval
-    const now = Date.now();
+    if (!Number.isInteger(count) || count <= 0) count = 5;
+    if (count > CONFIG_MAX_COUNT) count = CONFIG_MAX_COUNT;
+
     let fromMs;
     if (interval === 'min') {
-      fromMs = now - count * step * 60 * 1000;
+      if (!Number.isInteger(step) || step <= 0) step = 1;
+      fromMs = Date.now() - count * step * 60 * 1000;
     } else if (interval === 'week') {
-      fromMs = now - count * 7 * 24 * 60 * 60 * 1000;
+      fromMs = Date.now() - count * 7 * 24 * 60 * 60 * 1000;
     } else if (interval === 'month') {
-      fromMs = now - count * 30 * 24 * 60 * 60 * 1000;
+      fromMs = Date.now() - count * 30 * 24 * 60 * 60 * 1000;
     } else {
-      // 'day' default — add extra days for weekends/holidays
-      fromMs = now - count * 1.5 * 24 * 60 * 60 * 1000;
+      fromMs = Date.now() - count * 1.5 * 24 * 60 * 60 * 1000;
     }
 
-    const restArgs = { ticker: tkr, interval, step, from: Math.floor(fromMs), to: 0 };
+    // Reject invalid or extreme intervals
+    if (fromMs < 0 || fromMs > Date.now()) {
+      count = 5;
+      fromMs = Date.now() - 5 * (interval === 'day' ? 1.5 : interval === 'week' ? 7 : 30) * 24 * 60 * 60 * 1000;
+    }
+    const finalInterval = interval !== 'min' && interval !== 'day' && interval !== 'week' && interval !== 'month' ? 'day' : interval;
+
+    const restArgs = { ticker: tkr, interval: finalInterval, step, from: Math.floor(fromMs), to: 0 };
     const data = await this._mcpOrRest(
       'get-marketdata-candles',
       restArgs,
@@ -199,8 +135,6 @@ class AInvestService {
       restArgs,
     );
 
-    // Candles endpoint nests the array: {data: [candles]} inside the envelope
-    // After envelope unwrapping, we may get {data: [...]} or directly [...]
     let candles = data;
     if (!Array.isArray(candles) && candles?.data && Array.isArray(candles.data)) {
       candles = candles.data;
@@ -220,9 +154,6 @@ class AInvestService {
     }));
   }
 
-  /**
-   * Get normalized price quote from latest candles (compatible with price-fetcher).
-   */
   async getQuote(ticker) {
     const candles = await this.getCandles(ticker, { interval: 'day', count: 2 });
     if (!candles || candles.length === 0) return null;
@@ -252,15 +183,15 @@ class AInvestService {
     };
   }
 
-  /**
-   * Fetch current-day tick trades for a ticker.
-   */
   async getTrades(ticker, count = 50) {
     const tkr = ticker.toUpperCase();
     const now = Date.now();
+    const restParams = { ticker: tkr, count, to: now };
+    const mcpArgs = { ...restParams };
+
     const data = await this._mcpOrRest(
-      'get-marketdata-trades', { ticker: tkr, count, to: now },
-      '/marketdata/trades', { ticker: tkr, count, to: now },
+      'get-marketdata-trades', mcpArgs,
+      '/marketdata/trades', restParams,
     );
     let payload = data;
     if (!Array.isArray(payload) && !payload?.list && payload?.data) {
@@ -269,17 +200,6 @@ class AInvestService {
     return Array.isArray(payload) ? payload : (payload?.list || []);
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  NEWS & CONTENT
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Fetch news wire articles.
-   * @param {object} [opts]
-   * @param {string} [opts.tab='all'] - 'all'|'important'|'earnings'|'insider_trades'|'technical'
-   * @param {string[]} [opts.tickers]
-   * @param {number} [opts.limit=10]
-   */
   async getNews({ tab = 'all', tickers = [], limit = 10 } = {}) {
     const size = Math.min(Math.max(limit, 1), 50);
     const restParams = { tab, size };
@@ -295,16 +215,16 @@ class AInvestService {
       '/news/v1/wire/page/history', restParams,
     );
 
-    // Unwrap nested data: some endpoints return {data: [...]} inside the payload
     let payload = data;
     if (!Array.isArray(payload) && !payload?.list && payload?.data) {
       payload = payload.data;
     }
     const articles = Array.isArray(payload) ? payload : (payload?.list || []);
-    if (articles.length === 0) {
+    const articleLimit = Math.min(limit, articles.length);
+    if (articleLimit === 0) {
       console.warn(`[AInvest] getNews: 0 articles — data shape: ${typeof data}, keys=${data && typeof data === 'object' ? Object.keys(data).join(',') : 'N/A'}`);
     }
-    return articles.slice(0, limit).map(a => ({
+    return articles.slice(0, articleLimit).map(a => ({
       title: a.title || a.headline || '',
       summary: (a.summary || a.description || '').slice(0, 500),
       url: a.url || a.source_url || '',
@@ -315,16 +235,10 @@ class AInvestService {
     }));
   }
 
-  /**
-   * Fetch full wire content by content ID. (REST only — no MCP tool)
-   */
   async getWireContent(contentId) {
     return this._fetch(`/news/v1/wire/info/${contentId}`, {});
   }
 
-  /**
-   * Fetch articles (longer-form analysis pieces). (REST only — no MCP tool)
-   */
   async getArticles({ limit = 10 } = {}) {
     const params = { size: Math.min(limit, 50) };
 
@@ -341,13 +255,6 @@ class AInvestService {
     }));
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  ANALYST RATINGS
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Get analyst consensus (buy/hold/sell + price targets).
-   */
   async getAnalystConsensus(ticker) {
     const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
@@ -357,14 +264,11 @@ class AInvestService {
 
     if (!data) return null;
 
-    // Unwrap nested data if present
     let payload = data;
     if (!payload.analysts_ratings && !payload.buy && payload.data) {
       payload = payload.data;
     }
 
-    // REST response is nested: { analysts_ratings: {...}, target_price: {...} }
-    // MCP may return flat or nested — handle both
     const ratings = payload.analysts_ratings || payload;
     const targets = payload.target_price || payload;
 
@@ -382,9 +286,6 @@ class AInvestService {
     };
   }
 
-  /**
-   * Get full analyst ratings history (individual firm ratings).
-   */
   async getAnalystHistory(ticker, limit = 10) {
     const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
@@ -408,13 +309,6 @@ class AInvestService {
     }));
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  SECURITIES & COMPANY DATA
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Get fundamental financial data (P/E, EPS, margins, etc.). (REST only)
-   */
   async getFinancials(ticker) {
     const tkr = ticker.toUpperCase();
     const data = await this._fetch('/securities/stock/financials', { ticker: tkr });
@@ -436,9 +330,6 @@ class AInvestService {
     };
   }
 
-  /**
-   * Get earnings history (actual vs forecast). (REST only)
-   */
   async getEarnings(ticker, limit = 4) {
     const tkr = ticker.toUpperCase();
     const data = await this._fetch(
@@ -461,12 +352,6 @@ class AInvestService {
     }));
   }
 
-  /**
-   * Get financial statements (income, balance sheet, cash flow). (REST only)
-   * @param {string} ticker
-   * @param {object} [opts]
-   * @param {number} [opts.period=4] - 0=each, 1=Q1, 2=mid-year, 3=Q3, 4=annual
-   */
   async getFinancialStatements(ticker, { period = 4 } = {}) {
     const tkr = ticker.toUpperCase();
     return this._fetch(
@@ -475,17 +360,11 @@ class AInvestService {
     );
   }
 
-  /**
-   * Get stock dividend history. (REST only)
-   */
   async getStockDividends(ticker) {
     const tkr = ticker.toUpperCase();
     return this._fetch('/securities/stock/financials/dividends', { ticker: tkr });
   }
 
-  /**
-   * Search securities by ticker or name.
-   */
   async searchSecurities(query) {
     return this._mcpOrRest(
       'securities-search', { query },
@@ -493,31 +372,16 @@ class AInvestService {
     );
   }
 
-  // ── ETF Data ──────────────────────────────────────────────────────────
-
-  /**
-   * Get ETF profile (expense ratio, AUM, etc.). (REST only)
-   */
   async getETFProfile(ticker) {
     const tkr = ticker.toUpperCase();
     return this._fetch('/securities/etf/profile', { ticker: tkr });
   }
 
-  /**
-   * Get top ETF holdings. (REST only)
-   */
   async getETFHoldings(ticker) {
     const tkr = ticker.toUpperCase();
     return this._fetch('/securities/etf/holdings', { ticker: tkr });
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  OWNERSHIP & TRADING
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Get insider trades for a ticker.
-   */
   async getInsiderTrades(ticker) {
     const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
@@ -531,9 +395,6 @@ class AInvestService {
     return Array.isArray(payload) ? payload : (payload?.list || []);
   }
 
-  /**
-   * Get US Congress member trades.
-   */
   async getCongressTrades(ticker) {
     const tkr = ticker.toUpperCase();
     const data = await this._mcpOrRest(
@@ -547,16 +408,8 @@ class AInvestService {
     return Array.isArray(payload) ? payload : (payload?.list || []);
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  CALENDARS
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Get economic calendar events. (REST only — no MCP tool)
-   */
   async getEconomicCalendar({ date, importance } = {}) {
     const params = {};
-    // Default to today's date (required by API)
     params.date = date || new Date().toISOString().split('T')[0];
     if (importance) params.importance = importance;
 
@@ -575,67 +428,40 @@ class AInvestService {
     }));
   }
 
-  /**
-   * Get earnings calendar for a date.
-   */
   async getEarningsCalendar(date) {
-    // Default to today's date (required by API)
     const d = date || new Date().toISOString().split('T')[0];
-
     return this._mcpOrRest(
       'get-calendar-earnings', { date: d },
       '/calendar/earnings', { date: d },
     );
   }
 
-  /**
-   * Get dividends calendar.
-   */
   async getDividendsCalendar(date) {
     const d = date || new Date().toISOString().split('T')[0];
-
     return this._mcpOrRest(
       'get-calendar-dividends', { date: d },
       '/calendar/dividends', { date: d },
     );
   }
 
-  /**
-   * Get stock splits calendar. (REST only)
-   */
   async getSplitsCalendar(date) {
     const d = date || new Date().toISOString().split('T')[0];
     return this._fetch('/calendar/corporateactions', { date: d });
   }
 
-  /**
-   * Get IPO calendar. (REST only)
-   */
   async getIPOCalendar(date) {
     const d = date || new Date().toISOString().split('T')[0];
     return this._fetch('/calendar/ipo', { date: d });
   }
 
-  /**
-   * Get earnings backtesting data. (REST only)
-   * @param {string} uniqueId — from earnings calendar `unique_id` field
-   */
   async getEarningsBacktesting(uniqueId) {
     return this._fetch('/calendar/earnings/backtesting', { unique_id: uniqueId });
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  DISCORD FORMATTERS
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Format insider + congress trades for Discord (/flow command).
-   */
   formatFlowForDiscord({ insider = [], congress = [] }, ticker) {
     const upper = ticker ? ticker.toUpperCase() : 'Market';
     const lines = [`**Smart Money Flow — ${upper}**`, ''];
 
-    // Insider trades
     if (insider.length > 0) {
       lines.push('**Insider Trades:**');
       for (const t of insider.slice(0, 8)) {
@@ -659,7 +485,6 @@ class AInvestService {
       lines.push('**Insider Trades:** No recent activity\n');
     }
 
-    // Congress trades
     if (congress.length > 0) {
       lines.push('**Congress Trades:**');
       for (const t of congress.slice(0, 6)) {
@@ -687,14 +512,10 @@ class AInvestService {
     return output;
   }
 
-  /**
-   * Format the /whales intelligence dashboard for Discord.
-   */
   formatIntelDashboard(ticker, { analysts, financials, earnings, insider, congress, news } = {}) {
     const upper = ticker.toUpperCase();
     const lines = [`**Market Intelligence — ${upper}**`, ''];
 
-    // Analyst ratings
     if (analysts) {
       const total = analysts.totalAnalysts || 0;
       const buys = (analysts.strongBuy || 0) + (analysts.buy || 0);
@@ -710,7 +531,6 @@ class AInvestService {
       lines.push('');
     }
 
-    // Financials
     if (financials) {
       const parts = [];
       if (financials.peTTM != null) parts.push(`P/E: \`${financials.peTTM.toFixed(1)}\``);
@@ -724,7 +544,6 @@ class AInvestService {
       }
     }
 
-    // Earnings
     if (earnings && earnings.length > 0) {
       lines.push('**Recent Earnings:**');
       for (const e of earnings.slice(0, 2)) {
@@ -735,27 +554,23 @@ class AInvestService {
       lines.push('');
     }
 
-    // Insider trades
     if (insider && insider.length > 0) {
       lines.push('**Insider Trades (recent):**');
       for (const t of insider.slice(0, 3)) {
         const name = t.name || t.insider_name || t.full_name || 'Unknown';
-        const type = (t.trade_type || t.transaction_type || t.type || '').toUpperCase();
-        const isBuy = /buy|purchase|acquisition/i.test(type) || t.acquisition_or_disposition === 'A';
-        const emoji = isBuy ? '🟢 BUY' : '🔴 SELL';
+        const type = t.trade_type || t.transaction_type || t.type || '?';
         const shares = t.shares || t.quantity || t.number_of_shares || '?';
         const date = t.date || t.filing_date || '';
-        lines.push(`  ${emoji} ${name} — ${Number(shares).toLocaleString()} shares (${date})`);
+        lines.push(`  ${type}: ${name} — ${Number(shares).toLocaleString()} shares (${date})`);
       }
       lines.push('');
     }
 
-    // Congress trades
     if (congress && congress.length > 0) {
       lines.push('**Congress Trades:**');
       for (const t of congress.slice(0, 3)) {
         const name = t.name || t.politician || t.congress_member || 'Unknown';
-        const type = (t.trade_type || t.transaction_type || t.type || '').toUpperCase();
+        const type = t.trade_type || t.transaction_type || '?';
         const isBuy = /buy|purchase/i.test(type);
         const emoji = isBuy ? '🟢 BUY' : '🔴 SELL';
         const amount = t.amount || t.dollar_amount || t.value || '';
@@ -765,7 +580,6 @@ class AInvestService {
       lines.push('');
     }
 
-    // News headlines
     if (news && news.length > 0) {
       lines.push('**Latest News:**');
       for (const n of news.slice(0, 3)) {
@@ -781,14 +595,6 @@ class AInvestService {
     return output;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  ENRICHMENT FOR AI ANALYSIS (replaces Unusual Whales enrichment)
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Fetch and format AInvest data for inclusion in TradingAgents prompts.
-   * Returns a text block suitable for appending to market data.
-   */
   async getEnrichmentForAnalysis(ticker) {
     if (!this.enabled) return '';
 
@@ -805,7 +611,6 @@ class AInvestService {
 
     const [analystResult, financialsResult, earningsResult, insiderResult, congressResult] = results;
 
-    // Analyst consensus
     if (analystResult.status === 'fulfilled' && analystResult.value) {
       const a = analystResult.value;
       const buys = (a.strongBuy || 0) + (a.buy || 0);
@@ -817,7 +622,6 @@ class AInvestService {
   Consensus: ${bias}${a.targetAvg ? `\n  Price Target: $${a.targetLow}–$${a.targetHigh} (avg $${a.targetAvg})` : ''}`);
     }
 
-    // Fundamentals
     if (financialsResult.status === 'fulfilled' && financialsResult.value) {
       const f = financialsResult.value;
       const parts = [];
@@ -831,7 +635,6 @@ class AInvestService {
       }
     }
 
-    // Earnings
     if (earningsResult.status === 'fulfilled' && earningsResult.value?.length > 0) {
       sections.push('RECENT EARNINGS:');
       for (const e of earningsResult.value) {
@@ -840,7 +643,6 @@ class AInvestService {
       }
     }
 
-    // Insider trades
     if (insiderResult.status === 'fulfilled' && insiderResult.value?.length > 0) {
       const trades = insiderResult.value;
       sections.push('INSIDER TRADING (AInvest):');
@@ -852,7 +654,6 @@ class AInvestService {
       }
     }
 
-    // Congress trades
     if (congressResult.status === 'fulfilled' && congressResult.value?.length > 0) {
       sections.push('CONGRESS TRADES (AInvest):');
       for (const t of congressResult.value) {
@@ -867,21 +668,9 @@ class AInvestService {
     return `=== AINVEST MARKET INTELLIGENCE ===\n${sections.join('\n')}`;
   }
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  FORMATTED CONTEXT FOR AI PROMPTS
-  // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Build a comprehensive fundamental context block for LLM prompts.
-   * Fetches analyst ratings, financials, earnings, insider trades, and economic events.
-   *
-   * @param {string} ticker
-   * @returns {string} Formatted multi-section context
-   */
   async getFundamentalContext(ticker) {
     const sections = [];
 
-    // Fetch all data in parallel
     const [analysts, financials, earnings, insiders, econ] = await Promise.allSettled([
       this.getAnalystConsensus(ticker),
       this.getFinancials(ticker),
@@ -890,7 +679,6 @@ class AInvestService {
       this.getEconomicCalendar({ importance: 'high' }).then(e => e.slice(0, 3)),
     ]);
 
-    // Analyst ratings
     if (analysts.status === 'fulfilled' && analysts.value) {
       const a = analysts.value;
       sections.push(
@@ -900,7 +688,6 @@ class AInvestService {
       );
     }
 
-    // Financials
     if (financials.status === 'fulfilled' && financials.value) {
       const f = financials.value;
       const parts = [];
@@ -917,7 +704,6 @@ class AInvestService {
       }
     }
 
-    // Earnings
     if (earnings.status === 'fulfilled' && earnings.value && earnings.value.length > 0) {
       sections.push('RECENT EARNINGS:');
       for (const e of earnings.value) {
@@ -926,7 +712,6 @@ class AInvestService {
       }
     }
 
-    // Insider trades (smart money signal)
     if (insiders.status === 'fulfilled' && insiders.value && insiders.value.length > 0) {
       sections.push('RECENT INSIDER TRADES:');
       for (const t of insiders.value) {
@@ -938,7 +723,6 @@ class AInvestService {
       }
     }
 
-    // Economic calendar (macro context)
     if (econ.status === 'fulfilled' && econ.value && econ.value.length > 0) {
       sections.push('HIGH-IMPACT ECONOMIC EVENTS TODAY:');
       for (const e of econ.value) {
