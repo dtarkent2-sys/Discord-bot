@@ -7,12 +7,16 @@ const auditLog = require('../services/audit-log');
 const circuitBreaker = require('../services/circuit-breaker');
 const mood = require('../services/mood');
 
-// S3 backup — loaded defensively (missing SDK should never break the dashboard)
-let s3Backup = null;
-try {
-  s3Backup = require('../services/s3-backup');
-} catch {
-  s3Backup = { getStatus: () => ({ enabled: false }), listBackups: async () => [] };
+// S3 backup — lazy-loaded on first API hit so the heavy @aws-sdk/client-s3
+// import never blocks the health server from starting.
+let _s3Backup = null;
+let _s3Loaded = false;
+function getS3Backup() {
+  if (!_s3Loaded) {
+    _s3Loaded = true;
+    try { _s3Backup = require('../services/s3-backup'); } catch { _s3Backup = null; }
+  }
+  return _s3Backup;
 }
 
 // Discord client ref — set after client is ready via setDiscordClient()
@@ -116,8 +120,10 @@ function startDashboard() {
   // S3 backup status and management
   app.get('/api/backups', async (req, res) => {
     try {
-      const status = s3Backup.getStatus();
-      const backups = status.enabled ? await s3Backup.listBackups() : [];
+      const s3 = getS3Backup();
+      if (!s3) return res.json({ enabled: false, backups: [] });
+      const status = s3.getStatus();
+      const backups = status.enabled ? await s3.listBackups() : [];
       res.json({ ...status, backups: backups.slice(0, 20) });
     } catch (err) {
       res.status(500).json({ error: err.message });

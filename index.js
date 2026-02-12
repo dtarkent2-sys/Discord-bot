@@ -13,15 +13,6 @@ process.on('unhandledRejection', (reason) => {
 // Acquire leader lock BEFORE doing anything else. If another instance
 // holds the lock (during Railway deploys), this process exits gracefully.
 const { acquireLock } = require('./src/runtime/singleton-lock');
-const { initRedisStorage } = require('./src/services/storage');
-
-// S3 backup — loaded defensively so a missing SDK never blocks startup
-let s3Backup = null;
-try {
-  s3Backup = require('./src/services/s3-backup');
-} catch (err) {
-  console.warn('[Bot] S3 backup module failed to load (non-critical):', err.message);
-}
 
 // ── Start health server IMMEDIATELY ─────────────────────────────────
 // Railway's healthcheck begins as soon as the container launches.
@@ -31,6 +22,16 @@ const { startDashboard, setDiscordClient } = require('./src/dashboard/server');
 startDashboard();
 
 // ── Load remaining modules ──────────────────────────────────────────
+// Storage + S3 backup loaded here (AFTER health server) so the heavy
+// @aws-sdk/client-s3 import never delays the healthcheck response.
+const { initRedisStorage } = require('./src/services/storage');
+
+let s3Backup = null;
+try {
+  s3Backup = require('./src/services/s3-backup');
+} catch (err) {
+  console.warn('[Bot] S3 backup module failed to load (non-critical):', err.message);
+}
 const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
 const config = require('./src/config');
 const log = require('./src/logger')('Bot');
