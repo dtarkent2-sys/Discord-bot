@@ -106,6 +106,132 @@ class GitHubClient {
     }
   }
 
+  // ── Branch Management (for YOLO sandboxing) ──────────────────
+
+  /**
+   * Ensure a branch exists. Creates it from the base branch if it doesn't.
+   * Returns the branch name on success, null on failure.
+   */
+  async ensureBranch(branchName, baseBranch) {
+    const octokit = await this._getOctokit();
+    if (!octokit) return null;
+
+    baseBranch = baseBranch || config.githubBranch || 'main';
+
+    try {
+      // Check if branch already exists
+      await octokit.git.getRef({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        ref: `heads/${branchName}`,
+      });
+      return branchName; // already exists
+    } catch (err) {
+      if (err.status !== 404) {
+        console.error(`[GitHub] Error checking branch ${branchName}:`, err.message);
+        return null;
+      }
+    }
+
+    try {
+      // Get the SHA of the base branch
+      const { data: baseRef } = await octokit.git.getRef({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        ref: `heads/${baseBranch}`,
+      });
+
+      // Create the new branch
+      await octokit.git.createRef({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        ref: `refs/heads/${branchName}`,
+        sha: baseRef.object.sha,
+      });
+
+      console.log(`[GitHub] Created branch ${branchName} from ${baseBranch}`);
+      return branchName;
+    } catch (err) {
+      console.error(`[GitHub] Failed to create branch ${branchName}:`, err.message);
+      return null;
+    }
+  }
+
+  /**
+   * Commit a file change to a specific branch (not the default branch).
+   */
+  async updateFileOnBranch(filePath, newContent, commitMessage, branch) {
+    const octokit = await this._getOctokit();
+    if (!octokit) return { success: false, error: 'GitHub client not available' };
+
+    try {
+      // Get the file's current SHA on the target branch
+      const currentFile = await octokit.repos.getContent({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        path: filePath,
+        ref: branch,
+      });
+
+      const response = await octokit.repos.createOrUpdateFileContents({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        path: filePath,
+        message: commitMessage,
+        content: Buffer.from(newContent).toString('base64'),
+        sha: currentFile.data.sha,
+        branch,
+      });
+
+      console.log(`[GitHub] File ${filePath} updated on branch ${branch}.`);
+      return { success: true, url: response.data.commit.html_url };
+    } catch (error) {
+      console.error(`[GitHub] Failed to update ${filePath} on ${branch}:`, error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Create a pull request, or return the existing open PR for this branch.
+   */
+  async ensurePullRequest(branchName, title, body) {
+    const octokit = await this._getOctokit();
+    if (!octokit) return null;
+
+    const baseBranch = config.githubBranch || 'main';
+
+    try {
+      // Check for existing open PR from this branch
+      const { data: existing } = await octokit.pulls.list({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        head: `${config.githubOwner}:${branchName}`,
+        base: baseBranch,
+        state: 'open',
+      });
+
+      if (existing.length > 0) {
+        return { url: existing[0].html_url, number: existing[0].number, created: false };
+      }
+
+      // Create new PR
+      const { data: pr } = await octokit.pulls.create({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        title,
+        body,
+        head: branchName,
+        base: baseBranch,
+      });
+
+      console.log(`[GitHub] Created PR #${pr.number}: ${title}`);
+      return { url: pr.html_url, number: pr.number, created: true };
+    } catch (err) {
+      console.error(`[GitHub] Failed to create/find PR for ${branchName}:`, err.message);
+      return null;
+    }
+  }
+
   // Safety check: is this change safe for auto-edit?
   isChangeSafe(filePath, newContent, currentContent) {
     // Rule 1: Never touch files with secrets or core infra
