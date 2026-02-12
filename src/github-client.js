@@ -54,7 +54,17 @@ class GitHubClient {
   }
 
   // Update a file (creates a commit)
+  // GUARD: Automated commits (YOLO, SELF-HEAL) are blocked from the default branch.
+  // Use updateFileOnBranch() for automated changes.
   async updateFile(filePath, newContent, commitMessage) {
+    // Hard block: never let automated commits land on main/default branch
+    const autoPatterns = ['YOLO:', 'SELF-HEAL:', 'AUTO:'];
+    const isAutomated = autoPatterns.some(p => commitMessage.startsWith(p) || commitMessage.startsWith(`🔧 ${p}`));
+    if (isAutomated) {
+      console.error(`[GitHub] BLOCKED: Automated commit "${commitMessage.slice(0, 60)}" tried to push to ${config.githubBranch}. Use updateFileOnBranch() instead.`);
+      return { success: false, error: `Automated commits to ${config.githubBranch} are blocked. Route through a branch.` };
+    }
+
     const octokit = await this._getOctokit();
     if (!octokit) return { success: false, error: 'GitHub client not available' };
 
