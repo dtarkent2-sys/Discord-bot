@@ -1,25 +1,25 @@
 const alpaca = require('./alpaca');
+const { calculateSMA, calculateEMA, calculateRSI, calculateMACD, calculateBollingerBands, calculateATR, computeTechnicals, detectSignals, formatForDiscord } = require('./core');
+
+/**
+ * Technical Analysis Engine
+ *
+ * Ported from SHARK (https://github.com/ygwyg/SHARK)
+ * Provides RSI, MACD, Bollinger Bands, SMA/EMA, ATR calculations
+ * and automated signal detection (oversold/overbought, crossovers, etc.)
+ *
+ * All functions are pure math — no external API calls needed.
+ * Feed them price bars from Alpaca, Yahoo, or any OHLCV source.
+ */
 
 // ── Core Indicators ─────────────────────────────────────────────────
 
-/**
- * Simple Moving Average
- * @param {number[]} prices - array of prices (oldest first)
- * @param {number} period
- * @returns {number|null}
- */
 function calculateSMA(prices, period) {
   if (prices.length < period) return null;
   const slice = prices.slice(-period);
   return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-/**
- * Exponential Moving Average
- * @param {number[]} prices
- * @param {number} period
- * @returns {number|null}
- */
 function calculateEMA(prices, period) {
   if (prices.length < period) return null;
   const multiplier = 2 / (period + 1);
@@ -30,12 +30,6 @@ function calculateEMA(prices, period) {
   return ema;
 }
 
-/**
- * Relative Strength Index (Wilder's smoothing)
- * @param {number[]} prices
- * @param {number} period - default 14
- * @returns {number|null}
- */
 function calculateRSI(prices, period = 14) {
   if (prices.length < period + 1) return null;
   const changes = [];
@@ -57,11 +51,6 @@ function calculateRSI(prices, period = 14) {
   return 100 - 100 / (1 + rs);
 }
 
-/**
- * MACD (12/26/9)
- * @param {number[]} prices
- * @returns {{ macd: number, signal: number, histogram: number }|null}
- */
 function calculateMACD(prices) {
   const ema12 = calculateEMA(prices, 12);
   const ema26 = calculateEMA(prices, 26);
@@ -87,15 +76,6 @@ function calculateMACD(prices) {
   return { macd: macdLine, signal, histogram: macdLine - signal };
 }
 
-/**
- * Bollinger Bands (20-period, 2 std dev)
- * Updated to guard against zero variance and NaN conditions.
- * Clamps band width to epsilon if variance is too small or bands degenerate.
- * @param {number[]} prices
- * @param {number} period
- * @param {number} stdDev
- * @returns {{ upper: number, middle: number, lower: number, width: number }|null}
- */
 function calculateBollingerBands(prices, period = 20, stdDev = 2) {
   if (prices.length < period) return null;
   const slice = prices.slice(-period);
@@ -103,18 +83,11 @@ function calculateBollingerBands(prices, period = 20, stdDev = 2) {
   const squaredDiffs = slice.map(p => (p - middle) ** 2);
   const variance = squaredDiffs.reduce((a, b) => a + b, 0) / period;
   const std = Math.sqrt(variance);
-  // Prevent division by zero or NaN in width calculation; use epsilon
-  const epsilon = 1e-8;
-  const width = std >= epsilon ? (stdDev * std) / middle || epsilon : epsilon;
-  return { upper: middle + stdDev * std, middle, lower: middle - stdDev * std, width };
+  const upper = middle + stdDev * std;
+  const lower = middle - stdDev * std;
+  return { upper, middle, lower, width: (upper - lower) / middle };
 }
 
-/**
- * Average True Range (requires OHLCV bars)
- * @param {Array<{h: number, l: number, c: number}>} bars
- * @param {number} period
- * @returns {number|null}
- */
 function calculateATR(bars, period = 14) {
   if (bars.length < period + 1) return null;
   const trueRanges = [];
@@ -139,13 +112,12 @@ function calculateATR(bars, period = 14) {
 
 // ── Compute all indicators at once ──────────────────────────────────
 
-/**
- * Compute full technical analysis from OHLCV bars.
- * @param {string} symbol
- * @param {Array<{t: string, o: number, h: number, l: number, c: number, v: number}>} bars
- * @returns {object} TechnicalIndicators
- */
 function computeTechnicals(symbol, bars) {
+  if (!symbol || !bars) {
+    throw new Error('symbol and bars are required arguments');
+  }
+  if (!bars.length) return null;
+
   const closes = bars.map(b => b.c);
   const volumes = bars.map(b => b.v);
   const currentPrice = closes[closes.length - 1] ?? 0;
@@ -173,16 +145,13 @@ function computeTechnicals(symbol, bars) {
 
 // ── Signal Detection ────────────────────────────────────────────────
 
-/**
- * Detect actionable trading signals from technical indicators.
- * @param {object} tech - output from computeTechnicals()
- * @returns {Array<{type: string, direction: string, strength: number, description: string}>}
- */
 function detectSignals(tech) {
+  if (!tech) return [];
+
   const signals = [];
 
   // RSI oversold / overbought
-  if (tech.rsi_14 !== null) {
+  if (tech.rsi_14 !== null && typeof tech.rsi_14 !== 'undefined') {
     if (tech.rsi_14 < 30) {
       signals.push({
         type: 'rsi_oversold', direction: 'bullish',
@@ -199,7 +168,7 @@ function detectSignals(tech) {
   }
 
   // MACD crossover
-  if (tech.macd !== null) {
+  if (tech.macd !== null && typeof tech.macd !== 'undefined') {
     if (tech.macd.histogram > 0 && tech.macd.macd > tech.macd.signal) {
       signals.push({
         type: 'macd_bullish', direction: 'bullish',
@@ -216,7 +185,7 @@ function detectSignals(tech) {
   }
 
   // Bollinger Band position
-  if (tech.bollinger !== null) {
+  if (tech.bollinger !== null && typeof tech.bollinger !== 'undefined') {
     const bbPos = (tech.price - tech.bollinger.lower) / (tech.bollinger.upper - tech.bollinger.lower);
     if (bbPos < 0.1) {
       signals.push({
@@ -234,7 +203,8 @@ function detectSignals(tech) {
   }
 
   // SMA cross (20 vs 50)
-  if (tech.sma_20 !== null && tech.sma_50 !== null) {
+  if (tech.sma_20 !== null && typeof tech.sma_20 !== 'undefined' && 
+      tech.sma_50 !== null && typeof tech.sma_50 !== 'undefined') {
     const crossStrength = Math.abs(tech.sma_20 - tech.sma_50) / tech.price;
     if (tech.sma_20 > tech.sma_50) {
       signals.push({
@@ -252,7 +222,7 @@ function detectSignals(tech) {
   }
 
   // Price vs 200 SMA (trend filter)
-  if (tech.sma_200 !== null) {
+  if (tech.sma_200 !== null && typeof tech.sma_200 !== 'undefined') {
     if (tech.price > tech.sma_200) {
       signals.push({
         type: 'above_200sma', direction: 'bullish',
@@ -269,7 +239,8 @@ function detectSignals(tech) {
   }
 
   // Unusual volume
-  if (tech.relative_volume !== null && tech.relative_volume > 2) {
+  if (tech.relative_volume !== null && typeof tech.relative_volume !== 'undefined' && 
+      tech.relative_volume > 2) {
     signals.push({
       type: 'high_volume', direction: 'neutral',
       strength: Math.min(1, (tech.relative_volume - 1) / 4),
@@ -282,13 +253,6 @@ function detectSignals(tech) {
 
 // ── High-level analysis (fetches data + computes) ───────────────────
 
-/**
- * Run full technical analysis for a ticker.
- * Fetches 200 days of bars from Alpaca (or Yahoo fallback), then computes all indicators.
- *
- * @param {string} ticker
- * @returns {{ technicals: object, signals: Array, bars: Array }}
- */
 async function analyze(ticker) {
   const upper = ticker.toUpperCase();
   let bars;
@@ -319,7 +283,7 @@ async function analyze(ticker) {
         bars = snapshot.history.map(b => ({
           t: b.date,
           o: b.open,
-          h: b.high,
+          h: b.low,
           l: b.low,
           c: b.close,
           v: b.volume,
@@ -342,11 +306,6 @@ async function analyze(ticker) {
 
 // ── Discord formatting ──────────────────────────────────────────────
 
-/**
- * Format technical analysis for Discord.
- * @param {object} result - from analyze()
- * @returns {string}
- */
 function formatForDiscord(result) {
   const { technicals: t, signals } = result;
   const fmt = (v) => v !== null && v !== undefined ? v.toFixed(2) : '—';
