@@ -1,20 +1,15 @@
-const CONFIG_SCHEMA = {
-  fmpApiKey: { type: 'string', required: true, env: 'FMP_API_KEY' },
-};
+/**
+ * Market data client using Financial Modeling Prep (FMP) API.
+ * Requires an API key — set FMP_API_KEY in your .env file.
+ * Get your free key at https://financialmodelingprep.com/developer
+ * Supports stocks AND crypto (BTC, ETH, SOL, etc.)
+ */
 
-function validateConfig(config) {
-  const errors = Object.keys(CONFIG_SCHEMA)
-    .filter(key => CONFIG_SCHEMA[key].required && !config[key])
-    .map(key => `Missing required ${key} (${CONFIG_SCHEMA[key].env})`);
-  return errors;
-}
-
-if (validateConfig(config).length > 0) {
-  throw new Error('Configuration error: ' + validateConfig(config).join(', '));
-}
+const config = require('../config');
 
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
 
+// Common crypto symbols → FMP format (BTCUSD, not BTC-USD)
 const CRYPTO_MAP = {
   BTC: 'BTCUSD', ETH: 'ETHUSD', SOL: 'SOLUSD', XRP: 'XRPUSD',
   DOGE: 'DOGEUSD', ADA: 'ADAUSD', AVAX: 'AVAXUSD', DOT: 'DOTUSD',
@@ -39,13 +34,10 @@ class MarketDataClient {
   /**
    * Sanitize a user-provided ticker to prevent log injection and invalid lookups.
    * Strips anything that isn't alphanumeric, dash, or dot (e.g. BRK.B, BTC-USD).
-   * Rejects tickers prefixed with $ or / to prevent command injection.
    * Returns null if the result is empty or too long.
    */
   sanitizeTicker(ticker) {
     if (!ticker || typeof ticker !== 'string') return null;
-    // Reject tickers starting with non-alphanumeric chars (e.g. $AAPL, /AAPL)
-    if (/^[^A-Za-z0-9]+/.test(ticker.trim())) return null;
     const cleaned = ticker.replace(/[^A-Za-z0-9.\-]/g, '').trim();
     if (!cleaned || cleaned.length > 12) return null;
     return cleaned.toUpperCase();
@@ -77,7 +69,7 @@ class MarketDataClient {
     return !!CRYPTO_MAP[upper];
   }
 
-  // ── FMP API fetch helper ──────────────────────────────────────────────────────
+  // ── FMP API fetch helper ──────────────────────────────────────────────
 
   async _fmpFetch(endpoint, params = {}) {
     if (!config.fmpApiKey) throw new Error('FMP API key not configured — set FMP_API_KEY in .env');
@@ -102,7 +94,7 @@ class MarketDataClient {
     return res.json();
   }
 
-  // ── Retry helper ────────────────────────────────────────────────────────────────
+  // ── Retry helper ──────────────────────────────────────────────────────
 
   async _retry(fn, label, maxRetries = 2) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -126,7 +118,7 @@ class MarketDataClient {
     }
   }
 
-  // ── Quote — current price + key stats ─────────────────────────────────────────
+  // ── Quote — current price + key stats ─────────────────────────────────
 
   async getQuote(ticker) {
     const upper = ticker.toUpperCase();
@@ -341,118 +333,6 @@ class MarketDataClient {
     const data = await this._retry(
       () => this._fmpFetch('/biggest-gainers'),
       'gainers'
-    );
-
-    if (!Array.isArray(data) || data.length === 0) return [];
-
-    return data.slice(0, 20).map(q => ({
-      symbol: q.symbol,
-      shortName: q.name,
-      regularMarketPrice: q.price,
-      regularMarketChangePercent: q.changesPercentage,
-      regularMarketVolume: q.volume || null,
-      marketCap: q.marketCap || null,
-    }));
-  }
-
-  // ── Screening — advanced stock screener ─────────────────────────────
-
-  /**
-   * Screen stocks using FMP's company-screener endpoint.
-   * @param {object} filters — screening criteria:
-   *   marketCapMin/marketCapMax, volumeMin/volumeMax, priceMin/priceMax,
-   *   betaMin/betaMax, dividendMin/dividendMax,
-   *   sector, industry, exchange, country,
-   *   isActivelyTrading, isEtf, isFund, limit
-   * @returns {Array} — matching stocks with quote data
-   */
-  async screenStocks(filters = {}) {
-    const params = {};
-
-    // Market cap
-    if (filters.marketCapMin != null) params.marketCapMoreThan = filters.marketCapMin;
-    if (filters.marketCapMax != null) params.marketCapLowerThan = filters.marketCapMax;
-
-    // Volume
-    if (filters.volumeMin != null) params.volumeMoreThan = filters.volumeMin;
-    if (filters.volumeMax != null) params.volumeLowerThan = filters.volumeMax;
-
-    // Price
-    if (filters.priceMin != null) params.priceMoreThan = filters.priceMin;
-    if (filters.priceMax != null) params.priceLowerThan = filters.priceMax;
-
-    // Beta
-    if (filters.betaMin != null) params.betaMoreThan = filters.betaMin;
-    if (filters.betaMax != null) params.betaLowerThan = filters.betaMax;
-
-    // Dividend yield
-    if (filters.dividendMin != null) params.dividendMoreThan = filters.dividendMin;
-    if (filters.dividendMax != null) params.dividendLowerThan = filters.dividendMax;
-
-    // Classification
-    if (filters.sector) params.sector = filters.sector;
-    if (filters.industry) params.industry = filters.industry;
-    if (filters.exchange) params.exchange = filters.exchange;
-    if (filters.country) params.country = filters.country || 'US';
-
-    // Flags
-    if (filters.isActivelyTrading != null) params.isActivelyTrading = filters.isActivelyTrading;
-    if (filters.isEtf != null) params.isEtf = filters.isEtf;
-    if (filters.isFund != null) params.isFund = filters.isFund;
-
-    // Results limit (default 50, max 1000)
-    params.limit = Math.min(filters.limit || 50, 1000);
-
-    const data = await this._retry(
-      () => this._fmpFetch('/company-screener', params),
-      'screener'
-    );
-
-    if (!Array.isArray(data) || data.length === 0) return [];
-
-    return data.map(q => ({
-      symbol: q.symbol,
-      shortName: q.companyName || q.name,
-      regularMarketPrice: q.price,
-      regularMarketChangePercent: q.changesPercentage ?? null,
-      regularMarketVolume: q.volume ?? null,
-      marketCap: q.marketCap ?? null,
-      sector: q.sector || null,
-      industry: q.industry || null,
-      exchange: q.exchangeShortName || q.exchange || null,
-      beta: q.beta ?? null,
-      lastDividend: q.lastAnnualDividend ?? null,
-      country: q.country || null,
-      isActivelyTrading: q.isActivelyTrading ?? null,
-    }));
-  }
-
-  // ── Screening — top losers ──────────────────────────────────────────
-
-  async screenByLosers() {
-    const data = await this._retry(
-      () => this._fmpFetch('/biggest-losers'),
-      'losers'
-    );
-
-    if (!Array.isArray(data) || data.length === 0) return [];
-
-    return data.slice(0, 20).map(q => ({
-      symbol: q.symbol,
-      shortName: q.name,
-      regularMarketPrice: q.price,
-      regularMarketChangePercent: q.changesPercentage,
-      regularMarketVolume: q.volume || null,
-      marketCap: q.marketCap || null,
-    }));
-  }
-
-  // ── Screening — most active by volume ───────────────────────────────
-
-  async screenByMostActive() {
-    const data = await this._retry(
-      () => this._fmpFetch('/most-active'),
-      'most-active'
     );
 
     if (!Array.isArray(data) || data.length === 0) return [];

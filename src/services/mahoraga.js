@@ -1,48 +1,45 @@
+/**
+ * SHARK — Autonomous Trading Engine
+ *
+ * Runs directly inside the Discord bot on Railway.
+ * Druckenmiller top-down framework:
+ *   "50% of a stock's move is the overall market, 30% is the industry, 20% is stock picking."
+ *
+ * Pipeline: Macro Regime → Sector Rotation → Signal Scan → Fundamentals → Technicals → AI Decision → Trade
+ *
+ * Data sources:
+ *   - Macro engine (SPY trend, sector breadth, risk regime)
+ *   - Sector rotation (11 SPDR ETFs, multi-timeframe relative strength)
+ *   - StockTwits (social sentiment / trending)
+ *   - Reddit (r/wallstreetbets, r/stocks, r/investing, r/options)
+ *   - Validea (guru fundamental analysis — Buffett, Lynch, Graham, etc.)
+ *   - Alpaca (market data + trade execution)
+ *   - Technicals engine (RSI, MACD, Bollinger, etc.)
+ *
+ * Signal cache: persistent cache to avoid re-evaluating same tickers
+ * Order flow: two-step preview → approval token → submit (MAHORAGA reference)
+ * Risk management via policy.js (kill switch, position limits, stop losses, etc.)
+ *
+ * Based on https://github.com/ygwyg/SHARK (MIT license)
+ */
+
+const alpaca = require('./alpaca');
+const stocktwits = require('./stocktwits');
+const reddit = require('./reddit');
+const technicals = require('./technicals');
+const validea = require('./validea');
+const macro = require('./macro');
+const sectors = require('./sectors');
+const policy = require('./policy');
+const signalCache = require('./signal-cache');
+const ai = require('./ai');
+const config = require('../config');
+const Storage = require('./storage');
 const auditLog = require('./audit-log');
+const circuitBreaker = require('./circuit-breaker');
 
-const logQueue = [];
-let isFlushing = false;
-
-class AsyncAuditLogger {
-  constructor() {
-    this.flushDebounced = this.flushDebounced.bind(this);
-  }
-
-  log(type, message) {
-    const entry = { type, message, timestamp: new Date().toISOString() };
-    logQueue.push(entry);
-    
-    if (!isFlushing) {
-      isFlushing = true;
-      process.nextTick(this.flushDebounced);
-    }
-  }
-
-  async flushDebounced() {
-    if (logQueue.length === 0) {
-      isFlushing = false;
-      return;
-    }
-
-    isFlushing = true;
-    try {
-      const batch = [...logQueue];
-      logQueue.length = 0;
-      
-      const writePromises = batch.map(entry => {
-        return auditLog._append(entry);
-      });
-
-      await Promise.all(writePromises);
-    } catch (err) {
-      console.warn('[SHARK] Async log write failed, entry retained for retry', err.message);
-    } finally {
-      isFlushing = false;
-    }
-  }
-}
-
-const asyncAuditLog = new AsyncAuditLogger();
+// Max ticker evaluations per scan cycle (prevents runaway loops)
+const MAX_EVALS_PER_CYCLE = 8;
 
 class SharkEngine {
   constructor() {
@@ -72,8 +69,6 @@ class SharkEngine {
   /** Called by autonomous.js to wire up the Discord posting callback */
   setChannelPoster(fn) {
     this._postToChannel = fn;
-    // Also wire the options engine
-    optionsEngine.setChannelPoster(fn);
   }
 
   // ── Enable / Disable / Kill ───────────────────────────────────────
@@ -164,14 +159,6 @@ class SharkEngine {
 
     status.config = policy.getConfig();
     status.circuitBreaker = circuitBreaker.getStatus();
-
-    // Include options engine status
-    try {
-      status.options = await optionsEngine.getStatus();
-    } catch {
-      status.options = { enabled: false, error: 'Options engine unavailable' };
-    }
-
     return status;
   }
 
@@ -181,12 +168,12 @@ class SharkEngine {
 
   // ── Logging ───────────────────────────────────────────────────────
 
-  /**_log type, message) {
+  _log(type, message) {
     const entry = { type, message, timestamp: new Date().toISOString() };
     this._logs.push(entry);
     if (this._logs.length > 200) this._logs.shift();
     // Persist to audit log file
-    asyncAuditLog.log(type, `[SHARK] ${message}`);
+    auditLog.log(type, `[SHARK] ${message}`);
     return entry;
   }
 
@@ -248,13 +235,6 @@ class SharkEngine {
       // ── 4-5. Scan for new signals (skip if RISK_OFF macro) ──
       if (macroRegime.regime !== 'RISK_OFF') {
         await this._scanSignals(account, macroRegime);
-      }
-
-      // ── 6. Run 0DTE options cycle (if enabled) ──
-      try {
-        await optionsEngine.runCycle();
-      } catch (err) {
-        this._log('options', `Options cycle error: ${err.message}`);
       }
 
       // Cycle completed successfully — reset error counter
@@ -891,19 +871,14 @@ class SharkEngine {
     }
   }
 
-  // ── Options Engine Access ────────────────────────────────────────
-
-  get optionsEngine() { return optionsEngine; }
-
   // ── Discord Formatting ────────────────────────────────────────────
 
   formatStatusForDiscord(status) {
     if (!status) return '_Could not fetch agent status._';
 
-    const dangerousLabel = status.config?.dangerousMode ? ' | **DANGEROUS MODE**' : '';
     const lines = [
       `**SHARK — Autonomous Trading Agent**`,
-      `Mode: ${status.paper ? '📄 Paper Trading' : '💵 LIVE Trading'}${dangerousLabel}`,
+      `Mode: ${status.paper ? '📄 Paper Trading' : '💵 LIVE Trading'}`,
       `Agent: ${status.agent_enabled ? '🟢 **ENABLED**' : '🔴 **DISABLED**'}`,
       ``,
     ];
@@ -945,24 +920,6 @@ class SharkEngine {
     if (status.clock) {
       lines.push(``);
       lines.push(`Market: ${status.clock.is_open ? '🟢 Open' : '🔴 Closed'}`);
-    }
-
-    // Options engine status
-    if (status.options) {
-      lines.push(``);
-      lines.push(`**0DTE Options**`);
-      lines.push(`Engine: ${status.options.enabled ? '🟢 Enabled' : '🔴 Disabled'}`);
-      if (status.options.enabled) {
-        lines.push(`Positions: \`${status.options.activePositions}/${status.options.maxPositions}\``);
-        lines.push(`Daily Loss: \`$${status.options.dailyLoss?.toFixed(0) || 0}/$${status.options.maxDailyLoss || 0}\``);
-        lines.push(`Underlyings: \`${status.options.config?.underlyings?.join(', ') || 'SPY, QQQ'}\``);
-        if (status.options.positions?.length > 0) {
-          for (const p of status.options.positions) {
-            const emoji = p.unrealizedPL >= 0 ? '🟢' : '🔴';
-            lines.push(`${emoji} ${p.underlying} $${p.strike} ${p.type.toUpperCase()} — P/L: $${p.unrealizedPL.toFixed(2)} (${(p.unrealizedPLPct * 100).toFixed(1)}%)`);
-          }
-        }
-      }
     }
 
     return lines.join('\n');
@@ -1022,26 +979,10 @@ class SharkEngine {
       lines.push(`**Denylist:** \`${cfg.symbol_denylist.join(', ')}\``);
     }
 
-    // Options config
-    if (cfg.options_enabled) {
-      lines.push(``);
-      lines.push(`__0DTE Options__`);
-      lines.push(`**Max Premium/Trade:** \`$${cfg.options_max_premium_per_trade}\``);
-      lines.push(`**Max Daily Loss:** \`$${cfg.options_max_daily_loss}\``);
-      lines.push(`**Max Options Positions:** \`${cfg.options_max_positions}\``);
-      lines.push(`**Scalp TP/SL:** \`${(cfg.options_scalp_take_profit_pct * 100).toFixed(0)}% / ${(cfg.options_scalp_stop_loss_pct * 100).toFixed(0)}%\``);
-      lines.push(`**Swing TP/SL:** \`${(cfg.options_swing_take_profit_pct * 100).toFixed(0)}% / ${(cfg.options_swing_stop_loss_pct * 100).toFixed(0)}%\``);
-      lines.push(`**Min Conviction:** \`${cfg.options_min_conviction}/10\``);
-      lines.push(`**Delta Range:** \`${cfg.options_min_delta} — ${cfg.options_max_delta}\``);
-      lines.push(`**Underlyings:** \`${cfg.options_underlyings?.join(', ') || 'SPY, QQQ'}\``);
-    }
-
     lines.push(``);
     lines.push(`Kill Switch: ${cfg.killSwitch ? '🛑 **ACTIVE**' : '🟢 OK'}`);
-    lines.push(`Dangerous Mode: ${cfg.dangerousMode ? '**ACTIVE** — aggressive parameters' : 'OFF'}`);
     lines.push(``);
     lines.push(`_Use \`/agent set key:<name> value:<val>\` to change a setting_`);
-    lines.push(`_Use \`/agent dangerous\` to toggle aggressive mode_`);
     lines.push(`_Use \`/agent reset\` to restore defaults_`);
     return lines.join('\n');
   }
