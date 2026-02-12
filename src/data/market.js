@@ -1,7 +1,3 @@
-/**
- * Market context provider — fetches data from Alpaca (preferred) or FMP.
- */
-
 const { assertFresh, FreshnessError } = require('./freshness');
 const yahoo = require('../services/yahoo');
 const alpaca = require('../services/alpaca');
