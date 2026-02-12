@@ -141,56 +141,20 @@ class AgentSwarm {
         console.warn('[AgentSwarm] Market indices fetch failed:', err.message);
       }
 
-      // Detect screening/portfolio queries and use FMP screener
-      const isScreeningQuery = this._isScreeningQuery(query);
-
-      if (isScreeningQuery && marketData.enabled) {
-        // Use the advanced screener to find stocks matching the query intent
-        try {
-          const screenResults = await this._runSmartScreen(query);
-          if (screenResults.length > 0) {
-            overviewParts.push(screenResults.join('\n\n'));
-          }
-        } catch (err) {
-          console.warn('[AgentSwarm] Smart screen failed:', err.message);
+      // Fetch top gainers for actionable stock ideas
+      try {
+        const gainers = await marketData.screenByGainers();
+        if (gainers.length > 0) {
+          const top = gainers.slice(0, 10);
+          const lines = top.map(g => {
+            const pct = g.regularMarketChangePercent;
+            const dir = pct > 0 ? '+' : '';
+            return `${g.symbol} (${g.shortName || ''}): $${g.regularMarketPrice?.toFixed(2) || '?'} ${dir}${pct?.toFixed(2) || '?'}% | Vol: ${g.regularMarketVolume ? (g.regularMarketVolume / 1e6).toFixed(1) + 'M' : 'N/A'}`;
+          });
+          overviewParts.push(`TOP GAINERS TODAY:\n${lines.join('\n')}`);
         }
-      }
-
-      // Fetch top gainers + most active + losers for broader context
-      const [gainers, mostActive, losers] = await Promise.all([
-        marketData.screenByGainers().catch(() => []),
-        marketData.screenByMostActive ? marketData.screenByMostActive().catch(() => []) : Promise.resolve([]),
-        marketData.screenByLosers ? marketData.screenByLosers().catch(() => []) : Promise.resolve([]),
-      ]);
-
-      if (gainers.length > 0) {
-        const top = gainers.slice(0, 10);
-        const lines = top.map(g => {
-          const pct = g.regularMarketChangePercent;
-          const dir = pct > 0 ? '+' : '';
-          return `${g.symbol} (${g.shortName || ''}): $${g.regularMarketPrice?.toFixed(2) || '?'} ${dir}${pct?.toFixed(2) || '?'}% | Vol: ${g.regularMarketVolume ? (g.regularMarketVolume / 1e6).toFixed(1) + 'M' : 'N/A'} | MktCap: ${g.marketCap ? '$' + (g.marketCap / 1e9).toFixed(1) + 'B' : 'N/A'}`;
-        });
-        overviewParts.push(`TOP GAINERS TODAY:\n${lines.join('\n')}`);
-      }
-
-      if (mostActive.length > 0) {
-        const top = mostActive.slice(0, 10);
-        const lines = top.map(g => {
-          const pct = g.regularMarketChangePercent;
-          const dir = pct > 0 ? '+' : '';
-          return `${g.symbol} (${g.shortName || ''}): $${g.regularMarketPrice?.toFixed(2) || '?'} ${dir}${pct?.toFixed(2) || '?'}% | Vol: ${g.regularMarketVolume ? (g.regularMarketVolume / 1e6).toFixed(1) + 'M' : 'N/A'}`;
-        });
-        overviewParts.push(`MOST ACTIVE BY VOLUME:\n${lines.join('\n')}`);
-      }
-
-      if (losers.length > 0) {
-        const top = losers.slice(0, 5);
-        const lines = top.map(g => {
-          const pct = g.regularMarketChangePercent;
-          const dir = pct > 0 ? '+' : '';
-          return `${g.symbol} (${g.shortName || ''}): $${g.regularMarketPrice?.toFixed(2) || '?'} ${dir}${pct?.toFixed(2) || '?'}%`;
-        });
-        overviewParts.push(`TOP LOSERS TODAY:\n${lines.join('\n')}`);
+      } catch (err) {
+        console.warn('[AgentSwarm] Top gainers fetch failed:', err.message);
       }
 
       if (overviewParts.length > 0) {
@@ -264,141 +228,6 @@ class AgentSwarm {
     }
 
     return parts.length > 0 ? parts.join('\n\n---\n\n') : '';
-  }
-
-  /**
-   * Detect if the query is asking to screen/find/build a portfolio of stocks
-   * rather than asking about specific tickers.
-   */
-  _isScreeningQuery(query) {
-    const lower = query.toLowerCase();
-    const screeningKeywords = [
-      'portfolio', 'screen', 'find stocks', 'find me', 'pick stocks',
-      'best stocks', 'top stocks', 'build me', 'stock picks', 'pump',
-      'undervalued', 'high volume', 'momentum', 'growth stocks',
-      'dividend stocks', 'value stocks', 'small cap', 'large cap',
-      'mid cap', 'high beta', 'low beta', 'penny stocks',
-      'screener', 'scanner', 'filter stocks', 'stock ideas',
-      'what to buy', 'what should i buy', 'recommendations',
-    ];
-    return screeningKeywords.some(kw => lower.includes(kw));
-  }
-
-  /**
-   * Run multiple screener queries to get diverse stock data for portfolio building.
-   * Parses the query to extract criteria and runs targeted screens.
-   */
-  async _runSmartScreen(query) {
-    const lower = query.toLowerCase();
-    const results = [];
-
-    // Parallel screener calls for different criteria
-    const screens = [];
-
-    // Large-cap high-volume (liquid, safe)
-    screens.push({
-      label: 'LARGE-CAP HIGH-VOLUME STOCKS',
-      filters: { marketCapMin: 10e9, volumeMin: 5e6, country: 'US', isActivelyTrading: true, limit: 20 },
-    });
-
-    // Detect sector preferences from query
-    const sectorMap = {
-      tech: 'Technology', technology: 'Technology',
-      health: 'Healthcare', healthcare: 'Healthcare', pharma: 'Healthcare', biotech: 'Healthcare',
-      energy: 'Energy', oil: 'Energy', gas: 'Energy',
-      finance: 'Financial Services', financial: 'Financial Services', bank: 'Financial Services',
-      consumer: 'Consumer Cyclical', retail: 'Consumer Cyclical',
-      industrial: 'Industrials', manufacturing: 'Industrials',
-      real: 'Real Estate', reit: 'Real Estate',
-      utilities: 'Utilities',
-      materials: 'Basic Materials',
-      communication: 'Communication Services', media: 'Communication Services',
-    };
-
-    let sectorFilter = null;
-    for (const [keyword, sector] of Object.entries(sectorMap)) {
-      if (lower.includes(keyword)) {
-        sectorFilter = sector;
-        break;
-      }
-    }
-
-    if (sectorFilter) {
-      screens.push({
-        label: `${sectorFilter.toUpperCase()} SECTOR SCREEN`,
-        filters: { sector: sectorFilter, marketCapMin: 1e9, volumeMin: 1e6, country: 'US', isActivelyTrading: true, limit: 20 },
-      });
-    }
-
-    // Detect market cap preference
-    if (lower.includes('small cap') || lower.includes('smallcap') || lower.includes('penny')) {
-      screens.push({
-        label: 'SMALL-CAP STOCKS (under $2B)',
-        filters: { marketCapMax: 2e9, marketCapMin: 100e6, volumeMin: 500000, country: 'US', isActivelyTrading: true, limit: 20 },
-      });
-    }
-
-    if (lower.includes('mid cap') || lower.includes('midcap')) {
-      screens.push({
-        label: 'MID-CAP STOCKS ($2B–$10B)',
-        filters: { marketCapMin: 2e9, marketCapMax: 10e9, volumeMin: 1e6, country: 'US', isActivelyTrading: true, limit: 20 },
-      });
-    }
-
-    // Dividend stocks
-    if (lower.includes('dividend') || lower.includes('yield') || lower.includes('income')) {
-      screens.push({
-        label: 'HIGH-DIVIDEND STOCKS (yield > 3%)',
-        filters: { dividendMin: 3, marketCapMin: 1e9, country: 'US', isActivelyTrading: true, limit: 20 },
-      });
-    }
-
-    // High-beta / momentum
-    if (lower.includes('momentum') || lower.includes('high beta') || lower.includes('aggressive') || lower.includes('pump')) {
-      screens.push({
-        label: 'HIGH-BETA MOMENTUM STOCKS (beta > 1.5)',
-        filters: { betaMin: 1.5, marketCapMin: 500e6, volumeMin: 2e6, country: 'US', isActivelyTrading: true, limit: 20 },
-      });
-    }
-
-    // Low-beta / defensive
-    if (lower.includes('defensive') || lower.includes('low beta') || lower.includes('safe') || lower.includes('conservative')) {
-      screens.push({
-        label: 'LOW-BETA DEFENSIVE STOCKS (beta < 0.8)',
-        filters: { betaMax: 0.8, betaMin: 0, marketCapMin: 5e9, country: 'US', isActivelyTrading: true, limit: 20 },
-      });
-    }
-
-    // Value / undervalued — use low price + high market cap as proxy
-    if (lower.includes('value') || lower.includes('undervalued') || lower.includes('cheap')) {
-      screens.push({
-        label: 'VALUE STOCKS (large-cap, lower price)',
-        filters: { priceMax: 50, marketCapMin: 5e9, country: 'US', isActivelyTrading: true, limit: 20 },
-      });
-    }
-
-    // Run all screens in parallel
-    const screenResults = await Promise.all(
-      screens.map(async ({ label, filters }) => {
-        try {
-          const stocks = await marketData.screenStocks(filters);
-          if (stocks.length === 0) return null;
-          const lines = stocks.slice(0, 15).map(s => {
-            const vol = s.regularMarketVolume ? (s.regularMarketVolume / 1e6).toFixed(1) + 'M' : 'N/A';
-            const cap = s.marketCap ? '$' + (s.marketCap / 1e9).toFixed(1) + 'B' : 'N/A';
-            const beta = s.beta != null ? s.beta.toFixed(2) : 'N/A';
-            const div = s.lastDividend != null ? '$' + s.lastDividend.toFixed(2) : 'N/A';
-            return `  ${s.symbol} (${s.shortName || '?'}) | Price: $${s.regularMarketPrice?.toFixed(2) || '?'} | Vol: ${vol} | MktCap: ${cap} | Beta: ${beta} | Div: ${div} | Sector: ${s.sector || 'N/A'}`;
-          });
-          return `SCREENER — ${label} (${stocks.length} results):\n${lines.join('\n')}`;
-        } catch (err) {
-          console.warn(`[AgentSwarm] Screen "${label}" failed:`, err.message);
-          return null;
-        }
-      })
-    );
-
-    return screenResults.filter(Boolean);
   }
 
   _extractTickers(query) {

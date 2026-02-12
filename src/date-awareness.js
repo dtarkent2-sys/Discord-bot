@@ -213,61 +213,6 @@ function _flattenLiveData(data) {
 }
 
 /**
- * Numeric-focused hallucination detector (added by YOLO mode).
- *
- * Scans for unsubstantiated dollar amounts, percentages, market caps,
- * and analyst guidance tied to post-cutoff years.
- * Complements detectHallucinations() with financial-specific patterns.
- */
-function detectNumericHallucinations(response, liveData = {}) {
-  if (!response || typeof response !== 'string') {
-    return { flagged: false, warnings: [], confidence: 0 };
-  }
-
-  const warnings = [];
-  const cutoffYear = parseInt(MODEL_CUTOFF.match(/\d{4}/)?.[0] || '2024', 10);
-  const liveDataText = _flattenLiveData(liveData);
-
-  // Pattern: dollar amounts paired with post-cutoff year context
-  const dollarPattern = /\$[\d,.]+\s*(?:billions?|trillions?|millions?)?\b/gi;
-  let dollarMatch;
-  while ((dollarMatch = dollarPattern.exec(response)) !== null) {
-    const contextStart = Math.max(0, dollarMatch.index - 80);
-    const contextEnd = dollarMatch.index + dollarMatch[0].length + 50;
-    const context = response.slice(contextStart, contextEnd);
-    if (/\b(202[5-9]|203\d)\b/.test(context) && !liveDataText.includes(dollarMatch[0])) {
-      warnings.push(`Unsubstantiated dollar figure "${dollarMatch[0]}" linked to post-cutoff context`);
-    }
-  }
-
-  // Pattern: percentages for specific events after cutoff
-  const percentagePattern = /\b\d+(?:\.\d+)?%?\b(?:\s*(?:growth|decline|change|increase|drop|decrease|beat|miss|surge|jump|rise|fall))\s+(?:in|during|by|around|forecast)\s+(?:202[5-9]|203\d)/gi;
-  let percMatch;
-  while ((percMatch = percentagePattern.exec(response)) !== null) {
-    if (!liveDataText.includes(percMatch[0])) {
-      warnings.push(`Confidently stated ${percMatch[0]} for post-cutoff event — verify against live data`);
-    }
-  }
-
-  // Pattern: market cap / volume claims for recent entities
-  const capVolumePattern = /\b(?:market\s*cap|market\s*valuation|enterprise\s*value|trading\s*volume)\b\s*[:=]?\s*\$?\d{1,3}(?:[.,]\d{3})*(?:\.\d+)?\b/gi;
-  let capMatch;
-  while ((capMatch = capVolumePattern.exec(response)) !== null) {
-    const context = response.slice(
-      Math.max(0, capMatch.index - 80),
-      capMatch.index + capMatch[0].length + 80
-    );
-    if (/\b(202[5-9]|203\d)\b/.test(context) && !liveDataText.includes(capMatch[0])) {
-      warnings.push(`Confident ${capMatch[0].trim()} claim for recent entity not in live data`);
-    }
-  }
-
-  const flagged = warnings.length > 0;
-  const confidence = Math.min(100, warnings.length * 30);
-  return { flagged, warnings, confidence };
-}
-
-/**
  * Build a short warning footer to append to flagged responses.
  * Only used when the hallucination detector fires.
  */
@@ -286,6 +231,5 @@ module.exports = {
   ragReminder,
   userMessageDateAnchor,
   detectHallucinations,
-  detectNumericHallucinations,
   buildHallucinationWarning,
 };
