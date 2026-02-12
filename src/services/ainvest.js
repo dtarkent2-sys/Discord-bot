@@ -4,7 +4,7 @@ const CONFIG_MAX_COUNT = 1_000; // safeguard against runaway requests
 
 class AInvestService {
   constructor() {
-    this._headers = null;
+    this._cachedHeaders = null;
     this._mcpInitPromise = null;
   }
 
@@ -36,13 +36,12 @@ class AInvestService {
   }
 
   _getHeaders() {
-    if (!this._headers) {
-      this._headers = {
-        'Authorization': `Bearer ${config.ainvestApiKey}`,
-        'Accept': 'application/json',
-      };
-    }
-    return this._headers;
+    if (this._cachedHeaders) return this._cachedHeaders;
+    this._cachedHeaders = {
+      'Authorization': `Bearer ${config.ainvestApiKey}`,
+      'Accept': 'application/json',
+    };
+    return this._cachedHeaders;
   }
 
   async _fetch(path, params = {}, timeoutMs = 15000) {
@@ -102,7 +101,7 @@ class AInvestService {
     return result;
   }
 
-  async getCandles(ticker, { interval = 'day', step = 1, count = 2 } = {}) {
+  async getCandles(ticker, { interval = 'day', step = 1, count = 20 } = {}) {
     const tkr = ticker.toUpperCase();
 
     if (!Number.isInteger(count) || count <= 0) count = 5;
@@ -162,15 +161,15 @@ class AInvestService {
     const prev = candles.length > 1 ? candles[candles.length - 2] : null;
     const price = latest.close;
     const prevClose = prev ? prev.close : null;
-    const change = prevClose != null ? price - prevClose : null;
-    const changePercent = prevClose != null ? (change / prevClose) * 100 : null;
+    const change = prevClose ? price - prevClose : null;
+    const changePercent = prevClose ? (change / prevClose) * 100 : null;
 
     return {
       ticker: ticker.toUpperCase(),
       symbol: ticker.toUpperCase(),
       price,
-      change: change !== null ? change : null,
-      changePercent: changePercent !== null ? changePercent : null,
+      change,
+      changePercent,
       volume: latest.volume,
       marketCap: null,
       dayHigh: latest.high,
@@ -265,7 +264,7 @@ class AInvestService {
     if (!data) return null;
 
     let payload = data;
-    if (!payload.analysts_ratings && !payload.buy && payload.data) {
+    if (!payload.analysts_ratings && !payload.buy && payload?.data) {
       payload = payload.data;
     }
 
@@ -305,7 +304,7 @@ class AInvestService {
       rating: r.rating || r.current_rating || '',
       targetPrice: r.target_price ?? r.price_target ?? null,
       previousRating: r.previous_rating || r.rating_previous || null,
-      previousTarget: r.previous_target_price ?? r.target_price_previous ?? null,
+      previousTarget: r.previous_target_price ?? r.target_price_previous || null,
     }));
   }
 
