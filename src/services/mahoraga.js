@@ -1,15 +1,7 @@
-const getRegime = async () => {
-  const cached = this._macroRegimeCache;
-  if (cached) return cached;
+const alpaca = require('./alpaca'); const stocktwits = require('./stocktwits'); const reddit = require('./reddit'); const technicals = require('./technicals'); const validea = require('./validea'); const macro = require('./macro'); const sectors = require('./sectors'); const policy = require('./policy'); const signalCache = require('./signal-cache'); const ai = require('./ai'); const config = require('../config'); const Storage = require('./storage'); const auditLog = require('./audit-log'); const circuitBreaker = require('./circuit-breaker'); const optionsEngine = require('./options-engine');
 
-  try {
-    const result = await macro.getRegime();
-    this._macroRegimeCache = result;
-    return result;
-  } catch (err) {
-    throw new Error(`getRegime failed: ${err.message}`);
-  }
-};
+// Max ticker evaluations per scan cycle (prevents runaway loops)
+const MAX_EVALS_PER_CYCLE = 8;
 
 class SharkEngine {
   constructor() {
@@ -115,7 +107,7 @@ class SharkEngine {
 
     try {
       status.positions = await alpaca.getPositions();
-    } catch (err) {
+    } catch {
       status.positions = [];
     }
 
@@ -550,7 +542,7 @@ class SharkEngine {
       `"50% of a stock's move is the overall market, 30% is the industry, and 20% is stock picking."`,
       ``,
       `Evaluate this opportunity top-down: MACRO → SECTOR → STOCK, then decide BUY or PASS.`,
-      `Be risk-averse: prefer waiting for revenue validation over chasing hype. Look for Peter Lynch-style "fast growers" — sound financials, tangible revenue growth path, attractive valuations.`,
+      `Be risk-averse: favor waiting for revenue validation over chasing hype. Look for Peter Lynch-style "fast growers" — sound financials, tangible revenue growth path, attractive valuations.`,
       ``,
       `═══ MACRO ENVIRONMENT (50% weight) ═══`,
       macroRegime.regime ? `  Regime: ${macroRegime.regime} (score: ${macroRegime.score})` : `  Regime: unknown`,
@@ -735,7 +727,7 @@ class SharkEngine {
       const bullish = signals.filter(s => s.direction === 'bullish').reduce((a, s) => a + s.strength, 0);
       const bearish = signals.filter(s => s.direction === 'bearish').reduce((a, s) => a + s.strength, 0);
       netSignal = bullish - bearish;
-      steps.push(`Technicals: price $${tech.price?.toFixed(2)}, RSI ${tech.rsi_14?.toFixed(1) ?? '—'}, net signal ${netSignal.toFixed(2)}`);
+      steps.push(`Technicals: price $${tech.price?.toFixed(2)}, RSI ${tech.rsi_14?.toFixed(1) || '—'}, net signal ${netSignal.toFixed(2)}`);
     } catch (err) {
       steps.push(`Technicals: unavailable (${err.message})`);
     }
