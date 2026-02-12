@@ -111,7 +111,7 @@ function _createRedisClient(redisUrl) {
         }
       }
 
-      socket.on('data', (data) => parseResponse(data.toString()));
+       socket.on('data', (data) => parseResponse(data.toString()));
       socket.on('error', (err) => {
         if (pending.length > 0) pending.shift().reject(err);
       });
