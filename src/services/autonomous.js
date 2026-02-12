@@ -294,12 +294,26 @@ class AutonomousBehaviorEngine {
   // ── Channel posting (rate-limited) ──────────────────────────────────
 
   async postToChannel(channelName, content) {
-    const channel = this.client.channels.cache.find(
+    // Search cache first, then fetch from guild if cache misses (handles recreated channels)
+    let channel = this.client.channels.cache.find(
       ch => ch.name === channelName && ch.isTextBased()
     );
 
     if (!channel) {
-      console.warn(`[Sprocket] Channel "${channelName}" not found. Skipping post.`);
+      // Cache miss — the channel may have been recreated (new ID). Fetch fresh from guilds.
+      for (const guild of this.client.guilds.cache.values()) {
+        try {
+          const channels = await guild.channels.fetch();
+          channel = channels.find(ch => ch && ch.name === channelName && ch.isTextBased());
+          if (channel) break;
+        } catch (err) {
+          console.warn(`[Sprocket] Failed to fetch channels for guild ${guild.name}: ${err.message}`);
+        }
+      }
+    }
+
+    if (!channel) {
+      console.warn(`[Sprocket] Channel "${channelName}" not found in cache or guilds. Skipping post.`);
       return;
     }
 
