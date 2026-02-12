@@ -1,6 +1,21 @@
-const CONFIG_MIN_INTERVAL_MS = 60_000; // 1 minute
-const CONFIG_MAX_INTERVAL_MS = 86_400_000; // 24 hours
-const CONFIG_MAX_COUNT = 1_000; // safeguard against runaway requests
+const checkCandles = (data) => {
+  if (!Array.isArray(data) && data?.data && Array.isArray(data.data)) {
+    return data.data;
+  }
+  return data;
+};
+
+const formatKeys = (obj) => {
+  if (!obj || typeof obj !== 'object') return 'N/A';
+  return Object.keys(obj).join(',');
+};
+
+const cannedCandlesCheck = (data) => {
+  if (!Array.isArray(data) && data?.data && Array.isArray(data.data)) {
+    return data.data;
+  }
+  return data;
+};
 
 class AInvestService {
   constructor() {
@@ -120,7 +135,6 @@ class AInvestService {
       fromMs = Date.now() - count * 1.5 * 24 * 60 * 60 * 1000;
     }
 
-    // Reject invalid or extreme intervals
     if (fromMs < 0 || fromMs > Date.now()) {
       count = 5;
       fromMs = Date.now() - 5 * (interval === 'day' ? 1.5 : interval === 'week' ? 7 : 30) * 24 * 60 * 60 * 1000;
@@ -135,15 +149,15 @@ class AInvestService {
       restArgs,
     );
 
-    let candles = data;
-    if (!Array.isArray(candles) && candles?.data && Array.isArray(candles.data)) {
-      candles = candles.data;
-    }
-    if (!Array.isArray(candles)) {
-      console.warn(`[AInvest] getCandles(${tkr}): unexpected data shape — ${typeof candles}, keys=${candles && typeof candles === 'object' ? Object.keys(candles).join(',') : 'N/A'}`);
+    const processedData = cannedCandlesCheck(data);
+    const isArray = Array.isArray(processedData);
+    const keysJoined = !isArray && processedData?.keys ? formatKeys(processedData) : 'N/A';
+    const item = processedData;
+    if (!isArray) {
+      console.warn(`[AInvest] getCandles(${tkr}): unexpected data shape — ${typeof processedData}, keys=${keysJoined}`);
       return [];
     }
-    return candles.map(c => ({
+    return item.map(c => ({
       open: c.open ?? c.o,
       high: c.high ?? c.h,
       low: c.low ?? c.l,
@@ -193,7 +207,8 @@ class AInvestService {
       'get-marketdata-trades', mcpArgs,
       '/marketdata/trades', restParams,
     );
-    let payload = data;
+    const processedData = cannedCandlesCheck(data);
+    let payload = processedData;
     if (!Array.isArray(payload) && !payload?.list && payload?.data) {
       payload = payload.data;
     }
@@ -215,14 +230,15 @@ class AInvestService {
       '/news/v1/wire/page/history', restParams,
     );
 
-    let payload = data;
+    const payload = cannedCandlesCheck(data);
+    let articlesData = payload;
     if (!Array.isArray(payload) && !payload?.list && payload?.data) {
-      payload = payload.data;
+      articlesData = payload.data;
     }
-    const articles = Array.isArray(payload) ? payload : (payload?.list || []);
+    const articles = Array.isArray(articlesData) ? articlesData : (articlesData?.list || []);
     const articleLimit = Math.min(limit, articles.length);
     if (articleLimit === 0) {
-      console.warn(`[AInvest] getNews: 0 articles — data shape: ${typeof data}, keys=${data && typeof data === 'object' ? Object.keys(data).join(',') : 'N/A'}`);
+      console.warn(`[AInvest] getNews: 0 articles — data shape: ${typeof data}, keys=${formatKeys(data)}`);
     }
     return articles.slice(0, articleLimit).map(a => ({
       title: a.title || a.headline || '',
@@ -244,8 +260,9 @@ class AInvestService {
 
     const data = await this._fetch('/news/v1/article/page/history', params);
 
-    const articles = Array.isArray(data) ? data : (data?.list || []);
-    return articles.slice(0, limit).map(a => ({
+    const articles = cannedCandlesCheck(data);
+    const arrArticles = Array.isArray(articles) ? articles : (articles?.list || []);
+    return arrArticles.slice(0, limit).map(a => ({
       title: a.title || '',
       summary: (a.summary || a.description || '').slice(0, 500),
       url: a.url || '',
@@ -265,7 +282,7 @@ class AInvestService {
     if (!data) return null;
 
     let payload = data;
-    if (!payload.analysts_ratings && !payload.buy && payload.data) {
+    if (!payload.analysts_ratings && !payload.buy && payload?.data) {
       payload = payload.data;
     }
 
@@ -305,7 +322,7 @@ class AInvestService {
       rating: r.rating || r.current_rating || '',
       targetPrice: r.target_price ?? r.price_target ?? null,
       previousRating: r.previous_rating || r.rating_previous || null,
-      previousTarget: r.previous_target_price ?? r.target_price_previous ?? null,
+      previousTarget: r.previous_target_price || r.target_price_previous || null,
     }));
   }
 
