@@ -1,3 +1,17 @@
+/**
+ * Self-Awareness Module — The Bot's Introspective Knowledge
+ *
+ * Builds a comprehensive self-knowledge context block that gets injected
+ * into the AI system prompt, giving the bot true awareness of:
+ *   - Its own identity, architecture, and codebase
+ *   - What services/APIs are currently active vs disabled
+ *   - Its current runtime state (mood, stats, trading status)
+ *   - Its autonomous capabilities (YOLO, SHARK, initiative engine)
+ *   - Its own limitations and what it can/can't do right now
+ *
+ * This is NOT a static description — it reflects live runtime state.
+ */
+
 const config = require('../config');
 const stats = require('./stats');
 const mood = require('./mood');
