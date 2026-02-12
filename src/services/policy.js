@@ -77,6 +77,7 @@ const DEFAULT_CONFIG = {
   options_max_spread_pct: 0.10,         // max bid-ask spread as % of mid price
   options_underlyings: ['SPY', 'QQQ'],  // default underlyings to scan
   options_cooldown_minutes: 5,          // cooldown between options trades on same underlying
+  options_min_open_interest: 500,       // min open interest for contract selection — filters out illiquid contracts
 };
 
 // Keys that accept numeric values
@@ -91,7 +92,7 @@ const NUMERIC_KEYS = new Set([
   'options_swing_take_profit_pct', 'options_swing_stop_loss_pct',
   'options_min_conviction', 'options_close_before_minutes',
   'options_min_delta', 'options_max_delta', 'options_max_spread_pct',
-  'options_cooldown_minutes',
+  'options_cooldown_minutes', 'options_min_open_interest',
 ]);
 
 // Keys that accept boolean values
@@ -493,6 +494,11 @@ class PolicyEngine {
       if (absDelta > cfg.options_max_delta) {
         warnings.push(`Delta ${absDelta.toFixed(2)} above preferred max ${cfg.options_max_delta} — consider lower strike`);
       }
+    }
+
+    // Open interest floor
+    if (ctx.openInterest != null && ctx.openInterest < cfg.options_min_open_interest) {
+      violations.push(`Open interest ${ctx.openInterest} below minimum ${cfg.options_min_open_interest} — too illiquid`);
     }
 
     // Bid-ask spread
