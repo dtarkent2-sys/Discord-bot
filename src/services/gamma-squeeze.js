@@ -506,11 +506,12 @@ class GammaSqueezeEngine {
     // If momentum is > 0.3% in 3 polls (~9 min) during active squeeze, flag acceleration
     if (Math.abs(momentum) > 0.3 && state.state === SQUEEZE_STATE.ACTIVE) {
       const direction = momentum > 0 ? 'upward' : 'downward';
+      const optionPlay = momentum > 0 ? 'CALLS' : 'PUTS';
       const alertKey = `${ticker}:acceleration:${direction}`;
 
       if (!this._isAlertCoolingDown(alertKey)) {
         this._emitAlert(ticker, 'squeeze_acceleration',
-          `Squeeze accelerating ${direction} — ${Math.abs(momentum).toFixed(2)}% move in ~9 min during active squeeze`);
+          `Squeeze accelerating ${direction} → **${optionPlay}** — ${Math.abs(momentum).toFixed(2)}% move in ~9 min during active squeeze`);
         this._alertCooldowns.set(alertKey, Date.now());
       }
     }
@@ -562,10 +563,14 @@ class GammaSqueezeEngine {
 
   _formatBuildingAlert(ticker, snap, state) {
     const signals = state.signals || {};
+    const dir = this._getSqueezeDirection(snap, state);
     const lines = [
-      `**${ticker} — Gamma Squeeze Building**`,
+      `**${ticker} — Gamma Squeeze Building** ${dir.emoji}`,
       `Spot: \`$${snap.spot}\` | Regime: \`${snap.regime}\` (${(snap.regimeConfidence * 100).toFixed(0)}%)`,
       `Net GEX: \`${this._fmtDollar(snap.netGEX)}\` (dealers ${snap.dealerShortGamma ? 'SHORT' : 'LONG'} gamma)`,
+      '',
+      `**Direction: ${dir.direction} → ${dir.optionType}**`,
+      `_${dir.reason}_`,
       '',
       '**Early signals:**',
     ];
@@ -577,43 +582,58 @@ class GammaSqueezeEngine {
   }
 
   _formatActiveSqueezeAlert(ticker, snap, state) {
-    const direction = snap.spot > (snap.callWall || Infinity) ? 'UPWARD' : snap.spot < (snap.putWall || 0) ? 'DOWNWARD' : 'ACTIVE';
+    const dir = this._getSqueezeDirection(snap, state);
     return [
-      `**${ticker} — ACTIVE GAMMA SQUEEZE ${direction}**`,
+      `**${ticker} — ACTIVE GAMMA SQUEEZE** ${dir.emoji}`,
       `Spot: \`$${snap.spot}\` | Net GEX: \`${this._fmtDollar(snap.netGEX)}\``,
       `Dealers are **SHORT gamma** — forced hedging is amplifying moves`,
+      '',
+      `**Play: ${dir.direction} → ${dir.optionType}**`,
+      `_${dir.reason}_`,
+      '',
       `GEX change rate: \`${state.gexChangeRate?.toFixed(1) || '?'}%\` per poll`,
       snap.callWall ? `Call Wall: \`$${snap.callWall}\` (${snap.callWallDistPct?.toFixed(2)}% away)` : null,
       snap.putWall ? `Put Wall: \`$${snap.putWall}\` (${snap.putWallDistPct?.toFixed(2)}% away)` : null,
-      snap.gammaFlip ? `Gamma Flip: \`$${snap.gammaFlip}\`` : null,
+      snap.gammaFlip ? `Gamma Flip: \`$${snap.gammaFlip}\` (spot ${snap.spot > snap.gammaFlip ? 'ABOVE' : 'BELOW'})` : null,
       `P/C Ratio: \`${snap.pcRatio.toFixed(3)}\` (shift: ${state.pcRatioShift?.toFixed(3) || '0'})`,
       '',
-      `_Dealers are hedging into the move. Watch for exhaustion or wall break._`,
+      `_Dealers are hedging into the move. Ride the ${dir.optionType.toLowerCase()} until exhaustion or wall break._`,
     ].filter(Boolean).join('\n');
   }
 
   _formatKnifeFightAlert(ticker, snap, state) {
+    const dir = this._getSqueezeDirection(snap, state);
     return [
-      `**${ticker} — KNIFE FIGHT TERRITORY**`,
+      `**${ticker} — KNIFE FIGHT TERRITORY** ${dir.emoji}`,
       `Spot: \`$${snap.spot}\` has blown through dealer hedging levels`,
       `Dealers are **UNDERWATER** — short gamma and spot is beyond walls`,
+      '',
+      `**Momentum: ${dir.direction} → ${dir.optionType}** (but reversal risk is HIGH)`,
+      `_${dir.reason}_`,
+      '',
       `Net GEX: \`${this._fmtDollar(snap.netGEX)}\` | Change rate: \`${state.gexChangeRate?.toFixed(1) || '?'}%\``,
       snap.callWall ? `Call Wall: \`$${snap.callWall}\` (BREACHED — spot ${snap.callWallDistPct?.toFixed(2)}% beyond)` : null,
       snap.putWall ? `Put Wall: \`$${snap.putWall}\` (BREACHED — spot ${snap.putWallDistPct?.toFixed(2)}% beyond)` : null,
       '',
       `**Extreme caution.** Price is beyond fair value due to structural gamma imbalance.`,
-      `_Watch for snap reversal when dealers finish hedging or new OI pins form._`,
+      `_Continuation favors ${dir.optionType.toLowerCase()}, but watch for snap reversal._`,
     ].filter(Boolean).join('\n');
   }
 
   _formatUnwindAlert(ticker, snap, state) {
+    const dir = this._getSqueezeDirection(snap, state);
+    // During unwind, the OPPOSITE direction often profits (mean reversion)
+    const reverseType = dir.optionType === 'CALLS' ? 'PUTS' : dir.optionType === 'PUTS' ? 'CALLS' : 'STRADDLE';
     return [
-      `**${ticker} — Squeeze Unwinding**`,
+      `**${ticker} — Squeeze Unwinding** ↩️`,
       `Spot: \`$${snap.spot}\` | P/C Ratio shift: \`${state.pcRatioShift?.toFixed(3) || '0'}\``,
       state.signals?.pcRatioShifting ? 'Put/call ratio shifting — dealers repositioning' : null,
       !snap.dealerShortGamma ? 'Gamma regime flipping positive — dealer hedging pressure easing' : null,
       '',
-      `_Squeeze is fading. Be cautious of continuation plays — the structural edge is gone._`,
+      `**Fade the squeeze → ${reverseType}** (mean reversion play)`,
+      `_Previous squeeze was ${dir.direction.toLowerCase()}. Unwind typically reverses the move._`,
+      '',
+      `_Squeeze is fading. Close ${dir.optionType.toLowerCase()} if holding. New entries favor ${reverseType.toLowerCase()} for reversion._`,
     ].filter(Boolean).join('\n');
   }
 
@@ -718,9 +738,15 @@ class GammaSqueezeEngine {
       for (const s of status) {
         const emoji = this._stateEmoji(s.squeezeState);
         const latest = s.latestSnapshot;
+        let dirLabel = '';
+        if (latest && s.squeezeState !== 'normal') {
+          const dir = this._getSqueezeDirection(latest, s);
+          dirLabel = ` | **${dir.optionType}** ${dir.emoji}`;
+        }
         lines.push(
           `${emoji} **${s.ticker}** — \`${s.squeezeState}\`` +
           (latest ? ` | $${latest.spot} | GEX: ${this._fmtDollar(latest.netGEX)} | ${latest.regime}` : '') +
+          dirLabel +
           (s.historyLength > 0 ? ` | ${s.historyLength} snapshots` : '')
         );
       }
@@ -740,10 +766,12 @@ class GammaSqueezeEngine {
     ];
 
     if (latest) {
+      const dir = this._getSqueezeDirection(latest, s);
       lines.push(
         `**Latest Snapshot:**`,
         `Spot: \`$${latest.spot}\` | Net GEX: \`${this._fmtDollar(latest.netGEX)}\``,
         `Regime: \`${latest.regime}\` (${(latest.regimeConfidence * 100).toFixed(0)}%)`,
+        s.squeezeState !== 'normal' ? `${dir.emoji} **Play: ${dir.direction} → ${dir.optionType}** — _${dir.reason}_` : null,
         latest.gammaFlip ? `Gamma Flip: \`$${latest.gammaFlip}\` (${latest.flipDistPct?.toFixed(2)}% away)` : null,
         latest.callWall ? `Call Wall: \`$${latest.callWall}\` (${latest.callWallDistPct?.toFixed(2)}% from spot)` : null,
         latest.putWall ? `Put Wall: \`$${latest.putWall}\` (${latest.putWallDistPct?.toFixed(2)}% from spot)` : null,
@@ -826,6 +854,84 @@ class GammaSqueezeEngine {
   }
 
   // ── Helpers ────────────────────────────────────────────────────────
+
+  /**
+   * Determine squeeze direction and actionable option type (calls/puts).
+   * Uses gamma flip position, wall breaches, and momentum to recommend direction.
+   * @returns {{ direction: string, optionType: string, emoji: string, reason: string }}
+   */
+  _getSqueezeDirection(snap, state) {
+    // 1. Spot vs gamma flip is the strongest signal
+    if (snap.gammaFlip && snap.spot) {
+      if (snap.spot > snap.gammaFlip * 1.002) {
+        return {
+          direction: 'BULLISH',
+          optionType: 'CALLS',
+          emoji: '📈',
+          reason: `Spot $${snap.spot} above gamma flip $${snap.gammaFlip} — dealers forced to buy`,
+        };
+      }
+      if (snap.spot < snap.gammaFlip * 0.998) {
+        return {
+          direction: 'BEARISH',
+          optionType: 'PUTS',
+          emoji: '📉',
+          reason: `Spot $${snap.spot} below gamma flip $${snap.gammaFlip} — dealers forced to sell`,
+        };
+      }
+    }
+
+    // 2. Wall breaches
+    if (snap.callWall && snap.spot > snap.callWall) {
+      return {
+        direction: 'BULLISH',
+        optionType: 'CALLS',
+        emoji: '📈',
+        reason: `Spot breached call wall $${snap.callWall} — upside accelerating`,
+      };
+    }
+    if (snap.putWall && snap.spot < snap.putWall) {
+      return {
+        direction: 'BEARISH',
+        optionType: 'PUTS',
+        emoji: '📉',
+        reason: `Spot breached put wall $${snap.putWall} — downside accelerating`,
+      };
+    }
+
+    // 3. GEX trend from recent snapshots
+    const series = this._timeSeries.get(snap.ticker) || [];
+    if (series.length >= 3) {
+      const recent = series.slice(-3);
+      const spotMomentum = recent[recent.length - 1].spot - recent[0].spot;
+      if (spotMomentum > 0) {
+        return {
+          direction: 'BULLISH',
+          optionType: 'CALLS',
+          emoji: '📈',
+          reason: `Price momentum upward during squeeze ($${spotMomentum.toFixed(2)} in last ${series.length >= 3 ? '~9' : series.length * 3} min)`,
+        };
+      }
+      if (spotMomentum < 0) {
+        return {
+          direction: 'BEARISH',
+          optionType: 'PUTS',
+          emoji: '📉',
+          reason: `Price momentum downward during squeeze ($${spotMomentum.toFixed(2)} in last ${series.length >= 3 ? '~9' : series.length * 3} min)`,
+        };
+      }
+    }
+
+    // 4. Fallback: use P/C ratio
+    if (snap.pcRatio > 1.2) {
+      return { direction: 'BEARISH', optionType: 'PUTS', emoji: '📉', reason: 'Heavy put positioning (P/C > 1.2)' };
+    }
+    if (snap.pcRatio < 0.8) {
+      return { direction: 'BULLISH', optionType: 'CALLS', emoji: '📈', reason: 'Heavy call positioning (P/C < 0.8)' };
+    }
+
+    return { direction: 'NEUTRAL', optionType: 'STRADDLE', emoji: '↔️', reason: 'No clear directional bias — consider straddle or wait' };
+  }
 
   _isMarketHours() {
     const now = new Date();
