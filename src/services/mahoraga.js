@@ -1,46 +1,48 @@
-/**
- * SHARK — Autonomous Trading Engine
- *
- * Runs directly inside the Discord bot on Railway.
- * Druckenmiller top-down framework:
- *   "50% of a stock's move is the overall market, 30% is the industry, 20% is stock picking."
- *
- * Pipeline: Macro Regime → Sector Rotation → Signal Scan → Fundamentals → Technicals → AI Decision → Trade
- *
- * Data sources:
- *   - Macro engine (SPY trend, sector breadth, risk regime)
- *   - Sector rotation (11 SPDR ETFs, multi-timeframe relative strength)
- *   - StockTwits (social sentiment / trending)
- *   - Reddit (r/wallstreetbets, r/stocks, r/investing, r/options)
- *   - Validea (guru fundamental analysis — Buffett, Lynch, Graham, etc.)
- *   - Alpaca (market data + trade execution)
- *   - Technicals engine (RSI, MACD, Bollinger, etc.)
- *
- * Signal cache: persistent cache to avoid re-evaluating same tickers
- * Order flow: two-step preview → approval token → submit (MAHORAGA reference)
- * Risk management via policy.js (kill switch, position limits, stop losses, etc.)
- *
- * Based on https://github.com/ygwyg/SHARK (MIT license)
- */
-
-const alpaca = require('./alpaca');
-const stocktwits = require('./stocktwits');
-const reddit = require('./reddit');
-const technicals = require('./technicals');
-const validea = require('./validea');
-const macro = require('./macro');
-const sectors = require('./sectors');
-const policy = require('./policy');
-const signalCache = require('./signal-cache');
-const ai = require('./ai');
-const config = require('../config');
-const Storage = require('./storage');
 const auditLog = require('./audit-log');
-const circuitBreaker = require('./circuit-breaker');
-const optionsEngine = require('./options-engine');
 
-// Max ticker evaluations per scan cycle (prevents runaway loops)
-const MAX_EVALS_PER_CYCLE = 8;
+const logQueue = [];
+let isFlushing = false;
+
+class AsyncAuditLogger {
+  constructor() {
+    this.flushDebounced = this.flushDebounced.bind(this);
+  }
+
+  log(type, message) {
+    const entry = { type, message, timestamp: new Date().toISOString() };
+    logQueue.push(entry);
+    
+    if (!isFlushing) {
+      isFlushing = true;
+      process.nextTick(this.flushDebounced);
+    }
+  }
+
+  async flushDebounced() {
+    if (logQueue.length === 0) {
+      isFlushing = false;
+      return;
+    }
+
+    isFlushing = true;
+    try {
+      const batch = [...logQueue];
+      logQueue.length = 0;
+      
+      const writePromises = batch.map(entry => {
+        return auditLog._append(entry);
+      });
+
+      await Promise.all(writePromises);
+    } catch (err) {
+      console.warn('[SHARK] Async log write failed, entry retained for retry', err.message);
+    } finally {
+      isFlushing = false;
+    }
+  }
+}
+
+const asyncAuditLog = new AsyncAuditLogger();
 
 class SharkEngine {
   constructor() {
@@ -179,12 +181,12 @@ class SharkEngine {
 
   // ── Logging ───────────────────────────────────────────────────────
 
-  _log(type, message) {
+  /**_log type, message) {
     const entry = { type, message, timestamp: new Date().toISOString() };
     this._logs.push(entry);
     if (this._logs.length > 200) this._logs.shift();
     // Persist to audit log file
-    auditLog.log(type, `[SHARK] ${message}`);
+    asyncAuditLog.log(type, `[SHARK] ${message}`);
     return entry;
   }
 
@@ -215,7 +217,7 @@ class SharkEngine {
       let macroRegime = { regime: 'CAUTIOUS', score: 0, positionMultiplier: 1.0, topSectors: [], bottomSectors: [] };
       try {
         macroRegime = await macro.getRegime();
-        this._log('macro', `Market regime: ${macroRegime.regime} (score: ${macroRegime.score}, sizing: ${macroRegime.positionMultiplier}x)`);
+        this._log('macro', `Market regime: ${macroRegime.regime} (score: ${macroRegime.score}, sizing: ${macroRegime.positionMultiplier}x)`;
 
         // In RISK_OFF, skip scanning for new positions entirely (just monitor exits)
         if (macroRegime.regime === 'RISK_OFF') {
