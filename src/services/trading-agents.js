@@ -1,19 +1,3 @@
-/**
- * TradingAgents — Multi-agent LLM trading analysis pipeline.
- *
- * Inspired by https://github.com/TauricResearch/TradingAgents
- *
- * Pipeline:
- *   1. Four analyst agents run in parallel (Market, Fundamentals, News, Sentiment)
- *   2. Bull vs Bear debate synthesizes the analyst reports
- *   3. Trader agent makes a BUY / SELL / HOLD decision
- *   4. Three risk managers (aggressive, moderate, conservative) review
- *   5. Final signal is produced with confidence level
- *
- * All LLM calls go through the existing Ollama client.
- * AInvest data is fetched per-analyst for maximum richness.
- */
-
 const { Ollama } = require('ollama');
 const config = require('../config');
 const yahoo = require('./yahoo');
@@ -81,8 +65,10 @@ class TradingAgents {
     let marketData = formatContextForAI(context);
     const snapshot = context.snapshot || {};
     dataSources.push('market-data');
+    console.log(`[TradingAgents] Data sources for ${upper}: ${dataSources.join(', ')}`);
 
-    // ── Enrich with live price + AInvest data (parallel) ──
+    // ── Enrich with live price + AInvest data (parallel) ───────────────────
+
     progress('data', `Enriching with AInvest data for ${upper}...`);
     const enrichPromises = [];
 
@@ -118,7 +104,7 @@ class TradingAgents {
         this._fetchAInvestData(upper, ainvestData, dataSources)
       );
     } else {
-      console.warn('[TradingAgents] AInvest not available — analysis will lack fundamentals, news, and analyst ratings');
+      console.warn(`[TradingAgents] AInvest not available — analysis will lack fundamentals, news, and analyst ratings`);
     }
 
     // Kalshi prediction markets — find related contracts for context
@@ -141,20 +127,6 @@ class TradingAgents {
       );
     }
 
-    // AInvest — analyst ratings, fundamentals, insider + congress trades
-    if (ainvest && ainvest.enabled) {
-      enrichPromises.push(
-        ainvest.getEnrichmentForAnalysis(upper)
-          .then(block => {
-            if (block) {
-              marketData += `\n\n${block}`;
-              dataSources.push('ainvest');
-            }
-          })
-          .catch(err => console.warn(`[TradingAgents] AInvest enrichment failed for ${upper}:`, err.message))
-      );
-    }
-
     await Promise.all(enrichPromises);
 
     // Append general AInvest context to marketData for prompts that use it
@@ -162,8 +134,6 @@ class TradingAgents {
     if (ainvestBlock) {
       marketData += `\n\n${ainvestBlock}`;
     }
-
-    console.log(`[TradingAgents] Data sources for ${upper}: ${dataSources.join(', ')}`);
 
     // ── Stage 1: Four analysts in parallel ──
     progress('analysts', 'Running analyst agents (market, fundamentals, sentiment, news)...');
@@ -212,7 +182,7 @@ class TradingAgents {
       debate,
       trader: traderDecision,
       risk: riskReview,
-      dataSources,
+      dataSources, // Expose data sources for transparency
       timestamp: new Date().toISOString(),
     };
   }
@@ -224,7 +194,7 @@ class TradingAgents {
    */
   async _fetchAInvestData(ticker, data, dataSources) {
     const delay = (ms) => new Promise(r => setTimeout(r, ms));
-    const STAGGER_MS = 350; // space out calls to avoid AInvest rate limits
+    const STAGGER_MS = 350;
 
     const steps = [
       {
@@ -409,7 +379,6 @@ class TradingAgents {
     if (data.insiderTrades) sections.push(data.insiderTrades);
     if (data.congressTrades) sections.push(data.congressTrades);
     if (data.economicCalendar) sections.push(data.economicCalendar);
-    // News and analyst history are fed directly to specific analysts
     if (sections.length === 0) return '';
     return `=== AINVEST LIVE DATA ===\n${sections.join('\n\n')}`;
   }
@@ -446,7 +415,6 @@ The rating MUST be one of: BULLISH, BEARISH, or NEUTRAL. The confidence MUST be 
   }
 
   async _fundamentalsAnalyst(ticker, marketData, snapshot, ainvestData) {
-    // Build enriched prompt with AInvest fundamentals + analyst data
     let extraData = '';
     if (ainvestData.fundamentals) extraData += `\n\n${ainvestData.fundamentals}`;
     if (ainvestData.analystRatings) extraData += `\n\n${ainvestData.analystRatings}`;
@@ -485,7 +453,6 @@ The rating MUST be one of: BULLISH, BEARISH, or NEUTRAL. The confidence MUST be 
   }
 
   async _sentimentAnalyst(ticker, marketData, snapshot, ainvestData) {
-    // Build enriched prompt with insider/congress trades + sentiment data
     let extraData = '';
     if (ainvestData.insiderTrades) extraData += `\n\n${ainvestData.insiderTrades}`;
     if (ainvestData.congressTrades) extraData += `\n\n${ainvestData.congressTrades}`;
@@ -522,7 +489,6 @@ The rating MUST be one of: BULLISH, BEARISH, or NEUTRAL. The confidence MUST be 
   }
 
   async _newsAnalyst(ticker, marketData, snapshot, ainvestData) {
-    // Build enriched prompt with AInvest news + economic calendar
     let extraData = '';
     if (ainvestData.news) extraData += `\n\n${ainvestData.news}`;
     if (ainvestData.economicCalendar) extraData += `\n\n${ainvestData.economicCalendar}`;
@@ -566,7 +532,6 @@ The rating MUST be one of: BULLISH, BEARISH, or NEUTRAL. The confidence MUST be 
       .map(([name, report]) => `=== ${name.toUpperCase()} ANALYST ===\n${report}`)
       .join('\n\n');
 
-    // Bull makes the case
     const bullPrompt = `You are a BULL advocate in a trading firm debate about ${ticker}. You must argue FOR buying this stock.
 
 Review these analyst reports and the market data, then make the STRONGEST possible bull case:
@@ -582,7 +547,6 @@ ${ragReminder()}`;
 
     const bullCase = await this._llmCall(bullPrompt);
 
-    // Bear makes the case
     const bearPrompt = `You are a BEAR advocate in a trading firm debate about ${ticker}. You must argue AGAINST buying this stock.
 
 Review these analyst reports and the market data, then make the STRONGEST possible bear case:
@@ -644,7 +608,6 @@ The DECISION must be BUY, SELL, or HOLD. CONFIDENCE must be 1-10. TIMEFRAME must
   // ── Risk Management ───────────────────────────────────────────────────
 
   async _riskManagement(ticker, traderDecision, analysts, marketData) {
-    // Three risk managers with different risk appetites review in parallel
     const [aggressive, moderate, conservative] = await Promise.all([
       this._riskManager(ticker, traderDecision, marketData, 'aggressive',
         'You have a HIGH risk tolerance. You favor growth and momentum plays. Small drawdowns are acceptable for bigger gains.'),
@@ -710,7 +673,6 @@ The SIGNAL must be BUY, SELL, or HOLD. CONFIDENCE must be 1-10. SUMMARY must be 
 
     const response = await this._llmCall(prompt);
 
-    // Parse the structured response
     return this._parseSignal(response);
   }
 
@@ -746,16 +708,13 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
 
         clearTimeout(timeout);
 
-        // Strip thinking tags (qwen3, deepseek, etc. wrap responses in <think> blocks)
         result = result
-          .replace(/<think>[\s\S]*?<\/think>/gi, '')
-          .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
+          .replace(/ Thought[\s\S]*?<\/think>/gi, '')
+          .replace(/<|think>[\s\S]*?<|\\/think>/gi, '')
           .trim();
 
-        // Validate response quality
         if (!result || result.trim().length < 30) {
           console.warn(`[TradingAgents] LLM returned very short response (${result.length} chars): "${result.slice(0, 100)}"`);
-          // Return a structured fallback so parsing doesn't completely fail
           return `Analysis produced limited output. The model returned: ${result || '(empty)'}\n\nRATING: NEUTRAL | CONFIDENCE: 3`;
         }
 
@@ -765,11 +724,8 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
       }
     } catch (err) {
       const isTimeout = err.name === 'AbortError' || err.message?.includes('abort');
-      const errType = isTimeout ? 'timeout' : 'error';
-      console.error(`[TradingAgents] LLM call ${errType}:`, err.message);
-
-      // Return structured fallback instead of generic error string
-      return `Analysis unavailable due to ${errType}: ${err.message}\n\nRATING: NEUTRAL | CONFIDENCE: 1`;
+      console.error(`[TradingAgents] LLM call ${isTimeout ? 'timeout' : 'error'}:`, err.message);
+      return `Analysis unavailable due to ${isTimeout ? 'timeout' : 'error'}: ${err.message}\n\nRATING: NEUTRAL | CONFIDENCE: 1`;
     }
   }
 
@@ -787,10 +743,6 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
     };
   }
 
-  /**
-   * Extract RATING from an analyst report with multiple fallback strategies.
-   * This is the key fix for N/A issues — the regex matching is now much more forgiving.
-   */
   _extractRating(report) {
     if (!report || typeof report !== 'string') {
       return { rating: 'NEUTRAL', confidence: 1 };
@@ -798,7 +750,6 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
 
     const text = report.trim();
 
-    // Strategy 1: Exact format match (ideal case)
     const exactMatch = text.match(/RATING:\s*(BULLISH|BEARISH|NEUTRAL)\s*\|\s*CONFIDENCE:\s*(\d+)/i);
     if (exactMatch) {
       return {
@@ -807,7 +758,6 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
       };
     }
 
-    // Strategy 2: RATING line anywhere (may not have confidence on same line)
     const ratingMatch = text.match(/RATING:\s*(BULLISH|BEARISH|NEUTRAL)/i);
     const confMatch = text.match(/CONFIDENCE:\s*(\d+)/i);
     if (ratingMatch) {
@@ -817,7 +767,6 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
       };
     }
 
-    // Strategy 3: Look for "bullish", "bearish", "neutral" as standalone words near end
     const lastChunk = text.slice(-300).toLowerCase();
     if (/\bbullish\b/.test(lastChunk) && !/\bbearish\b/.test(lastChunk)) {
       const conf = confMatch ? Math.min(10, Math.max(1, parseInt(confMatch[1], 10))) : 5;
@@ -832,7 +781,6 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
       return { rating: 'NEUTRAL', confidence: conf };
     }
 
-    // Strategy 4: Count occurrences of bullish vs bearish throughout the text
     const fullLower = text.toLowerCase();
     const bullCount = (fullLower.match(/\bbullish\b/g) || []).length;
     const bearCount = (fullLower.match(/\bbearish\b/g) || []).length;
@@ -843,7 +791,6 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
       return { rating: 'BEARISH', confidence: confMatch ? parseInt(confMatch[1], 10) : 4 };
     }
 
-    // Strategy 5: Look for buy/sell/positive/negative sentiment words
     const buyWords = (fullLower.match(/\b(buy|upside|opportunity|undervalued|strong)\b/g) || []).length;
     const sellWords = (fullLower.match(/\b(sell|downside|overvalued|risk|weak|decline)\b/g) || []).length;
     if (buyWords > sellWords + 2) return { rating: 'BULLISH', confidence: 3 };
@@ -852,21 +799,16 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
     return { rating: 'NEUTRAL', confidence: 3 };
   }
 
-  /**
-   * Extract VERDICT from a risk manager report with fallbacks.
-   */
   _extractVerdict(review) {
     if (!review || typeof review !== 'string') {
       return { verdict: 'N/A', riskLevel: 'N/A' };
     }
 
-    // Strategy 1: Exact format
     const exactMatch = review.match(/VERDICT:\s*(APPROVE|REJECT)\s*\|\s*RISK_LEVEL:\s*(LOW|MEDIUM|HIGH)/i);
     if (exactMatch) {
       return { verdict: exactMatch[1].toUpperCase(), riskLevel: exactMatch[2].toUpperCase() };
     }
 
-    // Strategy 2: VERDICT line anywhere
     const verdictMatch = review.match(/VERDICT:\s*(APPROVE|REJECT)/i);
     const riskMatch = review.match(/RISK.?LEVEL:\s*(LOW|MEDIUM|HIGH)/i);
     if (verdictMatch) {
@@ -876,7 +818,6 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
       };
     }
 
-    // Strategy 3: Look for approve/reject keywords
     const lower = review.toLowerCase();
     const lastPart = lower.slice(-200);
     if (/\bapprove\b/.test(lastPart) || /\bapproved\b/.test(lastPart)) {
@@ -886,23 +827,19 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
       return { verdict: 'REJECT', riskLevel: riskMatch ? riskMatch[1].toUpperCase() : 'HIGH' };
     }
 
-    // Strategy 4: Sentiment-based inference
     const approveWords = (lower.match(/\b(approve|acceptable|proceed|favorable|recommend)\b/g) || []).length;
     const rejectWords = (lower.match(/\b(reject|unacceptable|avoid|too risky|caution)\b/g) || []).length;
     if (approveWords > rejectWords) return { verdict: 'APPROVE', riskLevel: 'MEDIUM' };
     if (rejectWords > approveWords) return { verdict: 'REJECT', riskLevel: 'HIGH' };
 
-    return { verdict: 'APPROVE', riskLevel: 'MEDIUM' }; // Default to approve if unclear
+    return { verdict: 'APPROVE', riskLevel: 'MEDIUM' };
   }
 
-  /** Infer signal from text when regex parsing fails */
   _inferSignal(text) {
     if (!text) return 'HOLD';
     const lower = text.toLowerCase();
-    // Check for explicit decision words
     if (/\b(strong buy|buy signal|recommend buying)\b/.test(lower)) return 'BUY';
     if (/\b(strong sell|sell signal|recommend selling)\b/.test(lower)) return 'SELL';
-    // Count sentiment
     const buyWords = (lower.match(/\b(buy|long|bullish|upside)\b/g) || []).length;
     const sellWords = (lower.match(/\b(sell|short|bearish|downside)\b/g) || []).length;
     if (buyWords > sellWords + 1) return 'BUY';
@@ -910,15 +847,11 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
     return 'HOLD';
   }
 
-  /** Extract a summary sentence from unstructured text */
   _extractSummary(text) {
     if (!text) return 'Analysis complete.';
-    // Take the first substantive sentence
     const sentences = text.split(/[.!]\s+/).filter(s => s.length > 20 && !s.startsWith('SIGNAL') && !s.startsWith('CONFIDENCE'));
     return sentences.length > 0 ? sentences[0].trim().slice(0, 300) + '.' : text.slice(0, 300);
   }
-
-  // ── Discord Formatting ────────────────────────────────────────────────
 
   formatForDiscord(result) {
     const emoji = { BUY: '🟢', SELL: '🔴', HOLD: '🟡' };
@@ -933,34 +866,31 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
       '',
       `> ${result.summary || 'Analysis complete.'}`,
       '',
+      '## Analyst Ratings',
+      (_) => `  ${result.analysts.market ? 'market:' : 'market:'} ${'?'}`
     ];
 
-    // Analyst ratings summary — use robust extraction
-    lines.push('**Analyst Ratings:**');
     for (const [name, report] of Object.entries(result.analysts)) {
       const { rating, confidence } = this._extractRating(report);
       const rEmoji = { BULLISH: '🟢', BEARISH: '🔴', NEUTRAL: '🟡' };
       lines.push(`  ${rEmoji[rating] || '⚪'} **${name.charAt(0).toUpperCase() + name.slice(1)}:** ${rating} (${confidence}/10)`);
     }
 
-    // Bull/Bear summary
     lines.push('');
-    lines.push('**Debate:**');
+    lines.push('## Debate');
     const bullSnippet = (result.debate.bull || '').split('\n').find(l => l.trim().length > 10) || result.debate.bull || '(no bull case)';
     const bearSnippet = (result.debate.bear || '').split('\n').find(l => l.trim().length > 10) || result.debate.bear || '(no bear case)';
     lines.push(`  🐂 Bull: ${bullSnippet.slice(0, 150)}${bullSnippet.length > 150 ? '...' : ''}`);
     lines.push(`  🐻 Bear: ${bearSnippet.slice(0, 150)}${bearSnippet.length > 150 ? '...' : ''}`);
 
-    // Risk verdicts — use robust extraction
     lines.push('');
-    lines.push('**Risk Committee:**');
+    lines.push('## Risk Management');
     for (const [style, review] of Object.entries(result.risk)) {
       const { verdict, riskLevel } = this._extractVerdict(review);
       const vEmoji = verdict === 'APPROVE' ? '✅' : verdict === 'REJECT' ? '❌' : '❓';
       lines.push(`  ${vEmoji} **${style.charAt(0).toUpperCase() + style.slice(1)}:** ${verdict} (Risk: ${riskLevel})`);
     }
 
-    // Data sources
     if (result.dataSources && result.dataSources.length > 0) {
       lines.push('');
       const sourceIcons = result.dataSources.map(s => {
@@ -981,9 +911,6 @@ IMPORTANT: Always follow the output format instructions exactly. End your respon
     return output;
   }
 
-  /**
-   * Format a detailed report (for follow-up messages or file upload).
-   */
   formatDetailedReport(result) {
     const sections = [
       `# TradingAgents Deep Analysis: ${result.ticker}`,
