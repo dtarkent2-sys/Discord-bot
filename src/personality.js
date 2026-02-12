@@ -1,3 +1,1 @@
-const cleanedPrompt = input.trim().replace(/\s+/g, ' ');
-const isCommand = cleanedPrompt.toLowerCase().startsWith('!');
-const commandBody = cleanedPrompt.slice(1).trim();
+const cleanedPrompt = input.replace(/^\s+|\s+$|\s{2,}/g, ' ');
