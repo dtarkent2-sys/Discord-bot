@@ -13,6 +13,7 @@ process.on('unhandledRejection', (reason) => {
 // Acquire leader lock BEFORE doing anything else. If another instance
 // holds the lock (during Railway deploys), this process exits gracefully.
 const { acquireLock } = require('./src/runtime/singleton-lock');
+const { initRedisStorage } = require('./src/services/storage');
 
 // ── Start health server IMMEDIATELY ─────────────────────────────────
 // Railway's healthcheck begins as soon as the container launches.
@@ -295,15 +296,17 @@ if (!config.token) {
 const websearchEnabled = (process.env.WEBSEARCH_ENABLED || (process.env.RAILWAY_ENVIRONMENT ? 'false' : 'true')).toLowerCase() === 'true';
 log.info(`WebSearch: ${websearchEnabled ? 'ENABLED' : 'DISABLED'}${!websearchEnabled ? ' (set WEBSEARCH_ENABLED=true to enable)' : ''}`);
 
-// Acquire singleton lock, then login to Discord
+// Acquire singleton lock, hydrate storage from Redis, then login to Discord
 acquireLock().then(() => {
+  return initRedisStorage();
+}).then(() => {
   client.login(config.token).catch((err) => {
     log.error('Discord login failed:', err.message);
     process.exit(1);
   });
 }).catch((err) => {
-  log.error('Singleton lock error:', err.message);
-  // Still try to login — lock failure shouldn't block in fallback mode
+  log.error('Startup error:', err.message);
+  // Still try to login — lock/storage failure shouldn't block in fallback mode
   client.login(config.token).catch((loginErr) => {
     log.error('Discord login failed:', loginErr.message);
     process.exit(1);
