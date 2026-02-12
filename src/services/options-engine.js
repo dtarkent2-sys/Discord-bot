@@ -726,6 +726,25 @@ class OptionsEngine {
         return null;
       }
 
+      // Check if the feed provides real delta values
+      // Alpaca's free 'indicative' feed often returns delta=0 for all contracts
+      const hasRealGreeks = options.some(o => o.delta && Math.abs(o.delta) > 0.01);
+
+      if (!hasRealGreeks && spot) {
+        this._log('contract', `${underlying}: no delta data from feed — estimating from moneyness (spot=$${spot})`);
+        // Approximate delta from moneyness for 0DTE:
+        //   ATM ≈ 0.50, each 1% OTM ≈ −0.10 delta, capped at [0.02, 0.95]
+        for (const opt of options) {
+          const pctOTM = optionType === 'call'
+            ? (opt.strike - spot) / spot
+            : (spot - opt.strike) / spot;
+          // Negative pctOTM means ITM
+          const approxDelta = Math.max(0.02, Math.min(0.95, 0.50 - pctOTM * 10));
+          opt.delta = approxDelta;
+          opt._estimatedDelta = true;
+        }
+      }
+
       // Time-adaptive delta range: widen near end of day for 0DTE
       // Late-day 0DTE deltas compress and can be extreme — rigid ranges miss contracts
       let minDelta = cfg.options_min_delta;
@@ -740,16 +759,30 @@ class OptionsEngine {
       }
 
       // Filter by delta range and minimum open interest
-      const minOI = cfg.options_min_open_interest || 500;
-      const candidates = options.filter(opt => {
+      // Use relaxed OI threshold when greeks are estimated (feed may also have sparse OI)
+      const minOI = hasRealGreeks ? (cfg.options_min_open_interest || 500) : Math.min(cfg.options_min_open_interest || 500, 100);
+      let candidates = options.filter(opt => {
         const absDelta = Math.abs(opt.delta || 0);
         if (absDelta < minDelta || absDelta > maxDelta) return false;
         if ((opt.openInterest || 0) < minOI) return false;
+        // Must have a valid bid/ask
+        if (!opt.bid || !opt.ask || opt.ask <= 0) return false;
         return true;
       });
 
+      // Fallback: if no candidates with OI filter, relax OI to any contract with a live quote
       if (candidates.length === 0) {
-        this._log('contract', `${underlying}: no contracts matching delta [${minDelta.toFixed(2)}-${maxDelta.toFixed(2)}] + OI >= ${minOI} (${options.length} options checked)`);
+        this._log('contract', `${underlying}: no contracts with OI >= ${minOI} — relaxing OI filter`);
+        candidates = options.filter(opt => {
+          const absDelta = Math.abs(opt.delta || 0);
+          if (absDelta < minDelta || absDelta > maxDelta) return false;
+          if (!opt.bid || !opt.ask || opt.ask <= 0) return false;
+          return true;
+        });
+      }
+
+      if (candidates.length === 0) {
+        this._log('contract', `${underlying}: no contracts matching delta [${minDelta.toFixed(2)}-${maxDelta.toFixed(2)}] (${options.length} options checked, greeks=${hasRealGreeks ? 'real' : 'estimated'})`);
         return null;
       }
 
@@ -776,7 +809,9 @@ class OptionsEngine {
         // Liquidity
         if (oi > 1000) score += 2;
         else if (oi > 500) score += 1;
+        else if (oi > 100) score += 0.5;
         if (volume > 100) score += 1;
+        else if (volume > 10) score += 0.5;
 
         return { ...opt, mid, spread, score };
       });
@@ -787,13 +822,14 @@ class OptionsEngine {
       const best = scored[0];
       if (!best) return null;
 
-      // Check spread is within limit
-      if (best.spread > cfg.options_max_spread_pct) {
-        this._log('contract', `${underlying}: best contract spread ${(best.spread * 100).toFixed(1)}% exceeds max ${(cfg.options_max_spread_pct * 100).toFixed(0)}%`);
+      // Check spread is within limit (wider tolerance when delta was estimated)
+      const maxSpread = hasRealGreeks ? cfg.options_max_spread_pct : Math.max(cfg.options_max_spread_pct, 0.20);
+      if (best.spread > maxSpread) {
+        this._log('contract', `${underlying}: best contract spread ${(best.spread * 100).toFixed(1)}% exceeds max ${(maxSpread * 100).toFixed(0)}%`);
         return null;
       }
 
-      this._log('contract', `${underlying}: selected ${best.symbol} — strike $${best.strike}, delta ${best.delta?.toFixed(2)}, mid $${best.mid.toFixed(2)}, spread ${(best.spread * 100).toFixed(1)}%, OI ${best.openInterest}`);
+      this._log('contract', `${underlying}: selected ${best.symbol} — strike $${best.strike}, delta ${best.delta?.toFixed(2)}${best._estimatedDelta ? ' (est)' : ''}, mid $${best.mid.toFixed(2)}, spread ${(best.spread * 100).toFixed(1)}%, OI ${best.openInterest}`);
 
       return best;
     } catch (err) {
