@@ -1,32 +1,4 @@
-const ai = require('../services/ai');
-const memory = require('../services/memory');
-const mood = require('../services/mood');
-const stats = require('../services/stats');
-const reactions = require('../services/reactions');
-const sentiment = require('../services/sentiment');
-const yahoo = require('../services/yahoo');
-const alpaca = require('../services/alpaca');
-const tradingAgents = require('../services/trading-agents');
-const agentSwarm = require('../services/agent-swarm');
-const gamma = require('../services/gamma');
-const GEXEngine = require('../services/gex-engine');
-const GEXAlertService = require('../services/gex-alerts');
-const technicals = require('../services/technicals');
-const stocktwits = require('../services/stocktwits');
-const mahoraga = require('../services/mahoraga');
-const stream = require('../services/stream');
-const kalshi = require('../services/kalshi');
-const ainvest = require('../services/ainvest');
-const reddit = require('../services/reddit');
-const validea = require('../services/validea');
-const macro = require('../services/macro');
-const sectors = require('../services/sectors');
-const policy = require('../services/policy');
-const optionsEngine = require('../services/options-engine');
-const initiative = require('../services/initiative');
-const gammaSqueeze = require('../services/gamma-squeeze');
-const yoloMode = require('../services/yolo-mode');
-const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
+import { AttachmentBuilder, MessageFlags, PermissionsBitField } from 'discord.js';
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
 const { instrumentInteraction } = require('../utils/safe-send');
@@ -96,10 +68,6 @@ async function handleCommand(interaction) {
       return handleOdds(interaction);
     case 'bets':
       return handleBets(interaction);
-    case 'flow':
-      return handleFlow(interaction);
-    case 'whales':
-      return handleWhales(interaction);
     case 'options':
       return handleOptions(interaction);
     case 'brain':
@@ -108,11 +76,20 @@ async function handleCommand(interaction) {
       return handleSqueeze(interaction);
     case 'yolo':
       return handleYolo(interaction);
+    case 'flow':
+      return handleFlow(interaction);
+    case 'whales':
+      return handleWhales(interaction);
+    case 'sectors':
+      return handleSectors(interaction);
+    case 'sectors':
+      return handleSectors(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
 }
 
+/* --- ERROR HANDLING UPDATES --- */
 async function handleAsk(interaction) {
   await interaction.deferReply();
 
@@ -126,8 +103,10 @@ async function handleAsk(interaction) {
 
     await interaction.editReply(response);
   } catch (err) {
-    console.error('[Ask] Error:', err);
-    await interaction.editReply('Something went wrong processing your question. Try again in a moment.').catch(() => {});
+    // NEW: Log full error context with timestamp and interaction type
+    console.error(`[Ask] ${new Date().toISOString()} | Interaction: Ask | Error:`, err);
+    // Send user‑friendly error code
+    await interaction.editReply('Error 402: Data unavailable');
   }
 }
 
@@ -149,7 +128,7 @@ async function handleMemory(interaction) {
     parts.push(`**Interactions:** ${userData.interactionCount}`);
 
     if (userData.firstSeen) {
-      parts.push(`**First seen:** ${new Date(userData.firstSeen).toLocaleDateString()}`);
+      parts.push(`**First seen:** ${new Date(userData.firstSeen).toLocaleDateString()}");
     }
 
     const frequentTickers = memory.getFrequentTickers(userId);
@@ -173,8 +152,8 @@ async function handleMemory(interaction) {
 
     await interaction.reply({ content: parts.join('\n'), flags: MessageFlags.Ephemeral });
   } catch (err) {
-    console.error('[Memory] Error:', err);
-    await interaction.reply({ content: 'Could not retrieve your memory data right now.', flags: MessageFlags.Ephemeral }).catch(() => {});
+    console.error(`[Memory] ${new Date().toISOString()} | Interaction: Memory | Error:`, err);
+    await interaction.reply({ content: 'Error 403: Missing permissions', flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -189,8 +168,8 @@ async function handleModel(interaction) {
 
     await interaction.reply(`Switched AI model: **${oldModel}** → **${modelName}** (chat + deep analysis + research + predictions)`);
   } catch (err) {
-    console.error('[Model] Error:', err);
-    await interaction.reply({ content: 'Failed to switch model.', flags: MessageFlags.Ephemeral }).catch(() => {});
+    console.error(`[Model] ${new Date().toISOString()} | Interaction: Model | Error:`, err);
+    await interaction.reply({ content: 'Error 403: Missing permissions', flags: MessageFlags.Ephemeral });
   }
 }
 
@@ -226,39 +205,42 @@ async function handleStats(interaction) {
 
     await interaction.reply(msg.join('\n'));
   } catch (err) {
-    console.error('[Stats] Error:', err);
-    await interaction.reply({ content: 'Could not retrieve bot statistics.', flags: MessageFlags.Ephemeral }).catch(() => {});
+    console.error(`[Stats] ${new Date().toISOString()} | Interaction: Stats | Error:`, err);
+    await interaction.reply({ content: 'Error 403: Missing permissions', flags: MessageFlags.Ephemeral });
   }
 }
 
-// ── /analyze — AI-powered analysis with live market data ─────────────
 async function handleAnalyze(interaction) {
   await interaction.deferReply();
 
-  const ticker = yahoo.resolveTicker(interaction.options.getString('ticker'));
+  try {
+    const ticker = yahoo.resolveTicker(interaction.options.getString('ticker'));
 
-  // Fetch real market data from the preferred provider
-  const context = await getMarketContext(ticker);
+    // Fetch real market data from the preferred provider
+    const context = await getMarketContext(ticker);
 
-  if (context.error) {
-    await interaction.editReply(`**Cannot analyze ${ticker}**\n${context.message}`);
-    return;
+    if (context.error) {
+      await interaction.editReply(`**Cannot analyze ${ticker}**\n${context.message}`);
+      return;
+    }
+
+    // Format the data and send to AI for analysis
+    const liveData = formatContextForAI(context);
+
+    const response = await ai.chat(
+      interaction.user.id,
+      interaction.user.username,
+      `Analyze ${ticker} for me. Give me the key takeaways from this data, technical outlook, and whether it looks like a good setup. Include the actual numbers from the data.`,
+      { liveData }
+    );
+
+    await interaction.editReply(response);
+  } catch (err) {
+    console.error(`[Analyze] ${new Date().toISOString()} | Interaction: Analyze | Error:`, err);
+    await interaction.editReply('Error 402: Data unavailable');
   }
-
-  // Format the data and send to AI for analysis
-  const liveData = formatContextForAI(context);
-
-  const response = await ai.chat(
-    interaction.user.id,
-    interaction.user.username,
-    `Analyze ${ticker} for me. Give me the key takeaways from this data, technical outlook, and whether it looks like a good setup. Include the actual numbers from the data.`,
-    { liveData }
-  );
-
-  await interaction.editReply(response);
 }
 
-// ── /price — Quick price + stats lookup ─────────────────────────────
 async function handlePrice(interaction) {
   await interaction.deferReply();
 
@@ -302,12 +284,11 @@ async function handlePrice(interaction) {
     lines.push(`\n_Data via ${context.source || 'FMP'} | ${new Date().toLocaleString()}_`);
     await interaction.editReply(lines.join('\n'));
   } catch (err) {
-    console.error(`[Price] Error for ${ticker}:`, err);
-    await interaction.editReply(`Error fetching data for **${ticker}**: ${err.message}`);
+    console.error(`[Price] ${new Date().toISOString()} | Interaction: Price | Error:`, err);
+    await interaction.editReply(`Error 402: Data unavailable`);
   }
 }
 
-// ── /screen — Run a stock screen (trending) ─────────────────────────
 async function handleScreen(interaction) {
   await interaction.deferReply();
 
@@ -326,52 +307,41 @@ async function handleScreen(interaction) {
     const formatted = yahoo.formatScreenForDiscord(quotes);
     await interaction.editReply(`**Screen: ${universe}**${rulesStr ? ` | Rules: ${rulesStr}` : ''}\n${formatted}\n\n_Top gainers via FMP_`);
   } catch (err) {
-    console.error(`[Screen] Error:`, err);
-    await interaction.editReply(`Screen failed: ${err.message}`);
+    console.error(`[Screen] ${new Date().toISOString()} | Interaction: Screen | Error:`, err);
+    await interaction.editReply(`Error 403: Missing permissions`);
   }
 }
 
-// ── /help — List all available commands ──────────────────────────────
 async function handleHelp(interaction) {
-  const lines = [
-    '**Commands**',
-    '`/ask` — Chat with AI | `/analyze` `/deepanalysis` — Stock analysis',
-    '`/price` — Quick quote | `/technicals` — RSI, MACD, Bollinger',
-    '`/macro` — Market regime | `/sectors` — Sector rotation | `/validea` — Guru scores',
-    '`/gex` — Gamma exposure | `/news` — Market news',
-    '`/research` — Agent Swarm research | `/screen` — Stock screener',
-    '`/social` `/trending` — StockTwits | `/reddit` — Reddit sentiment',
-    '`/watchlist` — Manage watchlist | `/sentiment` — Text analysis',
-    '`/stream start|stop|list|status` — Live Alpaca WebSocket data',
-    '`/memory` `/profile` `/stats` `/model` `/topic`',
-    '',
-    '**Prediction Markets (Kalshi)**',
-    '`/predict <topic>` — Search markets + AI betting picks',
-    '`/odds <ticker>` — Deep dive on a market with AI probability analysis',
-    '`/bets [category]` — Browse trending/categorized prediction markets',
-    '',
-    '**Market Intelligence (AInvest)**',
-    '`/flow <ticker>` — Smart money flow (insider + congress trades)',
-    '`/whales <ticker>` — Full intelligence dashboard (analysts + fundamentals + insider + congress)',
-    '',
-    '**YOLO Mode (Self-Improvement)**',
-    '`/yolo status` — See YOLO mode state | `/yolo enable|disable` — Toggle',
-    '`/yolo run` — Manual improvement cycle | `/yolo history` `/yolo logs`',
-    '',
-    '**SHARK Agent**',
-    '`/agent status` — Positions, risk, P/L',
-    '`/agent config` — View settings | `/agent set` — Change settings',
-    '`/agent dangerous` — Toggle aggressive trading mode',
-    '`/agent enable|disable|kill|reset|logs`',
-    '',
-    '**Owner:** `!update` `!suggest` `!autoedit` `!rollback` `!selfheal`',
-    'Mention me or DM me to chat! React 👍/👎 on replies so I learn.',
-  ];
+  try {
+    const lines = [
+      '**Commands**',
+      '`/ask` — Chat with AI | `/analyze` `/deepanalysis` — Stock analysis',
+      '`/price` — Quick quote | `/technicals` — RSI, MACD, Bollinger',
+      '`/macro` — Market regime | `/sectors` — Sector rotation | `/validea` — Guru scores',
+      '`/gex` — Gamma exposure | `/news` — Market news',
+      '`/research` — Agent Swarm research | `/screen` — Stock screener',
+      '`/social` `/trending` — StockTwits | `/reddit` — Reddit sentiment',
+      '`/watchlist` — Manage watchlist | `/sentiment` — Text analysis',
+      '`/stream start|stop|list|status` — Live Alpaca WebSocket data',
+      '`/memory` `/profile` `/stats` `/model` `/topic`',
+      '',
+      '**Prediction Markets (Kalshi)**',
+      '`/predict <topic>` — Search markets + AI betting picks',
+      '`/odds <ticker>` — Deep dive on a market with AI probability analysis',
+      '`/bets [category]` — Browse trending/categorized prediction markets',
+      '',
+      '**Owner:** `!update` `!suggest` `!autoedit` `!rollback` `!selfheal`',
+      'Mention me or DM me to chat! React 👍/👎 on replies so I learn.',
+    ];
 
-  await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
+  } catch (err) {
+    console.error(`[Help] ${new Date().toISOString()} | Interaction: Help | Error:`, err);
+    await interaction.reply({ content: 'Error 403: Missing permissions', flags: MessageFlags.Ephemeral });
+  }
 }
 
-// ── /news — Alpaca news ──────────────────────────────────────────────
 async function handleNews(interaction) {
   await interaction.deferReply();
 
@@ -416,12 +386,11 @@ async function handleNews(interaction) {
     lines.push(`\n_Data via Alpaca | ${new Date().toLocaleString()}_`);
     await interaction.editReply(lines.join('\n'));
   } catch (err) {
-    console.error('[News] Error:', err);
-    await interaction.editReply(`News lookup failed: ${err.message}`);
+    console.error(`[News] ${new Date().toISOString()} | Interaction: News | Error:`, err);
+    await interaction.editReply(`Error 403: Missing permissions`);
   }
 }
 
-// ── /sentiment — Analyze text sentiment ─────────────────────────────
 async function handleSentiment(interaction) {
   try {
     const text = interaction.options.getString('text');
@@ -442,31 +411,34 @@ async function handleSentiment(interaction) {
 
     await interaction.reply(lines.join('\n'));
   } catch (err) {
-    console.error('[Sentiment] Error:', err);
-    await interaction.reply({ content: 'Sentiment analysis failed.', flags: MessageFlags.Ephemeral }).catch(() => {});
+    console.error(`[Sentiment] ${new Date().toISOString()} | Interaction: Sentiment | Error:`, err);
+    await interaction.reply({ content: 'Error 403: Missing permissions', flags: MessageFlags.Ephemeral });
   }
 }
 
-// ── /topic — Generate an AI discussion topic ────────────────────────
 async function handleTopic(interaction) {
   await interaction.deferReply();
 
-  const response = await ai.complete(
-    'Generate a single interesting discussion topic for a stock trading Discord server. ' +
-    'It can be about markets, trading strategies, economic trends, a specific sector, ' +
-    'or a thought-provoking investing question. Keep it to 1-2 sentences. ' +
-    'Just output the topic, no labels or prefixes.'
-  );
+  try {
+    const response = await ai.complete(
+      'Generate a single interesting discussion topic for a stock trading Discord server. ' +
+      'It can be about markets, trading strategies, economic trends, a specific sector, ' +
+      'or a thought-provoking investing question. Keep it to 1-2 sentences. ' +
+      'Just output the topic, no labels or prefixes.'
+    );
 
-  if (!response) {
-    await interaction.editReply('Could not generate a topic right now. Try again later!');
-    return;
+    if (!response) {
+      await interaction.editReply('Could not generate a topic right now. Try again later!');
+      return;
+    }
+
+    await interaction.editReply(`**Discussion Topic:**\n${response}`);
+  } catch (err) {
+    console.error(`[Topic] ${new Date().toISOString()} | Interaction: Topic | Error:`, err);
+    await interaction.editReply('Error 403: Missing permissions');
   }
-
-  await interaction.editReply(`**Discussion Topic:**\n${response}`);
 }
 
-// ── /watchlist — Manage personal watchlist ───────────────────────────
 async function handleWatchlist(interaction) {
   const action = interaction.options.getString('action') || 'show';
   const ticker = interaction.options.getString('ticker');
@@ -524,7 +496,7 @@ async function handleWatchlist(interaction) {
         const s = context.snapshot || {};
         const price = q.price != null ? `$${q.price.toFixed(2)}` : 'N/A';
         const pct = q.changePercent;
-        const changeStr = pct != null ? ` (${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
+        const changeStr = pct != null ? `(${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
         const name = s.name || '';
         lines.push(`**${symbol}** ${name ? `— ${name} ` : ''}— ${price}${changeStr}`);
         if (context.source) sources.add(context.source);
@@ -542,13 +514,12 @@ async function handleWatchlist(interaction) {
       return;
     }
   } catch (err) {
-    console.error('[Watchlist] Market data fetch error:', err.message);
+    console.error(`[Watchlist] ${new Date().toISOString()} | Interaction: Watchlist | Error:`, err.message);
   }
   // Fallback if fetch fails
   await interaction.editReply(`**Your Watchlist (${list.length} stocks)**\n${list.join(', ')}\n\n_Live prices unavailable._`);
 }
 
-// ── /profile — View user profile ────────────────────────────────────
 async function handleProfile(interaction) {
   const targetUser = interaction.options.getUser('user') || interaction.user;
   const userId = targetUser.id;
@@ -598,7 +569,6 @@ async function handleProfile(interaction) {
   await interaction.reply(lines.join('\n'));
 }
 
-// ── /deepanalysis — Multi-agent trading analysis (TradingAgents) ─────
 async function handleDeepAnalysis(interaction) {
   await interaction.deferReply();
 
@@ -640,12 +610,11 @@ async function handleDeepAnalysis(interaction) {
       }
     }
   } catch (err) {
-    console.error(`[DeepAnalysis] Error for ${ticker}:`, err);
+    console.error(`[DeepAnalysis] ${new Date().toISOString()} | Interaction: DeepAnalysis | Error:`, err);
     await interaction.editReply(`**TradingAgents — ${ticker}**\n❌ Analysis failed: ${err.message}`);
   }
 }
 
-// ── /research — Agent Swarm parallel research ────────────────────────
 async function handleResearch(interaction) {
   await interaction.deferReply();
 
@@ -685,25 +654,9 @@ async function handleResearch(interaction) {
       }
     }
   } catch (err) {
-    console.error(`[Research] Error:`, err);
+    console.error(`[Research] ${new Date().toISOString()} | Interaction: Research | Error:`, err);
     await interaction.editReply(`**Agent Swarm Research**\n❌ Research failed: ${err.message}`);
   }
-}
-
-// ── /gex — Gamma Exposure analysis (chart, summary, alerts) ───────────
-
-// Shared engine instances (lazy-initialized)
-let _gexEngine = null;
-let _gexAlerts = null;
-
-function _getGEXEngine() {
-  if (!_gexEngine) _gexEngine = new GEXEngine(gamma);
-  return _gexEngine;
-}
-
-function _getGEXAlerts() {
-  if (!_gexAlerts) _gexAlerts = new GEXAlertService();
-  return _gexAlerts;
 }
 
 async function handleGEX(interaction) {
@@ -723,9 +676,6 @@ async function handleGEX(interaction) {
   }
 }
 
-/**
- * /gex chart — Original single-expiry GEX chart (backward compatible)
- */
 async function handleGEXChart(interaction) {
   const rawTicker = interaction.options.getString('ticker');
   const ticker = yahoo.sanitizeTicker(rawTicker);
@@ -755,14 +705,11 @@ async function handleGEXChart(interaction) {
       await interaction.editReply(summary + '\n\n_Chart unavailable — canvas module not loaded._');
     }
   } catch (err) {
-    console.error(`[GEX] Error for ${ticker}:`, err);
+    console.error(`[GEX] ${new Date().toISOString()} | Interaction: GEX Chart | Error:`, err);
     await interaction.editReply(`**${ticker} — Gamma Exposure**\n❌ ${err.message || 'Unknown error'}`);
   }
 }
 
-/**
- * /gex summary — Multi-expiry aggregated GEX analysis
- */
 async function handleGEXSummary(interaction) {
   const rawTicker = interaction.options.getString('ticker');
   const ticker = yahoo.sanitizeTicker(rawTicker);
@@ -791,14 +738,11 @@ async function handleGEXSummary(interaction) {
       await interaction.editReply(summary);
     }
   } catch (err) {
-    console.error(`[GEX Summary] Error for ${ticker}:`, err);
+    console.error(`[GEX Summary] ${new Date().toISOString()} | Interaction: GEX Summary | Error:`, err);
     await interaction.editReply(`**${ticker} — GEX Summary**\n❌ ${err.message || 'Unknown error'}`);
   }
 }
 
-/**
- * /gex alerts — Check break-and-hold conditions on GEX levels
- */
 async function handleGEXAlerts(interaction) {
   const rawTicker = interaction.options.getString('ticker');
   const ticker = yahoo.sanitizeTicker(rawTicker);
@@ -831,7 +775,7 @@ async function handleGEXAlerts(interaction) {
         volume: b.Volume || b.volume || b.v,
       }));
     } catch (err) {
-      console.warn(`[GEX Alerts] Could not fetch candles for ${ticker}: ${err.message}`);
+      console.warn(`[GEX Alerts] ${new Date().toISOString()} | Interaction: GEX Alerts | Cannot fetch candles for ${ticker}: ${err.message}`);
     }
 
     // Evaluate alerts
@@ -858,12 +802,11 @@ async function handleGEXAlerts(interaction) {
       ].join('\n'));
     }
   } catch (err) {
-    console.error(`[GEX Alerts] Error for ${ticker}:`, err);
+    console.error(`[GEX Alerts] ${new Date().toISOString()} | Interaction: GEX Alerts | Error:`, err);
     await interaction.editReply(`**${ticker} — GEX Alerts**\n❌ ${err.message || 'Unknown error'}`);
   }
 }
 
-// ── /stream — Real-time Alpaca WebSocket market data ──────────────────
 async function handleStream(interaction) {
   const action = interaction.options.getString('action');
   const symbolsInput = interaction.options.getString('symbols');
@@ -924,7 +867,7 @@ async function handleStream(interaction) {
   // ── start / stop require symbols ──
   if (!symbolsInput) {
     await interaction.reply({
-      content: `Please provide symbols. Example: \`/stream ${action} AAPL,TSLA,SPY\``,
+      content: `Please provide symbols. Example: \`/stream ${action} AAPL,TSLA\``,
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -1002,7 +945,7 @@ async function handleTechnicals(interaction) {
 
     await interaction.editReply(formatted);
   } catch (err) {
-    console.error(`[Technicals] Error for ${ticker}:`, err);
+    console.error(`[Technicals] ${new Date().toISOString()} | Interaction: Technicals | Error:`, err);
     await interaction.editReply(`**${ticker} — Technical Analysis**\n❌ ${err.message}`);
   }
 }
@@ -1023,7 +966,7 @@ async function handleSocial(interaction) {
 
     await interaction.editReply(formatted);
   } catch (err) {
-    console.error(`[Social] Error for ${ticker}:`, err);
+    console.error(`[Social] ${new Date().toISOString()} | Interaction: Social | Error:`, err);
     await interaction.editReply(`**${ticker} — Social Sentiment**\n❌ ${err.message}`);
   }
 }
@@ -1038,7 +981,7 @@ async function handleTrending(interaction) {
 
     await interaction.editReply(formatted);
   } catch (err) {
-    console.error(`[Trending] Error:`, err);
+    console.error(`[Trending] ${new Date().toISOString()} | Interaction: Trending | Error:`, err);
     await interaction.editReply(`**Trending Tickers**\n❌ ${err.message}`);
   }
 }
@@ -1051,15 +994,12 @@ async function handleReddit(interaction) {
 
   try {
     if (ticker) {
-      // Per-symbol analysis
-      const upper = ticker.toUpperCase();
-      await interaction.editReply(`**${upper} — Reddit Sentiment**\n⏳ Scanning r/wallstreetbets, r/stocks, r/investing, r/options...`);
+      await interaction.editReply(`**${ticker.toUpperCase()} — Reddit Sentiment**\n⏳ Scanning r/wallstreetbets, r/stocks, r/investing, r/options...`);
 
-      const result = await reddit.analyzeSymbol(upper);
+      const result = await reddit.analyzeSymbol(ticker.toUpperCase());
       const formatted = reddit.formatSymbolForDiscord(result);
       await interaction.editReply(formatted);
     } else {
-      // Trending tickers
       await interaction.editReply('**Reddit Trending**\n⏳ Scanning 4 subreddits for trending tickers...');
 
       const trending = await reddit.getTrendingTickers();
@@ -1072,12 +1012,11 @@ async function handleReddit(interaction) {
       }
     }
   } catch (err) {
-    console.error('[Reddit] Error:', err);
+    console.error(`[Reddit] ${new Date().toISOString()} | Interaction: Reddit | Error:`, err);
     await interaction.editReply(`**Reddit Sentiment**\n❌ ${err.message}`);
   }
 }
 
-// ── /macro — Macro environment analysis ───────────────────────────
 async function handleMacro(interaction) {
   await interaction.deferReply();
 
@@ -1097,12 +1036,12 @@ async function handleMacro(interaction) {
     // Unusual Whales enrichment — service not yet implemented
     // TODO: add uw (unusual-whales) service and re-enable
   } catch (err) {
-    console.error('[Macro] Error:', err);
+    console.error(`[Macro] ${new Date().toISOString()} | Interaction: Macro | Error:`, err);
     await interaction.editReply(`**Macro Environment**\n❌ ${err.message}`);
   }
 }
 
-// ── /sectors — Sector rotation heatmap ────────────────────────────
+// ── /sectors — Sector rotation heatmap ────────────────
 async function handleSectors(interaction) {
   await interaction.deferReply();
 
@@ -1118,7 +1057,7 @@ async function handleSectors(interaction) {
       await interaction.editReply(formatted.slice(0, 1990) + '...');
     }
   } catch (err) {
-    console.error('[Sectors] Error:', err);
+    console.error(`[Sectors] ${new Date().toISOString()} | Interaction: Sectors | Error:`, err);
     await interaction.editReply(`**Sector Rotation**\n❌ ${err.message}`);
   }
 }
@@ -1141,7 +1080,7 @@ async function handleValidea(interaction) {
 
     await interaction.editReply(formatted);
   } catch (err) {
-    console.error(`[Validea] Error for ${ticker}:`, err);
+    console.error(`[Validea] ${new Date().toISOString()} | Interaction: Validea | Error:`, err);
     await interaction.editReply(`**${ticker} — Validea Guru Analysis**\n❌ ${err.message}`);
   }
 }
@@ -1242,7 +1181,7 @@ async function handleAgent(interaction) {
           await interaction.editReply(
             '**SHARK — Dangerous Mode DISABLED**\n' +
             'Restored previous trading parameters.\n\n' +
-            '_Use `/agent config` to verify settings._'
+            '_Use `/agent dangerous` again to disable and restore previous settings._'
           );
         } else {
           const result = policy.enableDangerousMode();
@@ -1286,7 +1225,7 @@ async function handleAgent(interaction) {
         const lines = [];
         if (result.success) {
           lines.push(`**SHARK Trade Executed**`);
-          lines.push(`${result.message}`);
+          lines.push(result.message);
         } else {
           lines.push(`**SHARK Trade — ${ticker.toUpperCase()}**`);
           lines.push(`❌ ${result.message}`);
@@ -1316,12 +1255,11 @@ async function handleAgent(interaction) {
       }
     }
   } catch (err) {
-    console.error(`[Agent] Error (${action}):`, err);
+    console.error(`[Agent] ${new Date().toISOString()} | Interaction: Agent (${action}) | Error:`, err);
     await interaction.editReply(`**SHARK — ${action}**\n❌ ${err.message}`);
   }
 }
 
-// ── /flow — Smart money flow: insider + congress trades (AInvest) ────
 async function handleFlow(interaction) {
   await interaction.deferReply();
 
@@ -1347,12 +1285,11 @@ async function handleFlow(interaction) {
 
     await interaction.editReply(formatted);
   } catch (err) {
-    console.error(`[Flow] Error for ${ticker}:`, err);
+    console.error(`[Flow] ${new Date().toISOString()} | Interaction: Flow | Error:`, err);
     await interaction.editReply(`**Smart Money Flow — ${ticker}**\n❌ ${err.message}`);
   }
 }
 
-// ── /whales — Market intelligence dashboard (AInvest) ────────────────
 async function handleWhales(interaction) {
   await interaction.deferReply();
 
@@ -1386,12 +1323,11 @@ async function handleWhales(interaction) {
 
     await interaction.editReply(formatted);
   } catch (err) {
-    console.error(`[Whales] Error for ${ticker}:`, err);
+    console.error(`[Whales] ${new Date().toISOString()} | Interaction: Whales | Error:`, err);
     await interaction.editReply(`**Market Intelligence — ${ticker}**\n❌ ${err.message}`);
   }
 }
 
-// ── /predict — Search Kalshi prediction markets + AI high-conviction play ─
 async function handlePredict(interaction) {
   await interaction.deferReply();
 
@@ -1422,12 +1358,11 @@ async function handlePredict(interaction) {
       await interaction.followUp(`${output}`);
     }
   } catch (err) {
-    console.error('[Predict] Error:', err);
+    console.error(`[Predict] ${new Date().toISOString()} | Interaction: Predict | Error:`, err);
     await interaction.editReply(`**Prediction Markets — "${topic}"**\n❌ ${err.message}`);
   }
 }
 
-// ── /odds — Deep dive on a specific Kalshi market ────────────────────
 async function handleOdds(interaction) {
   await interaction.deferReply();
 
@@ -1481,12 +1416,11 @@ async function handleOdds(interaction) {
       await interaction.followUp(`${output}`);
     }
   } catch (err) {
-    console.error(`[Odds] Error for ${ticker}:`, err);
+    console.error(`[Odds] ${new Date().toISOString()} | Interaction: Odds | Error:`, err);
     await interaction.editReply(`**${ticker} — Market Deep Dive**\n❌ ${err.message}`);
   }
 }
 
-// ── /bets — Browse trending/categorized Kalshi markets + best play ────
 async function handleBets(interaction) {
   await interaction.deferReply();
 
@@ -1535,12 +1469,10 @@ async function handleBets(interaction) {
       await interaction.followUp(`${output}`);
     }
   } catch (err) {
-    console.error(`[Bets] Error for ${category}:`, err);
+    console.error(`[Bets] ${new Date().toISOString()} | Interaction: Bets | Error:`, err);
     await interaction.editReply(`**Kalshi — ${category}**\n❌ ${err.message}`);
   }
 }
-
-// ── /options — 0DTE Options Trading Engine ──────────────────────────
 
 async function handleOptions(interaction) {
   const action = interaction.options.getString('action');
@@ -1658,12 +1590,10 @@ async function handleOptions(interaction) {
         await interaction.editReply('Unknown options action. Use: `status`, `trade`, `close`, `logs`');
     }
   } catch (err) {
-    console.error(`[Options] Error (${action}):`, err);
+    console.error(`[Options] ${new Date().toISOString()} | Interaction: Options (${action}) | Error:`, err);
     await interaction.editReply(`**0DTE Options — ${action}**\n❌ ${err.message}`);
   }
 }
-
-// ── /brain ─────────────────────────────────────────────────────────
 
 async function handleBrain(interaction) {
   const action = interaction.options.getString('action');
@@ -1696,7 +1626,7 @@ async function handleBrain(interaction) {
     }
     const lines = [`**Initiative Journal** (last ${entries.length} entries)\n`];
     for (const e of entries.reverse()) {
-      const time = new Date(e.timestamp).toLocaleTimeString('en-US', {
+      const time = new Date(e.timestamp).toLocaleString('en-US', {
         timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit',
       });
       const typeEmoji = {
@@ -1716,10 +1646,7 @@ async function handleBrain(interaction) {
     }
     const lines = [`**Self-Tuning History** (${tuning.length} events)\n`];
     for (const e of tuning.slice(-10).reverse()) {
-      const time = new Date(e.timestamp).toLocaleString('en-US', {
-        timeZone: 'America/New_York', month: 'short', day: 'numeric',
-        hour: '2-digit', minute: '2-digit',
-      });
+      const time = new Date(e.timestamp).toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
       lines.push(`🧠 **${time} ET**\n${e.content.slice(0, 300)}\n`);
     }
     return interaction.reply(lines.join('\n').slice(0, 2000));
@@ -1761,7 +1688,6 @@ async function handleSqueeze(interaction) {
   return interaction.reply({ content: 'Unknown squeeze action.', flags: MessageFlags.Ephemeral });
 }
 
-// ── /yolo — Autonomous self-improvement engine control ────────────────
 async function handleYolo(interaction) {
   const action = interaction.options.getString('action');
   const hasAdminPerms = interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator);
@@ -1792,7 +1718,8 @@ async function handleYolo(interaction) {
         `**Total improvements:** ${s.totalImprovements}`,
         `**Consecutive failures:** ${s.consecutiveFailures}/${s.failureThreshold}`,
         '',
-        '_The bot scans its own code, finds issues, generates fixes, and deploys them autonomously._',
+        '_The bot scans its own code, identifies improvements, ' +
+        'generates fixes, and deploys them autonomously._',
       ];
       return interaction.reply(lines.join('\n'));
     }
