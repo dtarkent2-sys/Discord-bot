@@ -30,18 +30,31 @@ function _generateLockValue() {
 }
 
 /**
- * Create a minimal Redis client using native TCP.
+ * Create a minimal Redis client using native TCP or TLS.
  * Uses the RESP protocol directly to avoid adding a Redis dependency.
+ * Supports both redis:// (plain TCP) and rediss:// (TLS) URLs.
  */
 function _createRedisClient(redisUrl) {
   const url = new URL(redisUrl);
-  const net = require('net');
   const host = url.hostname || '127.0.0.1';
   const port = parseInt(url.port, 10) || 6379;
-  const password = url.password || null;
+  const password = url.password ? decodeURIComponent(url.password) : null;
+  const username = url.username ? decodeURIComponent(url.username) : null;
+  const useTls = url.protocol === 'rediss:';
+
+  log.info(`Redis connecting to ${host}:${port} (TLS: ${useTls})`);
 
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection({ host, port }, () => {
+    let socket;
+    if (useTls) {
+      const tls = require('tls');
+      socket = tls.connect({ host, port, rejectUnauthorized: false }, onConnect);
+    } else {
+      const net = require('net');
+      socket = net.createConnection({ host, port }, onConnect);
+    }
+
+    function onConnect() {
       let buffer = '';
       const pending = [];
 
@@ -110,10 +123,17 @@ function _createRedisClient(redisUrl) {
         },
       };
 
-      // Authenticate if password is present
+      // Authenticate if password is present.
+      // Redis 6+ ACL supports AUTH username password; fall back to AUTH password.
       if (password) {
-        sendCommand('AUTH', password)
-          .then(() => resolve(client))
+        const authArgs = username && username !== 'default'
+          ? ['AUTH', username, password]
+          : ['AUTH', password];
+        sendCommand(...authArgs)
+          .then(() => {
+            log.info('Redis AUTH successful');
+            resolve(client);
+          })
           .catch(reject);
       } else {
         resolve(client);
@@ -142,6 +162,8 @@ async function acquireLock() {
     log.warn('REDIS_URL not set — singleton lock DISABLED. Multiple instances may connect to Discord simultaneously.');
     return;
   }
+
+  log.info(`Attempting Redis lock (url scheme: ${new URL(redisUrl).protocol})`);
 
   try {
     _redis = await _createRedisClient(redisUrl);
