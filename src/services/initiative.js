@@ -580,9 +580,15 @@ class InitiativeEngine {
     const guild = this._client.guilds.cache.first();
     if (!guild) return;
 
-    const channel = guild.channels.cache.find(
+    let channel = guild.channels.cache.find(
       ch => ch.name === config.tradingChannelName && ch.isTextBased()
     );
+    if (!channel) {
+      try {
+        const fetched = await guild.channels.fetch();
+        channel = fetched.find(ch => ch && ch.name === config.tradingChannelName && ch.isTextBased());
+      } catch {}
+    }
     if (!channel || !channel.manageable) return;
 
     // Build topic from current state
@@ -766,9 +772,15 @@ class InitiativeEngine {
     const guild = this._client.guilds.cache.first();
     if (!guild) return null;
 
-    const channel = guild.channels.cache.find(
+    let channel = guild.channels.cache.find(
       ch => ch.name === config.tradingChannelName && ch.isTextBased()
     );
+    if (!channel) {
+      try {
+        const fetched = await guild.channels.fetch();
+        channel = fetched.find(ch => ch && ch.name === config.tradingChannelName && ch.isTextBased());
+      } catch {}
+    }
     if (!channel) return null;
 
     try {
