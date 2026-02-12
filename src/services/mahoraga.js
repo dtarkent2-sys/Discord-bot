@@ -37,6 +37,7 @@ const config = require('../config');
 const Storage = require('./storage');
 const auditLog = require('./audit-log');
 const circuitBreaker = require('./circuit-breaker');
+const optionsEngine = require('./options-engine');
 
 // Max ticker evaluations per scan cycle (prevents runaway loops)
 const MAX_EVALS_PER_CYCLE = 8;
@@ -69,6 +70,8 @@ class SharkEngine {
   /** Called by autonomous.js to wire up the Discord posting callback */
   setChannelPoster(fn) {
     this._postToChannel = fn;
+    // Also wire the options engine
+    optionsEngine.setChannelPoster(fn);
   }
 
   // ── Enable / Disable / Kill ───────────────────────────────────────
@@ -159,6 +162,14 @@ class SharkEngine {
 
     status.config = policy.getConfig();
     status.circuitBreaker = circuitBreaker.getStatus();
+
+    // Include options engine status
+    try {
+      status.options = await optionsEngine.getStatus();
+    } catch {
+      status.options = { enabled: false, error: 'Options engine unavailable' };
+    }
+
     return status;
   }
 
@@ -235,6 +246,13 @@ class SharkEngine {
       // ── 4-5. Scan for new signals (skip if RISK_OFF macro) ──
       if (macroRegime.regime !== 'RISK_OFF') {
         await this._scanSignals(account, macroRegime);
+      }
+
+      // ── 6. Run 0DTE options cycle (if enabled) ──
+      try {
+        await optionsEngine.runCycle();
+      } catch (err) {
+        this._log('options', `Options cycle error: ${err.message}`);
       }
 
       // Cycle completed successfully — reset error counter
@@ -871,14 +889,19 @@ class SharkEngine {
     }
   }
 
+  // ── Options Engine Access ────────────────────────────────────────
+
+  get optionsEngine() { return optionsEngine; }
+
   // ── Discord Formatting ────────────────────────────────────────────
 
   formatStatusForDiscord(status) {
     if (!status) return '_Could not fetch agent status._';
 
+    const dangerousLabel = status.config?.dangerousMode ? ' | **DANGEROUS MODE**' : '';
     const lines = [
       `**SHARK — Autonomous Trading Agent**`,
-      `Mode: ${status.paper ? '📄 Paper Trading' : '💵 LIVE Trading'}`,
+      `Mode: ${status.paper ? '📄 Paper Trading' : '💵 LIVE Trading'}${dangerousLabel}`,
       `Agent: ${status.agent_enabled ? '🟢 **ENABLED**' : '🔴 **DISABLED**'}`,
       ``,
     ];
@@ -920,6 +943,24 @@ class SharkEngine {
     if (status.clock) {
       lines.push(``);
       lines.push(`Market: ${status.clock.is_open ? '🟢 Open' : '🔴 Closed'}`);
+    }
+
+    // Options engine status
+    if (status.options) {
+      lines.push(``);
+      lines.push(`**0DTE Options**`);
+      lines.push(`Engine: ${status.options.enabled ? '🟢 Enabled' : '🔴 Disabled'}`);
+      if (status.options.enabled) {
+        lines.push(`Positions: \`${status.options.activePositions}/${status.options.maxPositions}\``);
+        lines.push(`Daily Loss: \`$${status.options.dailyLoss?.toFixed(0) || 0}/$${status.options.maxDailyLoss || 0}\``);
+        lines.push(`Underlyings: \`${status.options.config?.underlyings?.join(', ') || 'SPY, QQQ'}\``);
+        if (status.options.positions?.length > 0) {
+          for (const p of status.options.positions) {
+            const emoji = p.unrealizedPL >= 0 ? '🟢' : '🔴';
+            lines.push(`${emoji} ${p.underlying} $${p.strike} ${p.type.toUpperCase()} — P/L: $${p.unrealizedPL.toFixed(2)} (${(p.unrealizedPLPct * 100).toFixed(1)}%)`);
+          }
+        }
+      }
     }
 
     return lines.join('\n');
@@ -979,10 +1020,26 @@ class SharkEngine {
       lines.push(`**Denylist:** \`${cfg.symbol_denylist.join(', ')}\``);
     }
 
+    // Options config
+    if (cfg.options_enabled) {
+      lines.push(``);
+      lines.push(`__0DTE Options__`);
+      lines.push(`**Max Premium/Trade:** \`$${cfg.options_max_premium_per_trade}\``);
+      lines.push(`**Max Daily Loss:** \`$${cfg.options_max_daily_loss}\``);
+      lines.push(`**Max Options Positions:** \`${cfg.options_max_positions}\``);
+      lines.push(`**Scalp TP/SL:** \`${(cfg.options_scalp_take_profit_pct * 100).toFixed(0)}% / ${(cfg.options_scalp_stop_loss_pct * 100).toFixed(0)}%\``);
+      lines.push(`**Swing TP/SL:** \`${(cfg.options_swing_take_profit_pct * 100).toFixed(0)}% / ${(cfg.options_swing_stop_loss_pct * 100).toFixed(0)}%\``);
+      lines.push(`**Min Conviction:** \`${cfg.options_min_conviction}/10\``);
+      lines.push(`**Delta Range:** \`${cfg.options_min_delta} — ${cfg.options_max_delta}\``);
+      lines.push(`**Underlyings:** \`${cfg.options_underlyings?.join(', ') || 'SPY, QQQ'}\``);
+    }
+
     lines.push(``);
     lines.push(`Kill Switch: ${cfg.killSwitch ? '🛑 **ACTIVE**' : '🟢 OK'}`);
+    lines.push(`Dangerous Mode: ${cfg.dangerousMode ? '**ACTIVE** — aggressive parameters' : 'OFF'}`);
     lines.push(``);
     lines.push(`_Use \`/agent set key:<name> value:<val>\` to change a setting_`);
+    lines.push(`_Use \`/agent dangerous\` to toggle aggressive mode_`);
     lines.push(`_Use \`/agent reset\` to restore defaults_`);
     return lines.join('\n');
   }

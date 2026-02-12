@@ -1,3 +1,16 @@
+/**
+ * Audit Log — Persistent structured logging for autonomous actions.
+ *
+ * Logs every autonomous action, trade, Ollama prompt/response, and safety event
+ * to rotating JSON-lines files in data/logs/. Provides queryable in-memory buffer
+ * for the dashboard and Discord commands.
+ *
+ * Files:
+ *   data/logs/audit-YYYY-MM-DD.jsonl   — one JSON object per line
+ *   data/logs/ollama-YYYY-MM-DD.jsonl  — full Ollama prompt/response pairs
+ *   data/logs/postmortem-<timestamp>.json — emergency stop post-mortem snapshots
+ */
+
 const fs = require('fs');
 const path = require('path');
 const config = require('../config');
@@ -153,23 +166,19 @@ class AuditLog {
         .filter(f => f.startsWith('audit-') || f.startsWith('ollama-'))
         .sort();
 
+      // Group by prefix
       for (const prefix of ['audit-', 'ollama-']) {
         const prefixFiles = files.filter(f => f.startsWith(prefix));
         if (prefixFiles.length > MAX_LOG_FILES) {
           const toDelete = prefixFiles.slice(0, prefixFiles.length - MAX_LOG_FILES);
           for (const file of toDelete) {
-            const fullPath = path.join(LOG_DIR, file);
-            try {
-              fs.unlinkSync(fullPath);
-              console.log(`[AuditLog] Cleaned old log: ${file}`);
-            } catch (unlinkErr) {
-              console.error(`[AuditLog] Could not delete ${file}:`, unlinkErr.message);
-            }
+            fs.unlinkSync(path.join(LOG_DIR, file));
+            console.log(`[AuditLog] Cleaned old log: ${file}`);
           }
         }
       }
-    } catch (err) {
-      console.error('[AuditLog] Cleanup failed:', err.message);
+    } catch {
+      // Ignore cleanup errors on startup
     }
   }
 }

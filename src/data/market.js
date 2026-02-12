@@ -1,3 +1,7 @@
+/**
+ * Market context provider — fetches data from Alpaca (preferred) or FMP.
+ */
+
 const { assertFresh, FreshnessError } = require('./freshness');
 const yahoo = require('../services/yahoo');
 const alpaca = require('../services/alpaca');
@@ -10,34 +14,22 @@ const FRESHNESS = {
   candles_1d: 86400, // 24 hours
 };
 
-const sma = (prices, period) => {
-  const recent = prices.slice(-period);
-  return Math.round((recent.reduce((a, b) => a + b, 0) / recent.length) * 100) / 100;
-};
-
-const rsi = (prices, period = 14) => {
-  if (prices.length < period + 1) return null;
-  let gains = 0;
-  let losses = 0;
-  for (let i = prices.length - period; i < prices.length; i++) {
-    const diff = prices[i] - prices[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return Math.round((100 - (100 / (1 + rs))) * 100) / 100;
-};
-
+/**
+ * Fetch market context for a ticker via Alpaca (preferred) or FMP.
+ * Returns structured data for the AI, or { error: true, missing: [...] }.
+ * @param {string} ticker
+ * @param {{ skipAlpaca?: boolean }} [opts] — pass { skipAlpaca: true } to bypass Alpaca
+ *   (useful when the caller enriches with AInvest, which provides richer fundamentals)
+ */
 async function getMarketContext(ticker, opts = {}) {
+  // Resolve crypto shorthand: BTC → BTC-USD, ETH → ETH-USD, etc.
   const resolvedTicker = yahoo.resolveTicker(ticker);
   const missing = [];
   const context = { ticker: resolvedTicker, fetchedAt: new Date().toISOString() };
   const useAlpaca = !opts.skipAlpaca && alpaca.enabled && !yahoo.isCrypto(resolvedTicker);
   context.source = useAlpaca ? 'Alpaca' : 'FMP';
 
+  // ── Ticker Snapshot (fundamentals + technicals) ──
   if (useAlpaca) {
     try {
       const [snapshot, history] = await Promise.all([
@@ -70,8 +62,15 @@ async function getMarketContext(ticker, opts = {}) {
           marketCap: null,
           change: snapshot.change,
           changePercent: snapshot.changePercent,
-          pe: null, forwardPE: null, pb: null, eps: null, divYield: null,
-          roe: null, profitMargin: null, revenueGrowth: null, beta: null,
+          pe: null,
+          forwardPE: null,
+          pb: null,
+          eps: null,
+          divYield: null,
+          roe: null,
+          profitMargin: null,
+          revenueGrowth: null,
+          beta: null,
           fiftyTwoWeekHigh: high52,
           fiftyTwoWeekLow: low52,
           sma50,
@@ -126,6 +125,9 @@ async function getMarketContext(ticker, opts = {}) {
       missing.push({ field: 'snapshot', reason: err.message });
     }
 
+    // ── Fallback: If FMP failed and skipAlpaca was requested, try Alpaca anyway ──
+    // skipAlpaca is a preference (to allow AInvest enrichment), not a hard ban.
+    // A partial snapshot from Alpaca is better than total failure.
     if (!context.quote && alpaca.enabled && !yahoo.isCrypto(resolvedTicker)) {
       console.log(`[Market] FMP failed for ${resolvedTicker} — falling back to Alpaca despite skipAlpaca preference`);
       try {
@@ -177,9 +179,9 @@ async function getMarketContext(ticker, opts = {}) {
           };
           context.priceHistory = priceHistory;
 
+          // Clear the FMP failure from missing since we recovered
           const fmpIdx = missing.findIndex(m => m.field === 'snapshot');
           if (fmpIdx !== -1) missing.splice(fmpIdx, 1);
-
           console.log(`[Market] Alpaca fallback succeeded for ${resolvedTicker}: $${snapshot.price}`);
         }
       } catch (alpErr) {
@@ -188,6 +190,7 @@ async function getMarketContext(ticker, opts = {}) {
     }
   }
 
+  // Apply freshness gate to quote data
   if (context.quote) {
     try {
       const quoteAge = assertFresh(context.quote.timestamp, FRESHNESS.quote, 'quote');
@@ -201,6 +204,7 @@ async function getMarketContext(ticker, opts = {}) {
     }
   }
 
+  // If we have no data at all, return error
   if (missing.length > 0 && !context.quote) {
     return {
       error: true,
@@ -210,14 +214,17 @@ async function getMarketContext(ticker, opts = {}) {
     };
   }
 
+  // ── Enrich with technical indicators (non-blocking) ──
   try {
     const techResult = await technicals.analyze(resolvedTicker);
     context.technicals = techResult.technicals;
     context.signals = techResult.signals;
   } catch (err) {
+    // Technical analysis is supplementary — don't fail the whole request
     missing.push({ field: 'technicals', reason: err.message });
   }
 
+  // ── Enrich with social sentiment (non-blocking) ──
   try {
     const social = await stocktwits.analyzeSymbol(resolvedTicker);
     if (social.messages > 0) {
@@ -227,6 +234,7 @@ async function getMarketContext(ticker, opts = {}) {
     // StockTwits is supplementary — silently skip
   }
 
+  // Partial data is OK — include what we have and note what's missing
   if (missing.length > 0) {
     context.missingFields = missing;
   }
@@ -234,11 +242,15 @@ async function getMarketContext(ticker, opts = {}) {
   return context;
 }
 
+/**
+ * Format market context into a string for the AI system prompt.
+ */
 function formatContextForAI(context) {
   if (!context || context.error) {
     return context?.message || 'No market data available.';
   }
 
+  // Calculate data age and flag staleness
   const fetchedMs = new Date(context.fetchedAt).getTime();
   const ageSec = Math.floor((Date.now() - fetchedMs) / 1000);
   const ageLabel = ageSec > 300 ? ` [WARNING: data is ${Math.floor(ageSec / 60)}m old — may be stale]`
@@ -286,6 +298,7 @@ function formatContextForAI(context) {
     }
   }
 
+  // Technical indicators (from SHARK engine)
   if (context.technicals) {
     const t = context.technicals;
     lines.push('  Technical Indicators:');
@@ -300,6 +313,7 @@ function formatContextForAI(context) {
     if (t.relative_volume !== null) lines.push(`    Relative Volume: ${t.relative_volume.toFixed(1)}x average`);
   }
 
+  // Signal detection
   if (context.signals && context.signals.length > 0) {
     lines.push('  Detected Signals:');
     for (const sig of context.signals) {
@@ -307,6 +321,7 @@ function formatContextForAI(context) {
     }
   }
 
+  // Social sentiment
   if (context.socialSentiment) {
     const s = context.socialSentiment;
     lines.push(`  Social Sentiment (StockTwits): ${s.label} (score: ${(s.score * 100).toFixed(0)}%) — ${s.bullish} bullish / ${s.bearish} bearish / ${s.neutral} neutral (${s.messages} posts)`);
@@ -321,6 +336,27 @@ function formatContextForAI(context) {
   }
 
   return lines.join('\n');
+}
+
+function sma(prices, period) {
+  const recent = prices.slice(-period);
+  return Math.round((recent.reduce((a, b) => a + b, 0) / recent.length) * 100) / 100;
+}
+
+function rsi(prices, period = 14) {
+  if (prices.length < period + 1) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = prices.length - period; i < prices.length; i++) {
+    const diff = prices[i] - prices[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return Math.round((100 - (100 / (1 + rs))) * 100) / 100;
 }
 
 module.exports = { getMarketContext, formatContextForAI, FRESHNESS };
