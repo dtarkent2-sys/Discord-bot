@@ -42,7 +42,15 @@ class StockTwitsService {
    * Get recent messages for a specific ticker.
    * @param {string} symbol
    * @param {number} limit
-   * @returns {Array<{id: number, body: string, createdAt: string, username: string, followers: number, sentiment: string|null, symbols: string[]}>}
+   * @returns {Array<{
+     *   id: number,
+     *   body: string,
+     *   createdAt: string,
+     *   username: string,
+     *   followers: number,
+     *   sentiment: string|null,
+     *   symbols: string[]
+     * }>}
    */
   async getStream(symbol, limit = 30) {
     const upper = symbol.toUpperCase();
@@ -63,14 +71,14 @@ class StockTwitsService {
     }
 
     const data = await res.json();
-    const messages = (data.messages || []).map(msg => ({
+    const messages = ((data.messages || []) || []).map(msg => ({
       id: msg.id,
       body: msg.body,
       createdAt: msg.created_at,
       username: msg.user?.username || 'unknown',
       followers: msg.user?.followers || 0,
       sentiment: msg.entities?.sentiment?.basic || null, // "Bullish" | "Bearish" | null
-      symbols: (msg.symbols || []).map(s => s.symbol),
+      symbols: ((msg.symbols || []) || []).map(s => s.symbol),
     }));
 
     this._cache.set(upper, { data: messages, expiry: Date.now() + 2 * 60 * 1000 });
@@ -89,15 +97,15 @@ class StockTwitsService {
 
     if (!res.ok) throw new Error(`StockTwits API error: ${res.status}`);
     const data = await res.json();
-    return (data.messages || []).map(msg => ({
+    return (((data.messages || []) || []).map(msg => ({
       id: msg.id,
       body: msg.body,
       createdAt: msg.created_at,
       username: msg.user?.username || 'unknown',
       followers: msg.user?.followers || 0,
       sentiment: msg.entities?.sentiment?.basic || null,
-      symbols: (msg.symbols || []).map(s => s.symbol),
-    }));
+      symbols: ((msg.symbols || []) || []).map(s => s.symbol),
+    })));
   }
 
   // ── Sentiment Analysis ────────────────────────────────────────────
