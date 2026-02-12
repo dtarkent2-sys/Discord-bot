@@ -1,10 +1,10 @@
-const CONFIG_MIN_INTERVAL_MS = 60_000; // 1 minute
-const CONFIG_MAX_INTERVAL_MS = 86_400_000; // 24 hours
-const CONFIG_MAX_COUNT = 1_000; // safeguard against runaway requests
+const CONFIG_MIN_INTERVAL_MS = 60_000;
+const CONFIG_MAX_INTERVAL_MS = 86_400_000;
+const CONFIG_MAX_COUNT = 1_000;
 
 class AInvestService {
   constructor() {
-    this._cachedHeaders = null;
+    this._headers = null;
     this._mcpInitPromise = null;
   }
 
@@ -36,12 +36,13 @@ class AInvestService {
   }
 
   _getHeaders() {
-    if (this._cachedHeaders) return this._cachedHeaders;
-    this._cachedHeaders = {
-      'Authorization': `Bearer ${config.ainvestApiKey}`,
-      'Accept': 'application/json',
-    };
-    return this._cachedHeaders;
+    if (!this._headers) {
+      this._headers = {
+        'Authorization': `Bearer ${config.ainvestApiKey}`,
+        'Accept': 'application/json',
+      };
+    }
+    return this._headers;
   }
 
   async _fetch(path, params = {}, timeoutMs = 15000) {
@@ -119,12 +120,22 @@ class AInvestService {
       fromMs = Date.now() - count * 1.5 * 24 * 60 * 60 * 1000;
     }
 
-    // Reject invalid or extreme intervals
     if (fromMs < 0 || fromMs > Date.now()) {
       count = 5;
-      fromMs = Date.now() - 5 * (interval === 'day' ? 1.5 : interval === 'week' ? 7 : 30) * 24 * 60 * 60 * 1000;
+      const baseStep = interval === 'day' ? 1.5 : interval === 'week' ? 7 : 30;
+      fromMs = Date.now() - count * baseStep * 24 * 60 * 60 * 1000;
     }
-    const finalInterval = interval !== 'min' && interval !== 'day' && interval !== 'week' && interval !== 'month' ? 'day' : interval;
+    const finalInterval = ['min', 'day', 'week', 'month'].includes(interval) ? interval : 'day';
+
+    const timeOffsetStrings = {
+      'min': '60 * 1000',
+      'day': '24 * 60 * 60 * 1000',
+      'week': '7 * 24 * 60 * 60 * 1000',
+      'month': '30 * 24 * 60 * 60 * 1000'
+    };
+    const stepStr = timeOffsetStrings[interval] || '1.5 * 24 * 60 * 60 * 1000';
+    const stepCount = Math.max(1, count);
+    fromMs = Date.now() - stepCount * step * new Function(`return ${stepStr}`)();
 
     const restArgs = { ticker: tkr, interval: finalInterval, step, from: Math.floor(fromMs), to: 0 };
     const data = await this._mcpOrRest(
@@ -557,7 +568,7 @@ class AInvestService {
       lines.push('**Insider Trades (recent):**');
       for (const t of insider.slice(0, 3)) {
         const name = t.name || t.insider_name || t.full_name || 'Unknown';
-        const type = t.trade_type || t.transaction_type || t.type || '?';
+        const type = t.trade_type || t.transaction_type || '?';
         const shares = t.shares || t.quantity || t.number_of_shares || '?';
         const date = t.date || t.filing_date || '';
         lines.push(`  ${type}: ${name} — ${Number(shares).toLocaleString()} shares (${date})`);
