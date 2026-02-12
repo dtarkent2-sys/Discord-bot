@@ -659,8 +659,10 @@ class SharkEngine {
 
       if (!response) return null;
 
-      // Parse JSON from response
-      const jsonMatch = response.match(/\{[\s\S]*?\}/);
+      // Extract JSON — prefer object containing "action" key to avoid
+      // matching stray curly braces in model prose/thinking remnants
+      const jsonMatch = response.match(/\{[^{}]*"action"[^{}]*\}/)
+        || response.match(/\{[\s\S]*?\}/);
       if (!jsonMatch) return null;
 
       const parsed = JSON.parse(jsonMatch[0]);

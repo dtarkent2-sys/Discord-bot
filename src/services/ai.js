@@ -567,13 +567,17 @@ ${selfAwareness.buildSelfKnowledge()}
       content: `${ragEnforcementBlock()}\n\n${selfAwareness.buildCompactSelfKnowledge()}\n\nYou are analyzing data provided in the user prompt. All prices, metrics, and market conditions in the prompt are current as of today (${todayString()}). Use ONLY the data given. Do NOT fill in gaps from training memory for any post-${MODEL_CUTOFF} facts.`,
     };
 
+    const messages = [systemMsg, { role: 'user', content: prompt }];
+
     // Try Kimi agent mode first if enabled
     if (this.kimiEnabled) {
       try {
-        const result = await this._kimiAgentChat([systemMsg, { role: 'user', content: prompt }]);
+        const result = await this._kimiAgentChat(messages);
+        const cleaned = this._cleanResponse(result);
         const durationMs = Date.now() - startTime;
-        auditLog.logOllama('kimi-complete', prompt, result, durationMs);
-        return result;
+        auditLog.logOllama('kimi-complete', prompt, cleaned || result, durationMs);
+        if (cleaned) return cleaned;
+        console.warn('[AI] Kimi completion returned empty after cleaning, falling back to Ollama');
       } catch (err) {
         console.error('[AI] Kimi completion error, falling back to Ollama:', err.message);
       }
@@ -582,7 +586,7 @@ ${selfAwareness.buildSelfKnowledge()}
     try {
       const stream = await this.ollama.chat({
         model: this.model,
-        messages: [systemMsg, { role: 'user', content: prompt }],
+        messages,
         stream: true,
       });
 
@@ -591,10 +595,52 @@ ${selfAwareness.buildSelfKnowledge()}
         result += part.message.content;
       }
 
-      const durationMs = Date.now() - startTime;
-      auditLog.logOllama('ollama-complete', prompt, result, durationMs);
+      // Strip <think> tags (qwen3, deepseek, gemma, etc.) before returning
+      const cleaned = this._cleanResponse(result);
+      if (cleaned) {
+        const durationMs = Date.now() - startTime;
+        auditLog.logOllama('ollama-complete', prompt, cleaned, durationMs);
+        return cleaned;
+      }
 
-      return result;
+      // Streaming returned empty — try non-streaming fallback
+      console.warn(`[AI] Ollama streaming completion returned empty (model: ${this.model}), trying non-streaming...`);
+      try {
+        const retryResult = await this.ollama.chat({
+          model: this.model,
+          messages,
+          stream: false,
+        });
+        const retryText = retryResult.message?.content || '';
+        const retryClean = this._cleanResponse(retryText);
+        if (retryClean) {
+          const durationMs = Date.now() - startTime;
+          auditLog.logOllama('ollama-complete-retry', prompt, retryClean, durationMs);
+          return retryClean;
+        }
+      } catch (retryErr) {
+        console.warn(`[AI] Non-streaming completion retry failed: ${retryErr.message}`);
+      }
+
+      // Last resort: try Kimi even if not the primary model
+      if (!this.kimiEnabled && config.kimiApiKey) {
+        console.warn('[AI] Ollama completion empty — attempting Kimi as last resort...');
+        try {
+          const kimiResult = await this._kimiAgentChat(messages);
+          const kimiClean = this._cleanResponse(kimiResult);
+          if (kimiClean) {
+            const durationMs = Date.now() - startTime;
+            auditLog.logOllama('kimi-complete-fallback', prompt, kimiClean, durationMs);
+            return kimiClean;
+          }
+        } catch (kimiErr) {
+          console.warn(`[AI] Kimi last-resort completion failed: ${kimiErr.message}`);
+        }
+      }
+
+      // Everything failed
+      console.error(`[AI] ALL LLM backends returned empty for completion (model: ${this.model})`);
+      return null;
     } catch (err) {
       console.error('Ollama completion error:', err.message);
       auditLog.log('error', `Ollama completion error: ${err.message}`);
