@@ -21,7 +21,6 @@ class AIService {
     this.conversationHistory = new Map();
     this.maxHistory = 20;
 
-    // Kimi K2.5 agent mode — uses Moonshot API with built-in web search
     this.kimiEnabled = !!(config.kimiApiKey && this._isKimiModel());
 
     console.log(`[AI] Ollama host: ${config.ollamaHost}`);
@@ -31,7 +30,6 @@ class AIService {
       console.log(`[AI] Kimi agent mode ENABLED (${config.kimiBaseUrl}, model: ${config.kimiModel})`);
     }
 
-    // Log data source availability at startup (priority order)
     console.log(`[AI] Price sources (priority order): AInvest=${config.ainvestApiKey ? 'YES' : 'NO'}, FMP=${config.fmpApiKey ? 'YES' : 'NO'}, Alpaca=${config.alpacaApiKey ? 'YES' : 'NO'}, yahoo-finance2=${priceFetcher.isAvailable() ? 'YES' : 'NO'}`);
     console.log(`[AI] Search sources (priority order): AInvest=${config.ainvestApiKey ? 'YES' : 'NO'}, SearXNG=${config.searxngUrl || 'fallbacks only'}, DuckDuckGo=YES, AlpacaNews=${config.alpacaApiKey ? 'YES' : 'NO'}`);
 
@@ -71,12 +69,6 @@ class AIService {
     return this.model;
   }
 
-  /**
-   * Kimi K2.5 agent mode — calls Moonshot API directly with built-in $web_search tool.
-   * The model autonomously decides when to search the web for current information.
-   * Implements the tool call loop: when the model requests a search, we return the
-   * arguments as-is (Moonshot handles the actual search server-side) and re-submit.
-   */
   async _kimiAgentChat(messages) {
     const url = `${config.kimiBaseUrl}/chat/completions`;
     const headers = {
@@ -118,34 +110,36 @@ class AIService {
       const message = choice.message;
 
       if (finishReason === 'tool_calls' && message.tool_calls) {
-        // Model wants to use a tool — add its message and process each call
         conversationMessages.push(message);
 
-        for (const toolCall of message.tool_calls) {
-          const name = toolCall.function.name;
-          const args = toolCall.function.arguments;
+        if (message.tool_calls) {
+          if (!Array.isArray(message.tool_calls)) {
+            throw new Error('_kimiAgentChat: message.tool_calls is not an array');
+          }
+          for (const toolCall of message.tool_calls) {
+            const name = toolCall.function.name;
+            const args = toolCall.function.arguments;
 
-          let toolResult;
-          if (name === '$web_search') {
-            // Built-in search: return arguments as-is; Moonshot executes the search server-side
-            toolResult = args;
-          } else {
-            toolResult = JSON.stringify({ error: `Unknown tool: ${name}` });
+            let toolResult;
+            if (name === '$web_search') {
+              toolResult = args;
+            } else {
+              toolResult = JSON.stringify({ error: `Unknown tool: ${name}` });
+            }
+
+            conversationMessages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              name,
+              content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
+            });
           }
 
-          conversationMessages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name,
-            content: typeof toolResult === 'string' ? toolResult : JSON.stringify(toolResult),
-          });
+          console.log(`[AI] Kimi agent: tool call iteration ${i + 1} (${message.tool_calls.length} tools invoked)`);
+          continue;
         }
-
-        console.log(`[AI] Kimi agent: tool call iteration ${i + 1} (${message.tool_calls.length} tools invoked)`);
-        continue;
       }
 
-      // Final answer
       return message.content || '';
     }
 
@@ -180,14 +174,9 @@ ${selfAwareness.buildSelfKnowledge()}
 `.trim();
   }
 
-  /**
-   * Detect whether a message likely needs a live web search to answer well.
-   * Uses simple keyword heuristics — not perfect, but catches most real-time questions.
-   */
   _needsWebSearch(message) {
     const lower = message.toLowerCase();
 
-    // Current events / real-time triggers
     const realtimePatterns = [
       /\bwho(?:'s| is| are)\b.*\b(?:playing|winning|leading|fighting|competing|running)\b/,
       /\b(?:super\s?bowl|world\s?series|world\s?cup|olympics|nba finals|stanley cup|march madness)\b/,
@@ -200,19 +189,16 @@ ${selfAwareness.buildSelfKnowledge()}
       /\b(?:who won|who lost|who died|who got)\b/,
       /\b(?:when (?:is|does|did|will))\b/,
       /\b(?:is .{3,} (?:open|closed|canceled|cancelled|delayed|postponed))\b/,
-      // Year references that need current data
       /\b202[5-9]\b/,
       /\b(?:this year|next year|last year|this quarter|next quarter|last quarter)\b/,
-      /\b(?:q[1-4]\s*20)\b/i,
-      // Market / finance current events
+      /\bq[1-4]\s*20/i,
+      /\b(?:market|stock|crypto)\b.*\b(?:crash|rally|surge|dump|moon|tank)\b/,
       /\b(?:earnings|ipo|fed meeting|fomc|cpi|jobs report|nonfarm|gdp report)\b/,
       /\b(?:interest rate|rate cut|rate hike|inflation)\b.*\b(?:now|current|latest|today)\b/,
       /\b(?:market|stock|crypto)\b.*\b(?:crash|rally|surge|dump|moon|tank)\b/,
-      // Specific lookups
       /\b(?:what is|tell me about|who is|explain)\b.*\b[A-Z]{2,5}\b/,
     ];
 
-    // Question patterns that suggest "look this up"
     const questionPatterns = [
       /\bwhat(?:'s| is| are| was| were)\b.*\b(?:price|cost|worth|salary|net worth|market cap)\b/,
       /\bhow (?:much|many|old|tall|far|long)\b/,
@@ -235,17 +221,12 @@ ${selfAwareness.buildSelfKnowledge()}
     return false;
   }
 
-  /**
-   * Build a concise search query from a user message.
-   */
   _buildSearchQuery(message) {
-    // Strip common filler and just keep the substance
     let q = message
       .replace(/^(hey|hi|yo|ok|okay|so|well|um|hmm|please|can you|could you|do you know|tell me|what's|who's)\s+/i, '')
       .replace(/[?!.]+$/, '')
       .trim();
 
-    // If still too long, truncate to first ~80 chars
     if (q.length > 80) {
       q = q.slice(0, 80).replace(/\s\S*$/, '');
     }
@@ -253,13 +234,7 @@ ${selfAwareness.buildSelfKnowledge()}
     return q || message.slice(0, 80);
   }
 
-  /**
-   * Extract potential stock/crypto tickers from a message.
-   * Returns uppercase symbols like ['TSLA', 'AAPL', 'BTC'].
-   * Also resolves common market names like "dow", "nasdaq", "s&p" to tickers.
-   */
   _extractTickers(message) {
-    // Common market names → actual tickers (case-insensitive lookup)
     const MARKET_ALIASES = {
       'dow': 'DIA', 'djia': 'DIA', 'dow jones': 'DIA',
       'nasdaq': 'QQQ', 'naz': 'QQQ', 'nazzy': 'QQQ',
@@ -272,11 +247,9 @@ ${selfAwareness.buildSelfKnowledge()}
       'gold': 'GLD', 'oil': 'USO', 'bonds': 'TLT', 'treasuries': 'TLT',
     };
 
-    // Check for common market names (case-insensitive) in the message
     const lower = message.toLowerCase();
     const aliasTickers = [];
     for (const [alias, ticker] of Object.entries(MARKET_ALIASES)) {
-      // Use word boundary matching for short aliases, substring for multi-word
       const pattern = alias.includes(' ')
         ? alias
         : new RegExp(`\\b${alias.replace(/[&]/g, '\\$&')}\\b`);
@@ -285,7 +258,6 @@ ${selfAwareness.buildSelfKnowledge()}
       }
     }
 
-    // Match $TICKER format or standalone uppercase 1-5 char words
     const dollarTickers = (message.match(/\$([A-Za-z]{1,5})\b/g) || [])
       .map(t => t.slice(1).toUpperCase());
     const upperWords = (message.match(/\b[A-Z]{1,5}\b/g) || []);
@@ -310,7 +282,6 @@ ${selfAwareness.buildSelfKnowledge()}
 
     memory.recordInteraction(userId, username, userMessage);
 
-    // ── Pre-fetch: Auto-fetch prices for any tickers mentioned ──
     let livePrices = null;
     const tickers = this._extractTickers(userMessage);
     if (tickers.length > 0) {
@@ -334,9 +305,6 @@ ${selfAwareness.buildSelfKnowledge()}
       }
     }
 
-    // ── Auto-search for real-time questions ──
-    // Skip when Kimi agent mode handles search natively.
-    // Also search when tickers were found but prices failed (belt-and-suspenders).
     let searchResults = null;
     const needsSearch = this._needsWebSearch(userMessage);
     const pricesFailed = tickers.length > 0 && !livePrices;
@@ -358,7 +326,6 @@ ${selfAwareness.buildSelfKnowledge()}
       }
     }
 
-    // Track all live data provided to the model (for hallucination cross-reference)
     const liveDataContext = { livePrices, liveData, searchResults };
 
     const systemPrompt = this.buildSystemPrompt({ liveData, searchResults, livePrices });
@@ -374,8 +341,6 @@ ${selfAwareness.buildSelfKnowledge()}
     }
     const history = this.conversationHistory.get(userId);
 
-    // Prepend date anchor to the user message so the model sees
-    // the current date at the message level, not just system prompt
     let fullMessage = `${userMessageDateAnchor()} ${userMessage}`;
     if (imageDescription) {
       fullMessage = `${userMessageDateAnchor()} [Image in message: ${imageDescription}]\n${userMessage}`;
@@ -392,13 +357,11 @@ ${selfAwareness.buildSelfKnowledge()}
       ...history,
     ];
 
-    // ── Kimi agent mode path (Moonshot API with built-in web search) ──
     if (this.kimiEnabled) {
       try {
         const assistantMessage = await this._kimiAgentChat(chatMessages);
         if (!assistantMessage || !assistantMessage.trim()) {
           console.warn('[AI] Kimi returned empty response, falling back to Ollama');
-          // Fall through to Ollama
         } else {
           const cleaned = this._cleanResponse(assistantMessage);
           if (cleaned) {
@@ -409,21 +372,17 @@ ${selfAwareness.buildSelfKnowledge()}
       } catch (err) {
         console.error(`[AI] Kimi agent error: ${err.message}`);
         console.log('[AI] Falling back to Ollama...');
-        // Fall through to Ollama
       }
     }
 
-    // ── Standard Ollama path ──
     try {
       let assistantMessage = await this._ollamaChat(chatMessages);
 
-      // Clean thinking tags and validate
       const cleaned = this._cleanResponse(assistantMessage);
       if (cleaned) {
         return this._finalizeResponse(cleaned, history, liveDataContext);
       }
 
-      // Ollama returned empty — try non-streaming as fallback
       console.warn(`[AI] Ollama streaming returned empty (model: ${this.model}), trying non-streaming...`);
       try {
         const result = await this.ollama.chat({
@@ -440,7 +399,6 @@ ${selfAwareness.buildSelfKnowledge()}
         console.warn(`[AI] Non-streaming retry also failed: ${retryErr.message}`);
       }
 
-      // Last resort: try Kimi even if not the primary model
       if (!this.kimiEnabled && config.kimiApiKey) {
         console.warn('[AI] Ollama empty — attempting Kimi API as last resort...');
         try {
@@ -454,7 +412,6 @@ ${selfAwareness.buildSelfKnowledge()}
         }
       }
 
-      // Everything failed
       console.error(`[AI] ALL LLM backends returned empty (model: ${this.model}, host: ${config.ollamaHost}, kimi: ${config.kimiApiKey ? 'configured' : 'not set'})`);
       return `My AI brain isn't responding right now (model: ${this.model}). Try again in a moment, or check if the AI server is running.`;
     } catch (err) {
@@ -471,36 +428,23 @@ ${selfAwareness.buildSelfKnowledge()}
     }
   }
 
-  /**
-   * Finalize a response: scan for hallucinations, append warning if needed, truncate.
-   * All chat return paths should go through this.
-   * @param {string} cleaned — The cleaned LLM response
-   * @param {Array} history — Conversation history to push to
-   * @param {object} [liveDataContext] — The live data provided to the model (for cross-reference)
-   * @returns {string} — The final response to send to the user
-   */
   _finalizeResponse(cleaned, history, liveDataContext = {}) {
-    // Scan for hallucinations
     const scan = detectHallucinations(cleaned, liveDataContext);
     let final = cleaned;
 
     if (scan.flagged) {
       console.warn(`[AI] Hallucination detector flagged response (confidence: ${scan.confidence}%): ${scan.warnings.join('; ')}`);
 
-      // Only append warning to user-facing response if confidence is high enough
       if (scan.confidence >= 50) {
         const warning = buildHallucinationWarning(scan.warnings);
         final = cleaned + warning;
       }
     }
 
-    history.push({ role: 'assistant', content: cleaned }); // Store clean version in history
+    history.push({ role: 'assistant', content: cleaned });
     return final.length > 1990 ? final.slice(0, 1990) + '...' : final;
   }
 
-  /**
-   * Stream a chat response from Ollama, returning the raw text.
-   */
   async _ollamaChat(messages) {
     const stream = await this.ollama.chat({
       model: this.model,
@@ -520,27 +464,19 @@ ${selfAwareness.buildSelfKnowledge()}
     return result;
   }
 
-  /**
-   * Clean an LLM response: strip thinking tags, trim, validate non-empty.
-   * Returns the cleaned string or null if empty.
-   */
   _cleanResponse(text) {
     if (!text) return null;
 
-    // Strip thinking tags from models that use them (qwen3, deepseek, etc.)
     let cleaned = text
       .replace(/ Think[\s\S]*?<\/think>/gi, '')
       .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
       .trim();
 
-    // If stripping removed everything, try to salvage the thinking content
     if (!cleaned && text.trim()) {
       const thinkMatch = text.match(/ Think([\s\S]*?)<\/think>/i)
         || text.match(/<\|think\|>([\s\S]*?)<\|\/think\|>/i);
       if (thinkMatch) {
-        // The model only produced thinking — use the last sentence as a response
         const thoughts = thinkMatch[1].trim();
-        // Extract the last meaningful line as the "answer"
         const lines = thoughts.split('\n').filter(l => l.trim().length > 5);
         if (lines.length > 0) {
           cleaned = lines[lines.length - 1].trim();
@@ -548,7 +484,6 @@ ${selfAwareness.buildSelfKnowledge()}
         }
       }
 
-      // If still empty, just use the raw text (better than nothing)
       if (!cleaned) {
         cleaned = text.replace(/<\/?think>/gi, '').replace(/<\|\/?think\|>/gi, '').trim();
       }
@@ -560,14 +495,11 @@ ${selfAwareness.buildSelfKnowledge()}
   async complete(prompt) {
     const startTime = Date.now();
 
-    // Always include RAG enforcement for completions — prevents hallucination in
-    // autonomous posts, commentary, and other non-chat paths
     const systemMsg = {
       role: 'system',
       content: `${ragEnforcementBlock()}\n\n${selfAwareness.buildCompactSelfKnowledge()}\n\nYou are analyzing data provided in the user prompt. All prices, metrics, and market conditions in the prompt are current as of today (${todayString()}). Use ONLY the data given. Do NOT fill in gaps from training memory for any post-${MODEL_CUTOFF} facts.`,
     };
 
-    // Try Kimi agent mode first if enabled
     if (this.kimiEnabled) {
       try {
         const result = await this._kimiAgentChat([systemMsg, { role: 'user', content: prompt }]);
