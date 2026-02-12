@@ -14,7 +14,14 @@ process.on('unhandledRejection', (reason) => {
 // holds the lock (during Railway deploys), this process exits gracefully.
 const { acquireLock } = require('./src/runtime/singleton-lock');
 const { initRedisStorage } = require('./src/services/storage');
-const { initS3Backup } = require('./src/services/s3-backup');
+
+// S3 backup — loaded defensively so a missing SDK never blocks startup
+let s3Backup = null;
+try {
+  s3Backup = require('./src/services/s3-backup');
+} catch (err) {
+  console.warn('[Bot] S3 backup module failed to load (non-critical):', err.message);
+}
 
 // ── Start health server IMMEDIATELY ─────────────────────────────────
 // Railway's healthcheck begins as soon as the container launches.
@@ -302,7 +309,7 @@ acquireLock().then(() => {
   return initRedisStorage();
 }).then(() => {
   // Start S3 backups after Redis is ready (non-blocking)
-  initS3Backup();
+  if (s3Backup) s3Backup.initS3Backup();
 }).then(() => {
   client.login(config.token).catch((err) => {
     log.error('Discord login failed:', err.message);

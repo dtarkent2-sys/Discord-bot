@@ -6,7 +6,14 @@ const ai = require('../services/ai');
 const auditLog = require('../services/audit-log');
 const circuitBreaker = require('../services/circuit-breaker');
 const mood = require('../services/mood');
-const s3Backup = require('../services/s3-backup');
+
+// S3 backup — loaded defensively (missing SDK should never break the dashboard)
+let s3Backup = null;
+try {
+  s3Backup = require('../services/s3-backup');
+} catch {
+  s3Backup = { getStatus: () => ({ enabled: false }), listBackups: async () => [] };
+}
 
 // Discord client ref — set after client is ready via setDiscordClient()
 let discordClient = null;
