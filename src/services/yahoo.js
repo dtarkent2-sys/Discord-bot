@@ -34,10 +34,13 @@ class MarketDataClient {
   /**
    * Sanitize a user-provided ticker to prevent log injection and invalid lookups.
    * Strips anything that isn't alphanumeric, dash, or dot (e.g. BRK.B, BTC-USD).
+   * Rejects tickers prefixed with $ or / to prevent command injection.
    * Returns null if the result is empty or too long.
    */
   sanitizeTicker(ticker) {
     if (!ticker || typeof ticker !== 'string') return null;
+    // Reject tickers starting with non-alphanumeric chars (e.g. $AAPL, /AAPL)
+    if (/^[^A-Za-z0-9]+/.test(ticker.trim())) return null;
     const cleaned = ticker.replace(/[^A-Za-z0-9.\-]/g, '').trim();
     if (!cleaned || cleaned.length > 12) return null;
     return cleaned.toUpperCase();

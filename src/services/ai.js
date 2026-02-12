@@ -153,8 +153,16 @@ class AIService {
   }
 
   buildSystemPrompt(options = {}) {
-    const { liveData, searchResults, livePrices } = options;
+    const { liveData, searchResults } = options;
     const now = nowEST();
+
+    const livePricesSection = livePrices ? `\nLIVE PRICES (real-time via Yahoo Finance, fetched just now):\n${livePrices}\n` : '';
+    const liveDataSection = liveData ? `\nLIVE MARKET DATA (current as of ${now}):\n${liveData}\n` : '';
+    const searchResultsSection = searchResults ? `\nWEB SEARCH RESULTS (fetched ${now} — use as source of truth):\n${searchResults}\n` : '';
+
+    const kimiSearchNote = this.kimiEnabled 
+      ? `\nYou have access to web search. For ANY question about prices, events, news, or data after ${MODEL_CUTOFF}, you MUST use your web search tool BEFORE reasoning or answering. Always search first for recency-sensitive questions.\n` 
+      : '';
 
     return `
 You are ${persona.name}, running LIVE on a Discord server in ${new Date().getFullYear()}. Current time: ${now}.
@@ -170,10 +178,10 @@ You can talk about ANYTHING — stocks, crypto, sports, games, life, memes, what
 Keep it short. Most responses should be 1-3 sentences. Only go longer when someone actually asks for a detailed breakdown. Think Discord messages, not emails.
 
 NEVER say things like "As an AI" or "I don't have personal opinions" — you DO have opinions and you're not afraid to share them. You're ${persona.name}, not a chatbot disclaimer.
-${this.kimiEnabled ? `\nYou have access to web search. For ANY question about prices, events, news, or data after ${MODEL_CUTOFF}, you MUST use your web search tool BEFORE reasoning or answering. Always search first for recency-sensitive questions.\n` : ''}
-${livePrices ? `\nLIVE PRICES (real-time via Yahoo Finance, fetched just now):\n${livePrices}\n` : ''}
-${liveData ? `\nLIVE MARKET DATA (current as of ${now}):\n${liveData}\n` : ''}
-${searchResults ? `\nWEB SEARCH RESULTS (fetched ${now} — use as source of truth):\n${searchResults}\n` : ''}
+${kimiSearchNote}
+${livePricesSection}
+${liveDataSection}
+${searchResultsSection}
 ${mood.buildMoodContext()}
 
 ${selfAwareness.buildSelfKnowledge()}
@@ -203,7 +211,7 @@ ${selfAwareness.buildSelfKnowledge()}
       // Year references that need current data
       /\b202[5-9]\b/,
       /\b(?:this year|next year|last year|this quarter|next quarter|last quarter)\b/,
-      /\b(?:q[1-4]\s*20)\b/i,
+      /\bq[1-4]\s*20\b/i,
       // Market / finance current events
       /\b(?:earnings|ipo|fed meeting|fomc|cpi|jobs report|nonfarm|gdp report)\b/,
       /\b(?:interest rate|rate cut|rate hike|inflation)\b.*\b(?:now|current|latest|today)\b/,
@@ -529,13 +537,13 @@ ${selfAwareness.buildSelfKnowledge()}
 
     // Strip thinking tags from models that use them (qwen3, deepseek, etc.)
     let cleaned = text
-      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/ Think[\s\S]*?<\/think>/gi, '')
       .replace(/<\|think\|>[\s\S]*?<\|\/think\|>/gi, '')
       .trim();
 
     // If stripping removed everything, try to salvage the thinking content
     if (!cleaned && text.trim()) {
-      const thinkMatch = text.match(/<think>([\s\S]*?)<\/think>/i)
+      const thinkMatch = text.match(/ Think([\s\S]*?)<\/think>/i)
         || text.match(/<\|think\|>([\s\S]*?)<\|\/think\|>/i);
       if (thinkMatch) {
         // The model only produced thinking — use the last sentence as a response
@@ -544,7 +552,7 @@ ${selfAwareness.buildSelfKnowledge()}
         const lines = thoughts.split('\n').filter(l => l.trim().length > 5);
         if (lines.length > 0) {
           cleaned = lines[lines.length - 1].trim();
-          console.warn(`[AI] Response was only <think> tags — salvaged: "${cleaned.slice(0, 80)}"`);
+          console.warn(`[AI] Response was only  Think tags — salvaged: "${cleaned.slice(0, 80)}"`);
         }
       }
 

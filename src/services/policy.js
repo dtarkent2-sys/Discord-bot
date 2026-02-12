@@ -22,6 +22,28 @@ const Storage = require('./storage');
 // Config version — increment when defaults change to trigger migration
 const CONFIG_VERSION = 2;
 
+// Dangerous mode — aggressive trading overrides
+const DANGEROUS_CONFIG = {
+  max_positions: 10,
+  max_notional_per_trade: 10000,      // $10,000
+  max_daily_loss_pct: 0.05,            // 5%
+  stop_loss_pct: 0.08,                 // 8% (wider — let trades breathe)
+  take_profit_pct: 0.15,               // 15% (bigger targets)
+  cooldown_minutes: 5,                 // 5 min (rapid re-entry)
+  min_sentiment_score: 0.1,            // accept weaker sentiment signals
+  min_analyst_confidence: 0.4,         // accept lower AI confidence
+  allow_shorting: true,
+  crypto_enabled: true,
+  position_size_pct: 0.40,             // 40% of cash per trade
+  scan_interval_minutes: 2,            // scan every 2 min
+  options_max_premium_per_trade: 1000, // $1,000
+  options_max_daily_loss: 2500,        // $2,500
+  options_max_positions: 5,
+  options_min_conviction: 3,           // lower bar
+  options_cooldown_minutes: 2,         // rapid re-entry
+  options_max_spread_pct: 0.15,        // accept wider spreads
+};
+
 // Default configuration — tunable via /agent set or runtime
 const DEFAULT_CONFIG = {
   max_positions: 5,
@@ -96,6 +118,8 @@ class PolicyEngine {
     }
 
     this.killSwitch = false;
+    this.dangerousMode = false;
+    this._savedConfig = null;  // stash normal config when dangerous mode is active
     this.dailyPnL = 0;
     this.dailyStartEquity = 0;
     this.lastResetDate = '';
@@ -108,7 +132,7 @@ class PolicyEngine {
   // ── Configuration ─────────────────────────────────────────────────
 
   getConfig() {
-    return { ...this.config, killSwitch: this.killSwitch };
+    return { ...this.config, killSwitch: this.killSwitch, dangerousMode: this.dangerousMode };
   }
 
   getDefaultConfig() {
@@ -182,8 +206,43 @@ class PolicyEngine {
 
   resetConfig() {
     this.config = { ...DEFAULT_CONFIG };
+    this.dangerousMode = false;
+    this._savedConfig = null;
     this._persist();
     console.log('[Policy] Config reset to defaults');
+  }
+
+  // ── Dangerous Mode ─────────────────────────────────────────────────
+
+  enableDangerousMode() {
+    if (this.dangerousMode) return { changed: false, message: 'Dangerous mode is already active.' };
+    // Stash current config so we can restore it later
+    this._savedConfig = { ...this.config };
+    // Apply aggressive overrides on top of current config
+    for (const [key, value] of Object.entries(DANGEROUS_CONFIG)) {
+      if (key in this.config) {
+        this.config[key] = value;
+      }
+    }
+    this.dangerousMode = true;
+    this._persist();
+    console.log('[Policy] DANGEROUS MODE ENABLED — aggressive trading parameters active');
+    return { changed: true };
+  }
+
+  disableDangerousMode() {
+    if (!this.dangerousMode) return { changed: false, message: 'Dangerous mode is not active.' };
+    // Restore the stashed config
+    if (this._savedConfig) {
+      this.config = { ...this._savedConfig };
+      this._savedConfig = null;
+    } else {
+      this.config = { ...DEFAULT_CONFIG };
+    }
+    this.dangerousMode = false;
+    this._persist();
+    console.log('[Policy] Dangerous mode DISABLED — restored previous config');
+    return { changed: true };
   }
 
   _persist() {

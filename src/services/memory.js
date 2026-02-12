@@ -46,6 +46,12 @@ const TOPIC_KEYWORDS = {
   risk: /\b(stop loss|risk|position size|hedge|protect|downside|max loss)\b/i,
 };
 
+// Precompile REGEX objects once at module load (performance improvement)
+const COMPILED_TOPIC_KEYWORDS = {};
+for (const [topic, regex] of Object.entries(TOPIC_KEYWORDS)) {
+  COMPILED_TOPIC_KEYWORDS[topic] = new RegExp(regex.source, regex.flags);
+}
+
 class MemoryService {
   constructor() {
     this.store = new Storage('memory.json');
@@ -239,8 +245,8 @@ class MemoryService {
 
   _extractTopics(message) {
     const topics = [];
-    for (const [topic, regex] of Object.entries(TOPIC_KEYWORDS)) {
-      if (regex.test(message)) {
+    for (const [topic, compiledRegex] of Object.entries(COMPILED_TOPIC_KEYWORDS)) {
+      if (compiledRegex.test(message)) {
         topics.push(topic);
       }
     }

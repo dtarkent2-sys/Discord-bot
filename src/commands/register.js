@@ -242,6 +242,7 @@ const commands = [
           { name: 'config — view current settings', value: 'config' },
           { name: 'set — change a config value', value: 'set' },
           { name: 'reset — restore default settings', value: 'reset' },
+          { name: 'dangerous — toggle aggressive trading mode', value: 'dangerous' },
           { name: 'trade — manually trigger a trade', value: 'trade' },
           { name: 'logs', value: 'logs' },
           { name: 'kill', value: 'kill' },

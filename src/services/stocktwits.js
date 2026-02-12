@@ -1,16 +1,3 @@
-/**
- * StockTwits Social Sentiment Provider
- *
- * Ported from SHARK (https://github.com/ygwyg/SHARK)
- * Fetches trending tickers and social sentiment from StockTwits.
- * No API key required — uses the free public API.
- *
- * Key data:
- *   - Trending symbols (what retail is watching)
- *   - Per-ticker message streams with bullish/bearish tags
- *   - Aggregated sentiment score (-1 to +1)
- */
-
 const STOCKTWITS_BASE = 'https://api.stocktwits.com/api/2';
 
 class StockTwitsService {

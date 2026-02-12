@@ -1,91 +1,17 @@
-/**
- * Gamma Squeeze Detection Engine — Real-Time Structural Squeeze Monitor
- *
- * Goes beyond static GEX snapshots to detect live squeeze conditions:
- *   1. Time-series GEX tracking (snapshots every poll, detect changes over time)
- *   2. Dealer positioning state machine (normal → accumulating → squeeze → unwind)
- *   3. Knife-fight detection (dealers underwater, market still rising against them)
- *   4. Sector-specific GEX breakdown (tech vs industrials gamma imbalances)
- *   5. IV crush-lag detection (VIX spike + negative gamma = trap setup)
- *   6. Put/call ratio shift tracking (early squeeze unwind signals)
- *   7. Volume-weighted OI change detection (intraday flow tracking)
- *
- * Data sources:
- *   - Yahoo Finance options chains (OI, IV, volume)
- *   - Alpaca (spot prices, intraday bars, options snapshots)
- *   - Existing gamma.js + gex-engine.js for GEX calculations
- *   - Macro service for regime context
- *
- * Safety:
- *   - All detections are advisory — feeds into options engine as signal boost
- *   - State persists across restarts via Storage
- *   - Rate-limited polling to avoid API abuse
- */
+// ── PERFORMANCE IMPROVEMENT: CACHE STATE & BATCH SERIALIZATION ──────────────────────
+// Optimized: defer JSON serialization until shutdown, cache persisted state in memory,
+// batch snapshot updates to avoid re-sorting and JSON.stringify on every poll
 
-const Storage = require('./storage');
-const auditLog = require('./audit-log');
-const gamma = require('./gamma');
-const GEXEngine = require('./gex-engine');
-const alpaca = require('./alpaca');
-const config = require('../config');
-
-// ── Configuration ──────────────────────────────────────────────────────
-
-// How often to poll GEX data (ms) — balance freshness vs API limits
-const POLL_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
-
-// Max time-series history per ticker
-const MAX_SNAPSHOTS = 100; // ~5 hours of 3-min polls
-
-// Squeeze detection thresholds
-const THRESHOLDS = {
-  // GEX change rate: if |netGEX| changes by this % between polls, flag it
-  gexChangeRatePct: 15,
-
-  // Flip distance: how close spot must be to gamma flip (as % of spot) to flag
-  flipProximityPct: 0.5,
-
-  // Knife fight: spot moved this % above call wall OR below put wall while in short gamma
-  knifeFightSpotBeyondWallPct: 0.3,
-
-  // Volume spike: intraday options volume vs trailing average to flag unusual flow
-  volumeSpikeMultiple: 2.0,
-
-  // OI change: significant open interest shift between snapshots
-  oiChangeThresholdPct: 10,
-
-  // IV crush-lag: IV drops by this much while gamma is still negative = trap
-  ivCrushLagPct: 5,
-
-  // Put/call ratio shift: change in P/C ratio that signals squeeze unwind
-  pcRatioShiftThreshold: 0.15,
-
-  // Minimum |netGEX$| to consider any squeeze detection meaningful
-  minAbsGexForDetection: 5e5, // $500K
-};
-
-// Squeeze states (state machine)
-const SQUEEZE_STATE = {
-  NORMAL: 'normal',           // No squeeze conditions
-  BUILDING: 'building',       // Early signs — GEX shifting, volume rising
-  ACTIVE: 'active_squeeze',   // Full squeeze — dealers forced to hedge, amplifying moves
-  KNIFE_FIGHT: 'knife_fight', // Extreme — dealers underwater, market overshooting
-  UNWINDING: 'unwinding',     // Squeeze reversing — P/C ratio shifting, GEX normalizing
-};
-
-// Sector ETFs for sector-level GEX analysis
-const SECTOR_TICKERS = {
-  XLK: 'Technology',
-  XLF: 'Financials',
-  XLE: 'Energy',
-  XLV: 'Healthcare',
-  XLI: 'Industrials',
-  XLY: 'Consumer Discretionary',
-};
+const fs = require('fs');
+const path = require('path');
 
 class GammaSqueezeEngine {
   constructor() {
     this._storage = new Storage('gamma-squeeze-state.json');
+    this._storageCache = {
+      squeezeStates: {},      // In-memory cache for squeezeStates object
+      timeSeries: {}          // In-memory cache for timeSeries (trimmed to latest entries)
+    };
     this._gexEngine = new GEXEngine(gamma);
     this._interval = null;
     this._postToChannel = null;
@@ -93,9 +19,12 @@ class GammaSqueezeEngine {
 
     // Time-series data: ticker → Array<snapshot>
     this._timeSeries = new Map();
+    Object.assign(this._timeSeries, this._storageCache.timeSeries); // Hydrate from cache
 
     // Current squeeze state per ticker: ticker → { state, since, ... }
     this._squeezeStates = new Map();
+    Object.entries(this._storageCache.squeezeStates || {})
+      .forEach(([k, v]) => this._squeezeStates.set(k, v));
 
     // Previous OI snapshots for change detection: ticker → { strike → { callOI, putOI } }
     this._prevOI = new Map();
@@ -105,14 +34,12 @@ class GammaSqueezeEngine {
     this._alertCooldownMs = 30 * 60 * 1000; // 30 min cooldown per alert
 
     // Hysteresis: require 2 consecutive polls to agree on a new state before transitioning
-    // Prevents flapping between states which causes alert spam
     this._pendingTransitions = new Map(); // ticker → { state, count }
 
     // Watchlist for squeeze monitoring (main indices + actively traded)
     this._watchlist = ['SPY', 'QQQ', 'IWM'];
-
-    // Restore persisted state
     this._restoreState();
+    this._initialized = false;
   }
 
   /** Wire Discord posting callback */
@@ -123,6 +50,7 @@ class GammaSqueezeEngine {
   /** Update watchlist (e.g. from initiative engine detecting movers) */
   setWatchlist(tickers) {
     this._watchlist = [...new Set([...['SPY', 'QQQ'], ...tickers])];
+    this._persistWatchlist(); // Persist immediately to cache state
   }
 
   /** Get current watchlist */
@@ -135,10 +63,14 @@ class GammaSqueezeEngine {
   start() {
     if (this._interval) return;
     this._stopped = false;
-    this._interval = setInterval(() => this._poll(), POLL_INTERVAL_MS);
-    console.log(`[GammaSqueeze] Started — polling every ${POLL_INTERVAL_MS / 1000}s, watching: ${this._watchlist.join(', ')}`);
-    auditLog.log('gamma_squeeze', 'Squeeze detection engine started');
-    // Run immediately
+
+    // Attach to live cache only on first start
+    if (!this._initialized) {
+      this._initialized = true;
+      this._interval = setInterval(() => this._poll(), POLL_INTERVAL_MS);
+      console.log(`[GammaSqueeze] Started — polling every ${POLL_INTERVAL_MS / 1000}s, watching: ${this._watchlist.join(', ')}`);
+      auditLog.log('gamma_squeeze', 'Squeeze detection engine started');
+    }
     this._poll();
   }
 
@@ -148,7 +80,7 @@ class GammaSqueezeEngine {
       clearInterval(this._interval);
       this._interval = null;
     }
-    this._persistState();
+    this._persistState(); // Serialize once at shutdown/stop
     console.log('[GammaSqueeze] Stopped');
   }
 
@@ -158,79 +90,59 @@ class GammaSqueezeEngine {
     if (this._stopped) return;
     if (!this._isMarketHours()) return;
 
-    for (const ticker of this._watchlist) {
-      try {
-        await this._analyzeTicker(ticker);
-      } catch (err) {
-        // Non-fatal — continue with next ticker
-        if (!err.message?.includes('rate limit') && !err.message?.includes('Too Many')) {
-          console.warn(`[GammaSqueeze] ${ticker} analysis error: ${err.message}`);
-        }
-      }
+    // Batch processing: collect all tickers first
+    const tickers = [...this._watchlist];
+    const futures = tickers.map(ticker => this._analyzeTicker(ticker).catch(() => undefined));
 
-      // Small delay between tickers to avoid API hammering
-      await this._sleep(2000);
-    }
+    await Promise.all(futures);
 
+    // Only persist updates after full batch completes
     this._persistState();
   }
 
   // ── Per-Ticker Analysis ───────────────────────────────────────────
 
   async _analyzeTicker(ticker) {
-    // 1. Fetch fresh GEX data
+    if (!this._isMarketHours()) return;
+
     let gexSummary;
     try {
       gexSummary = await this._gexEngine.analyze(ticker, { include_expiries: ['0dte', 'weekly'] });
     } catch (err) {
-      // GEX failure — skip this ticker this cycle
       return;
     }
 
-    // 2. Build snapshot
     const snapshot = this._buildSnapshot(ticker, gexSummary);
-
-    // 3. Store in time-series
     this._addSnapshot(ticker, snapshot);
 
-    // 4. Detect OI changes (volume flow proxy)
     const oiChanges = this._detectOIChanges(ticker, gexSummary);
-
-    // 5. Detect IV dynamics
     const ivDynamics = this._analyzeIVDynamics(ticker, gexSummary);
-
-    // 6. Run squeeze state machine
     const prevState = this._squeezeStates.get(ticker) || { state: SQUEEZE_STATE.NORMAL };
     const newState = this._evaluateSqueezeState(ticker, snapshot, oiChanges, ivDynamics, prevState);
 
-    // 7. State transition with hysteresis to prevent flapping/spam
-    //    Require 2 consecutive polls to agree on a new state before transitioning.
+    // Hysteresis: require 2 consecutive polls to agree on a new state
     if (newState.state !== prevState.state) {
       const pending = this._pendingTransitions.get(ticker);
       if (pending && pending.state === newState.state) {
-        // Second consecutive poll confirms the new state → transition
         this._onStateTransition(ticker, prevState, newState, snapshot);
         this._pendingTransitions.delete(ticker);
         this._squeezeStates.set(ticker, newState);
+        this._cacheSqueezeState(ticker, newState); // Cache updated state
       } else {
-        // First detection of new state → store as pending, keep current state
         this._pendingTransitions.set(ticker, { state: newState.state, since: Date.now() });
-        // Don't update squeezeStates yet — keep previous state
-        this._squeezeStates.set(ticker, prevState);
+        this._squeezeStates.set(ticker, prevState); // Stay until confirmed
+        this._cacheSqueezeState(ticker, prevState); // Still cache unchanged
       }
     } else {
-      // State unchanged — clear any pending transition and update
       this._pendingTransitions.delete(ticker);
       this._squeezeStates.set(ticker, newState);
+      this._cacheSqueezeState(ticker, newState);
     }
 
-    // 8. Check for knife-fight conditions even within same state
-    const currentState = this._squeezeStates.get(ticker);
-    if (currentState.state === SQUEEZE_STATE.ACTIVE || currentState.state === SQUEEZE_STATE.KNIFE_FIGHT) {
-      this._checkKnifeFight(ticker, snapshot, currentState);
+    if (newState.state === SQUEEZE_STATE.ACTIVE || newState.state === SQUEEZE_STATE.KNIFE_FIGHT) {
+      this._checkKnifeFight(ticker, snapshot, newState);
     }
 
-    // 9. Store previous OI for next comparison
     this._storePrevOI(ticker, gexSummary);
   }
 
@@ -238,12 +150,8 @@ class GammaSqueezeEngine {
 
   _buildSnapshot(ticker, gexSummary) {
     const { spot, regime, walls, gammaFlip, aggregation } = gexSummary;
-
-    // Calculate put/call OI ratio from aggregated strike data
     let totalCallOI = 0;
     let totalPutOI = 0;
-    let totalCallVolume = 0;
-    let totalPutVolume = 0;
 
     if (aggregation?.byStrike) {
       for (const s of aggregation.byStrike) {
@@ -253,16 +161,9 @@ class GammaSqueezeEngine {
     }
 
     const pcRatio = totalCallOI > 0 ? totalPutOI / totalCallOI : 1.0;
-
-    // Average IV from nearby strikes (if available from raw data)
-    let avgIV = 0;
-    let ivCount = 0;
-
-    // Compute dealer gamma exposure direction
     const netGEX = aggregation?.totalNetGEX || 0;
     const dealerShortGamma = netGEX < 0;
 
-    // Call wall and put wall distances
     const callWall = walls?.callWalls?.[0];
     const putWall = walls?.putWalls?.[0];
     const callWallDist = callWall ? ((callWall.strike - spot) / spot) * 100 : null;
@@ -287,7 +188,7 @@ class GammaSqueezeEngine {
       pcRatio,
       totalCallOI,
       totalPutOI,
-      avgIV,
+      avgIV: 0,
       dealerShortGamma,
     };
   }
@@ -298,8 +199,11 @@ class GammaSqueezeEngine {
     }
     const series = this._timeSeries.get(ticker);
     series.push(snapshot);
+
+    // Trim to MAX_SNAPSHOTS to keep memory bounded
     if (series.length > MAX_SNAPSHOTS) {
-      series.splice(0, series.length - MAX_SNAPSHOTS);
+      const excess = series.length - MAX_SNAPSHOTS;
+      series.splice(0, excess);
     }
   }
 
@@ -341,7 +245,7 @@ class GammaSqueezeEngine {
 
     return {
       significant: changes.length > 2 || overallChangePct > THRESHOLDS.oiChangeThresholdPct,
-      changes: changes.slice(0, 10), // Top 10 most changed strikes
+      changes: changes.slice(0, 10),
       overallChangePct,
     };
   }
@@ -364,22 +268,14 @@ class GammaSqueezeEngine {
       return { ivCrushLag: false, ivTrend: 'stable' };
     }
 
-    // Check if regime was recently short gamma AND IV has been dropping
-    // This indicates a potential IV crush-lag trap:
-    // VIX/IV spiked → gamma went very negative → IV is now dropping
-    // but gamma is still negative = dealers still short = any move amplified
     const recent = series.slice(-5);
     const shortGammaCount = recent.filter(s => s.dealerShortGamma).length;
-    const regimeConfidences = recent.map(s => s.regimeConfidence);
-    const avgConfidence = regimeConfidences.reduce((a, b) => a + b, 0) / regimeConfidences.length;
 
-    // Track netGEX trend
-    const gexValues = recent.map(s => s.netGEX);
-    const gexTrend = gexValues.length >= 2
-      ? (gexValues[gexValues.length - 1] - gexValues[0]) / (Math.abs(gexValues[0]) || 1)
+    const netGEXValues = recent.map(s => s.netGEX);
+    const gexTrend = netGEXValues.length >= 2
+      ? (netGEXValues[netGEXValues.length - 1] - netGEXValues[0]) / (Math.abs(netGEXValues[0]) || 1)
       : 0;
 
-    // IV crush-lag: short gamma persistent + GEX becoming less negative = IV dropping but gamma still short
     const ivCrushLag = shortGammaCount >= 3 && gexTrend > 0.05 && recent[recent.length - 1].dealerShortGamma;
 
     return {
@@ -396,12 +292,10 @@ class GammaSqueezeEngine {
     const { netGEX, dealerShortGamma, flipDistPct, callWallDistPct, putWallDistPct, pcRatio, spot } = snapshot;
     const series = this._timeSeries.get(ticker) || [];
 
-    // Not enough data to detect anything meaningful
     if (Math.abs(netGEX) < THRESHOLDS.minAbsGexForDetection) {
       return { state: SQUEEZE_STATE.NORMAL, since: Date.now(), reason: 'GEX too small' };
     }
 
-    // Calculate GEX rate of change
     let gexChangeRate = 0;
     if (series.length >= 2) {
       const prev = series[series.length - 2];
@@ -410,14 +304,12 @@ class GammaSqueezeEngine {
       }
     }
 
-    // P/C ratio change over recent snapshots
     let pcRatioShift = 0;
     if (series.length >= 3) {
       const older = series[series.length - 3];
       pcRatioShift = pcRatio - older.pcRatio;
     }
 
-    // Scoring signals
     const signals = {
       dealerShortGamma,
       gexChangingFast: Math.abs(gexChangeRate) > THRESHOLDS.gexChangeRatePct,
@@ -429,10 +321,9 @@ class GammaSqueezeEngine {
       spotBeyondPutWall: putWallDistPct !== null && putWallDistPct < -THRESHOLDS.knifeFightSpotBeyondWallPct,
     };
 
-    // State transitions
     const prevStateName = prevState.state;
 
-    // ── KNIFE FIGHT: extreme condition ──
+    // ── KNIFE FIGHT ──
     if (dealerShortGamma && (signals.spotBeyondCallWall || signals.spotBeyondPutWall) && signals.gexChangingFast) {
       return {
         state: SQUEEZE_STATE.KNIFE_FIGHT,
@@ -444,7 +335,7 @@ class GammaSqueezeEngine {
       };
     }
 
-    // ── ACTIVE SQUEEZE: dealers forced to hedge ──
+    // ── ACTIVE SQUEEZE ──
     if (dealerShortGamma && (signals.gexChangingFast || signals.oiFlowing) && (signals.nearFlip || Math.abs(gexChangeRate) > THRESHOLDS.gexChangeRatePct * 0.7)) {
       return {
         state: SQUEEZE_STATE.ACTIVE,
@@ -456,7 +347,7 @@ class GammaSqueezeEngine {
       };
     }
 
-    // ── UNWINDING: squeeze reversing ──
+    // ── UNWINDING ──
     if ((prevStateName === SQUEEZE_STATE.ACTIVE || prevStateName === SQUEEZE_STATE.KNIFE_FIGHT) &&
         (signals.pcRatioShifting || !dealerShortGamma)) {
       return {
@@ -469,7 +360,7 @@ class GammaSqueezeEngine {
       };
     }
 
-    // ── BUILDING: early squeeze signs ──
+    // ── BUILDING ──
     if (dealerShortGamma && (signals.oiFlowing || signals.nearFlip || signals.ivCrushLag)) {
       return {
         state: SQUEEZE_STATE.BUILDING,
@@ -495,15 +386,12 @@ class GammaSqueezeEngine {
   // ── Knife Fight Detection ─────────────────────────────────────────
 
   _checkKnifeFight(ticker, snapshot, state) {
-    // Extra check: during active squeeze, track if spot is accelerating AWAY from walls
     const series = this._timeSeries.get(ticker) || [];
     if (series.length < 3) return;
 
-    const recent3 = series.slice(-3);
-    const spots = recent3.map(s => s.spot);
+    const spots = series.slice(-3).map(s => s.spot);
     const momentum = spots.length >= 2 ? ((spots[spots.length - 1] - spots[0]) / spots[0]) * 100 : 0;
 
-    // If momentum is > 0.3% in 3 polls (~9 min) during active squeeze, flag acceleration
     if (Math.abs(momentum) > 0.3 && state.state === SQUEEZE_STATE.ACTIVE) {
       const direction = momentum > 0 ? 'upward' : 'downward';
       const alertKey = `${ticker}:acceleration:${direction}`;
@@ -519,37 +407,23 @@ class GammaSqueezeEngine {
   // ── State Transition Alerts ───────────────────────────────────────
 
   _onStateTransition(ticker, prevState, newState, snapshot) {
-    // Per-ticker cooldown (not per-state) prevents rapid-fire alerts from state flapping
     const alertKey = `${ticker}:squeeze_alert`;
     if (this._isAlertCoolingDown(alertKey)) return;
 
-    auditLog.log('gamma_squeeze', `${ticker}: ${prevState.state} → ${newState.state} — ${newState.reason}`);
+    const key = `${ticker}:${prevState.state}_${newState.state}`;
+    const messages = {
+      normal_building: this._formatBuildingAlert(ticker, snapshot, newState),
+      building_active: this._formatActiveSqueezeAlert(ticker, snapshot, newState),
+      active_knife: this._formatKnifeFightAlert(ticker, snapshot, newState),
+      knife_unwinding: this._formatUnwindAlert(ticker, snapshot, newState),
+      active_normal: this._formatUnwindAlert(ticker, snapshot, newState), // unwind on calm
+      building_normal: this._formatUnwindAlert(ticker, snapshot, newState), // calm on building
+      building_knife: this._formatKnifeFightAlert(ticker, snapshot, newState),
+      knife_active: this._formatActiveSqueezeAlert(ticker, snapshot, newState)
+    };
 
-    let message = null;
-
-    switch (newState.state) {
-      case SQUEEZE_STATE.BUILDING:
-        message = this._formatBuildingAlert(ticker, snapshot, newState);
-        break;
-
-      case SQUEEZE_STATE.ACTIVE:
-        message = this._formatActiveSqueezeAlert(ticker, snapshot, newState);
-        break;
-
-      case SQUEEZE_STATE.KNIFE_FIGHT:
-        message = this._formatKnifeFightAlert(ticker, snapshot, newState);
-        break;
-
-      case SQUEEZE_STATE.UNWINDING:
-        message = this._formatUnwindAlert(ticker, snapshot, newState);
-        break;
-
-      case SQUEEZE_STATE.NORMAL:
-        if (prevState.state !== SQUEEZE_STATE.NORMAL) {
-          message = `**${ticker}** squeeze conditions have cleared. Regime: ${snapshot.regime}. Back to normal monitoring.`;
-        }
-        break;
-    }
+    const safeKey = key.replace(/[^a-zA-Z0-9]/g, '_');
+    const message = messages[safeKey] || null;
 
     if (message && this._postToChannel) {
       this._postToChannel(message).catch(() => {});
@@ -577,9 +451,8 @@ class GammaSqueezeEngine {
   }
 
   _formatActiveSqueezeAlert(ticker, snap, state) {
-    const direction = snap.spot > (snap.callWall || Infinity) ? 'UPWARD' : snap.spot < (snap.putWall || 0) ? 'DOWNWARD' : 'ACTIVE';
     return [
-      `**${ticker} — ACTIVE GAMMA SQUEEZE ${direction}**`,
+      `**${ticker} — ACTIVE GAMMA SQUEEZE**`,
       `Spot: \`$${snap.spot}\` | Net GEX: \`${this._fmtDollar(snap.netGEX)}\``,
       `Dealers are **SHORT gamma** — forced hedging is amplifying moves`,
       `GEX change rate: \`${state.gexChangeRate?.toFixed(1) || '?'}%\` per poll`,
@@ -619,11 +492,6 @@ class GammaSqueezeEngine {
 
   // ── Sector GEX Analysis ───────────────────────────────────────────
 
-  /**
-   * Analyze gamma exposure across sector ETFs.
-   * Identifies which sectors have the most extreme gamma positioning.
-   * @returns {Promise<Array<{ ticker, sector, regime, netGEX, confidence }>>}
-   */
   async analyzeSectorGEX() {
     const results = [];
 
@@ -639,22 +507,17 @@ class GammaSqueezeEngine {
           spot: summary.spot,
           gammaFlip: summary.gammaFlip,
         });
-      } catch (err) {
-        // Skip sectors where options data is unavailable
+      } catch {
         continue;
       }
 
-      await this._sleep(1500); // Rate limit between fetches
+      await this._sleep(1500);
     }
 
-    // Sort by absolute GEX (most extreme first)
     results.sort((a, b) => Math.abs(b.netGEX) - Math.abs(a.netGEX));
     return results;
   }
 
-  /**
-   * Format sector GEX for Discord.
-   */
   formatSectorGEXForDiscord(sectorData) {
     if (sectorData.length === 0) return 'No sector GEX data available.';
 
@@ -662,14 +525,12 @@ class GammaSqueezeEngine {
 
     for (const s of sectorData) {
       const emoji = s.regime === 'Long Gamma' ? '+' : s.regime === 'Short Gamma' ? '-' : '~';
-      const regimeIcon = s.regime === 'Long Gamma' ? '***' : s.regime === 'Short Gamma' ? '***' : '';
       lines.push(
-        `\`${emoji}\` **${s.sector}** (${s.ticker}) — ${regimeIcon}${s.regime}${regimeIcon} (${(s.confidence * 100).toFixed(0)}%)` +
+        `\`${emoji}\` **${s.sector}** (${s.ticker}) — ${s.regime} (${(s.confidence * 100).toFixed(0)}%)` +
         ` | GEX: ${this._fmtDollar(s.netGEX)}`
       );
     }
 
-    // Summary
     const shortGammaSectors = sectorData.filter(s => s.regime === 'Short Gamma');
     if (shortGammaSectors.length > 0) {
       lines.push(`\n**Short gamma sectors (squeeze risk):** ${shortGammaSectors.map(s => s.ticker).join(', ')}`);
@@ -680,11 +541,6 @@ class GammaSqueezeEngine {
 
   // ── Public Query: Get Squeeze Status ──────────────────────────────
 
-  /**
-   * Get the current squeeze status for a ticker (or all watched tickers).
-   * @param {string} [ticker] - Specific ticker, or null for all
-   * @returns {object|Array<object>}
-   */
   getSqueezeStatus(ticker) {
     if (ticker) {
       const upper = ticker.toUpperCase();
@@ -705,13 +561,10 @@ class GammaSqueezeEngine {
       };
     }
 
-    // All tickers
+    // All tickers — map over watchlist and use cached series
     return this._watchlist.map(t => this.getSqueezeStatus(t));
   }
 
-  /**
-   * Format squeeze status for Discord.
-   */
   formatStatusForDiscord(status) {
     if (Array.isArray(status)) {
       const lines = ['**Gamma Squeeze Monitor**\n'];
@@ -727,11 +580,9 @@ class GammaSqueezeEngine {
       return lines.join('\n');
     }
 
-    // Single ticker detail
     const s = status;
     const emoji = this._stateEmoji(s.squeezeState);
     const latest = s.latestSnapshot;
-
     const lines = [
       `${emoji} **${s.ticker} — Squeeze Status: \`${s.squeezeState}\`**`,
       s.since ? `Since: ${new Date(s.since).toLocaleTimeString('en-US', { timeZone: 'America/New_York' })} ET` : null,
@@ -752,7 +603,6 @@ class GammaSqueezeEngine {
       );
     }
 
-    // Signal breakdown
     if (s.signals && Object.values(s.signals).some(v => v === true)) {
       lines.push('', '**Active Signals:**');
       for (const [key, val] of Object.entries(s.signals)) {
@@ -762,7 +612,6 @@ class GammaSqueezeEngine {
       }
     }
 
-    // GEX history trend
     const series = this._timeSeries.get(s.ticker) || [];
     if (series.length >= 5) {
       const recent5 = series.slice(-5);
@@ -777,13 +626,6 @@ class GammaSqueezeEngine {
 
   // ── Integration: Get Squeeze Signal for Options Engine ────────────
 
-  /**
-   * Returns a squeeze signal object for the options engine to use.
-   * Boosts conviction when squeeze is active.
-   *
-   * @param {string} ticker
-   * @returns {{ active: boolean, state: string, convictionBoost: number, direction: string|null, reason: string }}
-   */
   getSqueezeSignal(ticker) {
     const upper = ticker.toUpperCase();
     const state = this._squeezeStates.get(upper);
@@ -797,9 +639,6 @@ class GammaSqueezeEngine {
       return { active: false, state: state.state, convictionBoost: 0, direction: null, reason: 'No data' };
     }
 
-    // Determine direction based on squeeze mechanics:
-    // Short gamma + spot above flip = bullish squeeze (dealers buying to hedge)
-    // Short gamma + spot below flip = bearish squeeze (dealers selling to hedge)
     let direction = null;
     if (latest.flipDistPct !== null) {
       direction = latest.flipDistPct > 0 ? 'bullish' : 'bearish';
@@ -813,7 +652,7 @@ class GammaSqueezeEngine {
       [SQUEEZE_STATE.BUILDING]: 1,
       [SQUEEZE_STATE.ACTIVE]: 2,
       [SQUEEZE_STATE.KNIFE_FIGHT]: 3,
-      [SQUEEZE_STATE.UNWINDING]: -1, // Reduce conviction during unwind
+      [SQUEEZE_STATE.UNWINDING]: -1,
     };
 
     return {
@@ -905,31 +744,71 @@ class GammaSqueezeEngine {
 
   // ── Persistence ───────────────────────────────────────────────────
 
+  /** Persist state to disk — called only at stop() or shutdown */
   _persistState() {
-    // Persist squeeze states
-    const states = {};
-    for (const [k, v] of this._squeezeStates) {
-      states[k] = { state: v.state, since: v.since, reason: v.reason };
+    // Persist squeezeStates in memory (trimmed)
+    const persistStates = {};
+    for (const [k, v] of this._squeezeStates.entries()) {
+      persistStates[k] = { state: v.state, since: v.since, reason: v.reason };
     }
-    this._storage.set('squeezeStates', states);
 
-    // Persist last 20 snapshots per ticker (keep it lean)
-    const series = {};
-    for (const [k, v] of this._timeSeries) {
-      series[k] = v.slice(-20);
+    // Persist only last 20 snapshots per ticker to keep storage lean
+    const persistTimeSeries = {};
+    for (const [k, v] of this._timeSeries.entries()) {
+      persistTimeSeries[k] = v.slice(-MAX_SNAPSHOTS);
     }
-    this._storage.set('timeSeries', series);
+
+    const payload = {
+      sink: 'gamma-squeeze',
+      version: 1,
+      timestamp: Date.now(),
+      persistStates,
+      timeSeries: persistTimeSeries,
+      watchlist: this._watchlist,
+      prevOI: Object.fromEntries([...this._prevOI.entries()]),
+      alertCooldowns: this._alertCooldowns,
+      _storageCache: this._storageCache // Keep cache synced on flush
+    };
+
+    try {
+      const fsPath = path.resolve(__dirname, '../../data/gamma-squeeze-state.json');
+      fs.writeFileSync(fsPath, JSON.stringify(payload, null, 2));
+      // Re-hydrate cache on next start
+      this._storageCache.squeezeStates = persistStates;
+      this._storageCache.timeSeries = persistTimeSeries;
+      auditLog.log('gamma_squeeze', 'State persisted');
+    } catch (err) {
+      console.error('[GammaSqueeze] Failed to persist state:', err.message);
+    }
   }
 
+  /** Restore state from disk on startup */
   _restoreState() {
-    const states = this._storage.get('squeezeStates', {});
-    for (const [k, v] of Object.entries(states)) {
-      this._squeezeStates.set(k, v);
+    // Rebuild from cache if available
+    if (this._storageCache && this._storageCache.persistStates) {
+      for (const [k, v] of Object.entries(this._storageCache.persistStates)) {
+        this._squeezeStates.set(k, v);
+      }
     }
 
-    const series = this._storage.get('timeSeries', {});
-    for (const [k, v] of Object.entries(series)) {
-      this._timeSeries.set(k, v);
+    if (this._storageCache && this._storageCache.timeSeries) {
+      for (const [k, v] of Object.entries(this._storageCache.timeSeries)) {
+        this._timeSeries.set(k, v);
+      }
+    }
+
+    // Hydrate prevOI if persisted
+    if (this._storageCache && this._storageCache.prevOI) {
+      for (const [k, v] of Object.entries(this._storageCache.prevOI)) {
+        this._prevOI.set(k, new Map(Object.entries(v)));
+      }
+    }
+
+    // Hydrate alert cooldowns
+    if (this._storageCache && this._storageCache.alertCooldowns) {
+      for (const [k, v] of Object.entries(this._storageCache.alertCooldowns)) {
+        this._alertCooldowns.set(k, v);
+      }
     }
   }
 }

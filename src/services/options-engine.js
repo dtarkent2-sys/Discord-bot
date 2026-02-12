@@ -1,30 +1,4 @@
-/**
- * 0DTE Options Trading Engine
- *
- * Autonomous options trading focused on 0DTE (and short-dated) contracts
- * on SPY, QQQ, and opportunistic A+ setups on individual names.
- *
- * Strategy types:
- *   - SCALP: Quick in/out, +20-30% target, tight stops, 5-30 min hold
- *   - SWING: Larger move, +50-75% target, wider stops, hold hours
- *
- * Decision pipeline:
- *   1. Market regime check (macro + GEX)
- *   2. Intraday price action scan (5-min bars, technicals)
- *   3. GEX-informed levels (call walls, put walls, gamma flip)
- *   4. Contract selection (delta-based, spread-filtered)
- *   5. AI conviction scoring (must meet threshold)
- *   6. Risk validation (policy engine)
- *   7. Order execution + position monitoring
- *
- * Data sources:
- *   - GEX Engine (gamma regime, walls, flip levels)
- *   - Technicals (RSI, MACD, Bollinger, ATR on intraday bars)
- *   - Macro (risk regime, sector rotation)
- *   - Alpaca (options chain, quotes, execution)
- *   - AI (Ollama decision engine)
- */
-
+#!/usr/bin/env node
 const alpaca = require('./alpaca');
 const gamma = require('./gamma');
 const GEXEngine = require('./gex-engine');
@@ -37,13 +11,10 @@ const ai = require('./ai');
 const auditLog = require('./audit-log');
 const circuitBreaker = require('./circuit-breaker');
 const signalCache = require('./signal-cache');
-const config = require('../config');
 const Storage = require('./storage');
 
-// Max contracts to evaluate per scan
 const MAX_CONTRACTS_PER_SCAN = 20;
 
-// Time constants (ET)
 const MARKET_OPEN_HOUR = 9;
 const MARKET_OPEN_MIN = 30;
 const MARKET_CLOSE_HOUR = 16;
@@ -55,21 +26,12 @@ class OptionsEngine {
     this._gexEngine = new GEXEngine(gamma);
     this._logs = [];
     this._postToChannel = null;
-    this._activeTrades = new Map(); // occSymbol → { entry, strategy, underlying, ... }
-
-    // Restore state
+    this._activeTrades = new Map();
     const savedTrades = this._storage.get('activeTrades', []);
-    for (const t of savedTrades) {
-      this._activeTrades.set(t.symbol, t);
-    }
+    for (const t of savedTrades) this._activeTrades.set(t.symbol, t);
   }
 
-  /** Wire up Discord posting callback */
-  setChannelPoster(fn) {
-    this._postToChannel = fn;
-  }
-
-  // ── Logging ───────────────────────────────────────────────────────
+  setChannelPoster(fn) { this._postToChannel = fn; }
 
   _log(type, message) {
     const entry = { type, message, timestamp: new Date().toISOString() };
@@ -81,15 +43,13 @@ class OptionsEngine {
 
   getLogs() { return [...this._logs]; }
 
-  // ── Time Helpers ──────────────────────────────────────────────────
-
   _getETTime() {
     const now = new Date();
     const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
     return {
       hour: et.getHours(),
       minute: et.getMinutes(),
-      day: et.getDay(), // 0=Sun, 6=Sat
+      day: et.getDay(),
       date: et,
       minutesToClose: (MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MIN) - (et.getHours() * 60 + et.getMinutes()),
       todayString: `${et.getFullYear()}-${String(et.getMonth() + 1).padStart(2, '0')}-${String(et.getDate()).padStart(2, '0')}`,
@@ -105,12 +65,6 @@ class OptionsEngine {
     return minuteOfDay >= openMinute && minuteOfDay < closeMinute;
   }
 
-  // ── Main Cycle ────────────────────────────────────────────────────
-
-  /**
-   * Run the full 0DTE options trading cycle.
-   * Called on schedule by the SHARK engine during market hours.
-   */
   async runCycle() {
     const cfg = policy.getConfig();
     if (!cfg.options_enabled) {
@@ -133,7 +87,6 @@ class OptionsEngine {
       return;
     }
 
-    // Skip first 15 min after open (too volatile/noisy for entries)
     const minutesSinceOpen = et.minutesToClose > 0
       ? (MARKET_CLOSE_HOUR * 60) - et.minutesToClose - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN)
       : 0;
@@ -145,15 +98,12 @@ class OptionsEngine {
     try {
       this._log('cycle', `Options cycle started — ${et.minutesToClose} min to close`);
 
-      // 1. Check account
       const account = await alpaca.getAccount();
       const equity = Number(account.equity || 0);
       policy.resetDaily(equity);
 
-      // 2. Monitor existing options positions FIRST (always run)
       await this._monitorPositions(et.minutesToClose);
 
-      // 3. If we have room and time, scan for new entries
       const optionsPositions = await alpaca.getOptionsPositions();
       if (optionsPositions.length < cfg.options_max_positions && et.minutesToClose > cfg.options_close_before_minutes) {
         this._log('cycle', `Scanning for entries — ${optionsPositions.length}/${cfg.options_max_positions} positions, ${et.minutesToClose} min left`);
@@ -171,8 +121,6 @@ class OptionsEngine {
     }
   }
 
-  // ── Position Monitoring ───────────────────────────────────────────
-
   async _monitorPositions(minutesToClose) {
     try {
       const optionsPositions = await alpaca.getOptionsPositions();
@@ -180,27 +128,19 @@ class OptionsEngine {
 
       this._log('monitor', `Monitoring ${optionsPositions.length} options position(s)`);
 
-      // Determine strategy for each position from our tracking
       for (const pos of optionsPositions) {
         const tracked = this._activeTrades.get(pos.symbol);
         const strategy = tracked?.strategy || 'scalp';
-
         const exits = policy.checkOptionsExits([pos], strategy, minutesToClose);
         for (const exit of exits) {
           try {
             await alpaca.closeOptionsPosition(exit.symbol);
             this._log('trade', `CLOSE OPTIONS ${exit.symbol}: ${exit.message}`);
-
-            // Record P&L
             const pnl = Number(pos.unrealized_pl || 0);
             policy.recordOptionsTradeResult(pnl);
             circuitBreaker.recordExit(exit.symbol, exit.reason, exit.pnlPct);
-
-            // Remove from tracking
             this._activeTrades.delete(exit.symbol);
             this._persistTrades();
-
-            // Discord alert
             if (this._postToChannel) {
               const emoji = pnl >= 0 ? '🟢' : '🔴';
               const parsed = alpaca._parseOccSymbol(exit.symbol);
@@ -221,13 +161,10 @@ class OptionsEngine {
     }
   }
 
-  // ── Entry Scanning ────────────────────────────────────────────────
-
   async _scanForEntries(account, currentOptionsPositions, et) {
     const cfg = policy.getConfig();
     const underlyings = cfg.options_underlyings || ['SPY', 'QQQ'];
 
-    // 1. Get macro regime — don't let failure block scanning
     let macroRegime = { regime: 'CAUTIOUS', score: 0 };
     try {
       macroRegime = await macro.getRegime();
@@ -237,7 +174,6 @@ class OptionsEngine {
 
     this._log('scan', `Scanning ${underlyings.join(', ')} | macro=${macroRegime.regime} | positions=${currentOptionsPositions}/${cfg.options_max_positions}`);
 
-    // Skip scanning in RISK_OFF (only monitor exits)
     if (macroRegime.regime === 'RISK_OFF') {
       this._log('scan', 'RISK_OFF — skipping options entry scan, monitoring exits only');
       return;
@@ -253,7 +189,6 @@ class OptionsEngine {
         const signal = await this._analyzeUnderlying(underlying, macroRegime, et);
         if (!signal) continue;
 
-        // Execute if we got a signal
         this._log('trade', `EXECUTING: ${signal.optionType.toUpperCase()} on ${underlying} — conviction ${signal.conviction}/10, strategy ${signal.strategy}`);
         const result = await this._executeEntry(signal, account, currentOptionsPositions, et);
         if (result.success) {
@@ -268,26 +203,17 @@ class OptionsEngine {
     }
   }
 
-  /**
-   * Analyze an underlying for a 0DTE options trade opportunity.
-   * Returns a signal object or null if no setup found.
-   *
-   * RESILIENT: GEX failure does NOT block analysis — falls back to
-   * technicals + AI. Signal cache only blocks for 5 min (not 15).
-   */
   async _analyzeUnderlying(underlying, macroRegime, et) {
     const cfg = policy.getConfig();
 
-    // Cooldown per-underlying (not using signal cache — that was blocking too aggressively)
     const cooldownKey = `opts_${underlying}`;
     const lastScan = this._scanTimestamps?.get(cooldownKey) || 0;
     if (Date.now() - lastScan < (cfg.options_cooldown_minutes || 5) * 60 * 1000) {
-      return null; // Still on cooldown, silently skip
+      return null;
     }
 
     this._log('scan', `${underlying}: Starting 0DTE analysis...`);
 
-    // 1. Fetch GEX data (OPTIONAL — failure does not block)
     let gexSummary = null;
     try {
       gexSummary = await this._gexEngine.analyze(underlying, { include_expiries: ['0dte'] });
@@ -296,7 +222,6 @@ class OptionsEngine {
       this._log('gex', `${underlying}: GEX unavailable (${err.message}) — proceeding with technicals only`);
     }
 
-    // 2. Fetch intraday technicals (5-min bars) — REQUIRED
     let intradayTech;
     const spot = gexSummary?.spot || null;
     try {
@@ -306,7 +231,6 @@ class OptionsEngine {
         this._markScanned(cooldownKey);
         return null;
       }
-      // Use spot from GEX if available, otherwise last close from bars
       const refPrice = spot || bars[bars.length - 1].close;
       intradayTech = this._computeIntradayTechnicals(bars, refPrice);
       this._log('tech', `${underlying}: RSI=${intradayTech.rsi?.toFixed(1)}, MACD hist=${intradayTech.macd?.histogram?.toFixed(3) || 'N/A'}, momentum=${intradayTech.momentum.toFixed(2)}%, VWAP=$${intradayTech.vwap.toFixed(2)}, vol=${intradayTech.volumeTrend.toFixed(1)}x`);
@@ -316,7 +240,6 @@ class OptionsEngine {
       return null;
     }
 
-    // 3. Determine direction bias
     const gexRegime = gexSummary?.regime || { label: 'Unknown', confidence: 0 };
     const walls = gexSummary?.walls || { callWalls: [], putWalls: [] };
     const gammaFlip = gexSummary?.gammaFlip || null;
@@ -324,7 +247,6 @@ class OptionsEngine {
 
     const directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spotPrice, macroRegime);
 
-    // 3b. Check gamma squeeze engine for conviction boost
     const squeezeSignal = gammaSqueeze.getSqueezeSignal(underlying);
     if (squeezeSignal.active) {
       directionSignals.conviction = Math.min(directionSignals.conviction + squeezeSignal.convictionBoost, 10);
@@ -335,22 +257,19 @@ class OptionsEngine {
       this._log('squeeze', `${underlying}: squeeze=${squeezeSignal.state}, boost=${squeezeSignal.convictionBoost}, dir=${squeezeSignal.direction}`);
     }
 
-    // 3c. Multi-timeframe 9/20 EMA confluence — blocks low-confluence plays
     let mtfResult = null;
     try {
       mtfResult = await analyzeMTFEMA(underlying);
       const mtfDir = mtfResult.confluenceScore > 0 ? 'bullish' : 'bearish';
       const mtfMatchesDirection = mtfDir === directionSignals.direction;
-
       directionSignals.conviction = Math.max(1, Math.min(directionSignals.conviction + mtfResult.convictionBoost, 10));
-      directionSignals.reasons.push(`MTF EMA: ${mtfResult.consensus} (${mtfResult.confluenceScore > 0 ? '+' : ''}${mtfResult.confluenceScore.toFixed(2)}, boost ${mtfResult.convictionBoost > 0 ? '+' : ''}${mtfResult.convictionBoost}) — ${mtfMatchesDirection ? 'CONFIRMS' : 'CONFLICTS'}`);
-
+      directionSignals.reasons.push(`MTF EMA: ${mtfResult.consensus} (${mtfResult.confluenceScore > 0 ? '+' : ''}${mtfResult.confluenceScore.toFixed(2)}, boost ${mtfResult.convictionBoost}) — ${mtfMatchesDirection ? 'CONFIRMS' : 'CONFLICTS'}`);
       this._log('mtf', `${underlying}: MTF=${mtfResult.consensus}, score=${mtfResult.confluenceScore.toFixed(2)}, boost=${mtfResult.convictionBoost}, bull=${mtfResult.bullishCount} bear=${mtfResult.bearishCount}`);
     } catch (err) {
       this._log('mtf', `${underlying}: MTF EMA unavailable (${err.message}) — proceeding without`);
     }
 
-    this._log('scan', `${underlying}: direction=${directionSignals.direction}, bull=${directionSignals.bullPoints.toFixed(1)} vs bear=${directionSignals.bearPoints.toFixed(1)}, conviction=${directionSignals.conviction}/10, strategy=${directionSignals.strategy}`);
+    this._log('scan', `${underlying}: direction=${directionSignals.direction}, conviction=${directionSignals.conviction}/10, strategy=${directionSignals.strategy}`);
 
     if (directionSignals.conviction < 3) {
       this._log('scan', `${underlying}: weak directional signals (${directionSignals.conviction}/10) — skipping`);
@@ -358,9 +277,8 @@ class OptionsEngine {
       return null;
     }
 
-    // 4. Ask AI for final decision
     this._log('scan', `${underlying}: conviction ${directionSignals.conviction}/10 — asking AI...`);
-    const aiDecision = await this._askOptionsAI(underlying, spotPrice, intradayTech, gexSummary || this._buildMinimalGexContext(spotPrice), macroRegime, directionSignals, et);
+    const aiDecision = await this._askOptionsAI(underlying, spotPrice, intradayTech, this._buildMinimalGexContext(spotPrice), macroRegime, directionSignals, et);
 
     if (!aiDecision || aiDecision.action === 'SKIP') {
       const reason = aiDecision?.reason || 'AI says skip';
@@ -394,13 +312,11 @@ class OptionsEngine {
     };
   }
 
-  /** Track when we last scanned an underlying */
   _markScanned(key) {
     if (!this._scanTimestamps) this._scanTimestamps = new Map();
     this._scanTimestamps.set(key, Date.now());
   }
 
-  /** Build minimal GEX context when real GEX is unavailable (so AI prompt doesn't break) */
   _buildMinimalGexContext(spotPrice) {
     return {
       spot: spotPrice,
@@ -410,26 +326,14 @@ class OptionsEngine {
     };
   }
 
-  // ── Intraday Technicals ───────────────────────────────────────────
-
   _computeIntradayTechnicals(bars, currentPrice) {
     const closes = bars.map(b => b.close);
     const volumes = bars.map(b => b.volume);
-
-    // RSI on closes (returns a single number)
     const rsi = technicals.calculateRSI(closes, 14);
-
-    // MACD (returns { macd, signal, histogram } or null)
     const macd = technicals.calculateMACD(closes);
-
-    // Bollinger Bands (returns { upper, middle, lower, width } or null)
     const bb = technicals.calculateBollingerBands(closes, 20);
-
-    // ATR (expects bars with h, l, c keys)
     const atrBars = bars.map(b => ({ h: b.high, l: b.low, c: b.close }));
     const atr = technicals.calculateATR(atrBars, 14);
-
-    // VWAP approximation (cumulative typical price × volume / cumulative volume)
     let cumTPV = 0, cumVol = 0;
     for (let i = 0; i < bars.length; i++) {
       const tp = (bars[i].high + bars[i].low + bars[i].close) / 3;
@@ -437,26 +341,17 @@ class OptionsEngine {
       cumVol += bars[i].volume;
     }
     const vwap = cumVol > 0 ? cumTPV / cumVol : currentPrice;
-
-    // Volume trend (last 5 bars vs previous 10)
     const recentVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
     const earlierVol = volumes.slice(-15, -5).reduce((a, b) => a + b, 0) / Math.max(volumes.slice(-15, -5).length, 1);
     const volumeTrend = earlierVol > 0 ? recentVol / earlierVol : 1;
-
-    // Price momentum (last 5 bars)
     const recentCloses = closes.slice(-5);
     const momentum = recentCloses.length >= 2
       ? ((recentCloses[recentCloses.length - 1] - recentCloses[0]) / recentCloses[0]) * 100
       : 0;
-
-    // Support/Resistance from recent bars
     const lows = bars.map(b => b.low);
-    const highs = bars.map(b => b.high);
     const recentLows = lows.slice(-20);
-    const recentHighs = highs.slice(-20);
     const nearestSupport = Math.min(...recentLows);
-    const nearestResistance = Math.max(...recentHighs);
-
+    const nearestResistance = Math.max(...bars.map(b => b.high));
     return {
       price: currentPrice,
       rsi,
@@ -473,18 +368,11 @@ class OptionsEngine {
     };
   }
 
-  // ── Direction Assessment ──────────────────────────────────────────
-
-  /**
-   * Score directional signals from all sources.
-   * Returns { direction, conviction, strategy, reasons }
-   */
   _assessDirection(tech, gexRegime, walls, gammaFlip, spot, macroRegime) {
     let bullPoints = 0;
     let bearPoints = 0;
     const reasons = [];
 
-    // ── MACRO (highest weight for 0DTE) ──
     if (macroRegime.regime === 'RISK_ON') {
       bullPoints += 2;
       reasons.push('Macro RISK_ON (+2 bull)');
@@ -493,9 +381,7 @@ class OptionsEngine {
       reasons.push('Macro RISK_OFF (+2 bear)');
     }
 
-    // ── GEX REGIME ──
     if (gexRegime.label === 'Long Gamma' && gexRegime.confidence > 0.4) {
-      // Long gamma = mean reversion. Trade reversals at extremes.
       if (tech.rsi < 35) {
         bullPoints += 2;
         reasons.push('Long gamma + oversold RSI → bounce play (+2 bull)');
@@ -504,7 +390,6 @@ class OptionsEngine {
         reasons.push('Long gamma + overbought RSI → fade play (+2 bear)');
       }
     } else if (gexRegime.label === 'Short Gamma' && gexRegime.confidence > 0.4) {
-      // Short gamma = trend continuation. Ride momentum.
       if (tech.momentum > 0.15) {
         bullPoints += 2;
         reasons.push('Short gamma + bullish momentum → trend continuation (+2 bull)');
@@ -514,10 +399,8 @@ class OptionsEngine {
       }
     }
 
-    // ── GEX WALLS (key levels) ──
     const callWall = walls.callWalls?.[0];
     const putWall = walls.putWalls?.[0];
-
     if (putWall && spot <= putWall.strike * 1.005) {
       bullPoints += 1.5;
       reasons.push(`At put wall $${putWall.strike} → support bounce (+1.5 bull)`);
@@ -527,7 +410,6 @@ class OptionsEngine {
       reasons.push(`At call wall $${callWall.strike} → resistance rejection (+1.5 bear)`);
     }
 
-    // ── GAMMA FLIP ──
     if (gammaFlip) {
       if (spot > gammaFlip * 1.01) {
         bullPoints += 1;
@@ -538,8 +420,6 @@ class OptionsEngine {
       }
     }
 
-    // ── TECHNICALS ──
-    // RSI
     if (tech.rsi < 30) {
       bullPoints += 1.5;
       reasons.push(`RSI oversold ${tech.rsi.toFixed(0)} (+1.5 bull)`);
@@ -548,7 +428,6 @@ class OptionsEngine {
       reasons.push(`RSI overbought ${tech.rsi.toFixed(0)} (+1.5 bear)`);
     }
 
-    // MACD
     if (tech.macd) {
       if (tech.macd.histogram > 0 && tech.macd.macd > tech.macd.signal) {
         bullPoints += 1;
@@ -559,7 +438,6 @@ class OptionsEngine {
       }
     }
 
-    // VWAP
     if (tech.priceAboveVWAP) {
       bullPoints += 0.5;
       reasons.push('Price above VWAP (+0.5 bull)');
@@ -568,7 +446,6 @@ class OptionsEngine {
       reasons.push('Price below VWAP (+0.5 bear)');
     }
 
-    // Bollinger
     if (tech.bollinger) {
       if (tech.price <= tech.bollinger.lower * 1.002) {
         bullPoints += 1;
@@ -579,31 +456,26 @@ class OptionsEngine {
       }
     }
 
-    // Volume trend (confirming direction)
-    if (tech.volumeTrend > 1.5) {
+    const recentVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
+    const earlierVol = volumes.slice(-15, -5).reduce((a, b) => a + b, 0) / Math.max(volumes.slice(-15, -5).length, 1);
+    const volumeTrend = earlierVol > 0 ? recentVol / earlierVol : 1;
+    if (volumeTrend > 1.5) {
       if (tech.momentum > 0) bullPoints += 0.5;
       else bearPoints += 0.5;
-      reasons.push(`Volume surging ${tech.volumeTrend.toFixed(1)}x (+0.5 direction confirm)`);
+      reasons.push(`Volume surging ${volumeTrend.toFixed(1)}x (+0.5 direction confirm)`);
     }
 
-    // Calculate total and direction
     const total = bullPoints + bearPoints;
     const direction = bullPoints > bearPoints ? 'bullish' : 'bearish';
     const dominantPoints = Math.max(bullPoints, bearPoints);
-
-    // Conviction: 1-10 scale based on signal strength and clarity
-    const clarity = total > 0 ? dominantPoints / total : 0; // how one-sided
+    const clarity = total > 0 ? dominantPoints / total : 0;
     const rawConviction = Math.min(dominantPoints * clarity * 2.5, 10);
     const conviction = Math.round(rawConviction);
-
-    // Strategy: scalp if low ATR / mean-reversion setup, swing if trending
     const atrPct = tech.atr ? tech.atr / tech.price : 0;
     const strategy = (gexRegime.label === 'Short Gamma' || atrPct > 0.005) ? 'swing' : 'scalp';
 
     return { direction, conviction, strategy, reasons, bullPoints, bearPoints };
   }
-
-  // ── AI Decision ───────────────────────────────────────────────────
 
   async _askOptionsAI(underlying, spot, tech, gexSummary, macroRegime, directionSignals, et) {
     const prompt = [
@@ -640,7 +512,6 @@ class OptionsEngine {
       ``,
       `═══ MULTI-TIMEFRAME EMA (9/20) ═══`,
       (() => {
-        // MTF data is embedded in direction reasons if available, summarize here
         const mtfReason = directionSignals.reasons.find(r => r.startsWith('MTF EMA:'));
         return mtfReason || 'MTF EMA data not available for this scan';
       })(),
@@ -671,14 +542,10 @@ class OptionsEngine {
       const startTime = Date.now();
       const response = await ai.complete(prompt);
       const durationMs = Date.now() - startTime;
-
       auditLog.logOllama(`0DTE_${underlying}`, prompt, response, durationMs);
-
       if (!response) return null;
-
       const jsonMatch = response.match(/\{[\s\S]*?\}/);
       if (!jsonMatch) return null;
-
       const parsed = JSON.parse(jsonMatch[0]);
       return {
         action: parsed.action?.toUpperCase() || 'SKIP',
@@ -694,28 +561,18 @@ class OptionsEngine {
     }
   }
 
-  // ── Contract Selection ────────────────────────────────────────────
-
-  /**
-   * Select the optimal contract for a given signal.
-   * Picks based on delta range, spread quality, and liquidity.
-   */
   async _selectContract(signal) {
     const cfg = policy.getConfig();
     const { underlying, optionType, spot } = signal;
     const et = this._getETTime();
 
     try {
-      // Fetch options chain for today's expiration
       const options = await alpaca.getOptionsSnapshots(underlying, et.todayString, optionType);
-
       if (options.length === 0) {
         this._log('contract', `${underlying}: no ${optionType} options for ${et.todayString}`);
         return null;
       }
 
-      // Time-adaptive delta range: widen near end of day for 0DTE
-      // Late-day 0DTE deltas compress and can be extreme — rigid ranges miss contracts
       let minDelta = cfg.options_min_delta;
       let maxDelta = cfg.options_max_delta;
       if (et.minutesToClose < 120) {
@@ -727,7 +584,6 @@ class OptionsEngine {
         maxDelta = Math.min(0.90, maxDelta + 0.10);
       }
 
-      // Filter to our delta range
       const candidates = options.filter(opt => {
         const absDelta = Math.abs(opt.delta || 0);
         return absDelta >= minDelta && absDelta <= maxDelta;
@@ -738,7 +594,6 @@ class OptionsEngine {
         return null;
       }
 
-      // Score each candidate
       const scored = candidates.map(opt => {
         const bid = opt.bid || 0;
         const ask = opt.ask || 0;
@@ -747,32 +602,21 @@ class OptionsEngine {
         const absDelta = Math.abs(opt.delta || 0);
         const volume = opt.volume || 0;
         const oi = opt.openInterest || 0;
-
-        // Score: favor tight spread, good delta, high OI, decent volume
         let score = 0;
         if (spread < 0.05) score += 3;
         else if (spread < 0.10) score += 2;
         else if (spread < 0.15) score += 1;
-
-        // Prefer delta around 0.35-0.45 (sweet spot)
         if (absDelta >= 0.35 && absDelta <= 0.45) score += 2;
         else if (absDelta >= 0.30 && absDelta <= 0.50) score += 1;
-
-        // Liquidity
         if (oi > 1000) score += 2;
         else if (oi > 500) score += 1;
         if (volume > 100) score += 1;
-
         return { ...opt, mid, spread, score };
       });
 
-      // Sort by score descending, then by spread ascending
       scored.sort((a, b) => b.score - a.score || a.spread - b.spread);
-
       const best = scored[0];
       if (!best) return null;
-
-      // Check spread is within limit
       if (best.spread > cfg.options_max_spread_pct) {
         this._log('contract', `${underlying}: best contract spread ${(best.spread * 100).toFixed(1)}% exceeds max ${(cfg.options_max_spread_pct * 100).toFixed(0)}%`);
         return null;
@@ -787,25 +631,19 @@ class OptionsEngine {
     }
   }
 
-  // ── Order Execution ───────────────────────────────────────────────
-
   async _executeEntry(signal, account, currentOptionsPositions, et) {
     const cfg = policy.getConfig();
-
-    // 1. Select contract
     const contract = await this._selectContract(signal);
     if (!contract) {
       return { success: false, reason: 'No suitable contract found' };
     }
 
-    // 2. Calculate position size
     const mid = contract.mid || ((contract.bid + contract.ask) / 2);
-    const premium = mid * 100; // premium per contract
+    const premium = mid * 100;
     const maxContracts = Math.floor(cfg.options_max_premium_per_trade / premium);
-    const qty = Math.max(1, Math.min(maxContracts, 3)); // 1-3 contracts
+    const qty = Math.max(1, Math.min(maxContracts, 3));
     const totalPremium = premium * qty;
 
-    // 3. Risk validation
     const riskCheck = policy.evaluateOptionsOrder({
       underlying: signal.underlying,
       premium: totalPremium,
@@ -822,9 +660,7 @@ class OptionsEngine {
       return { success: false, reason: riskCheck.violations.join('; ') };
     }
 
-    // 4. Execute limit order at mid price (slight edge)
-    const limitPrice = Math.round(mid * 100) / 100; // round to pennies
-
+    const limitPrice = Math.round(mid * 100) / 100;
     try {
       const order = await alpaca.createOptionsOrder({
         symbol: contract.symbol,
@@ -835,7 +671,6 @@ class OptionsEngine {
         time_in_force: 'day',
       });
 
-      // Track the trade
       const trade = {
         symbol: contract.symbol,
         underlying: signal.underlying,
@@ -855,8 +690,6 @@ class OptionsEngine {
       policy.recordOptionsTrade(signal.underlying);
 
       this._log('trade', `BUY ${qty}x ${contract.symbol} @ $${limitPrice} (${signal.strategy}) — conviction ${signal.conviction}/10`);
-
-      // Discord alert
       if (this._postToChannel) {
         const warnings = riskCheck.warnings?.length > 0 ? `\n⚠️ ${riskCheck.warnings.join('\n⚠️ ')}` : '';
         await this._postToChannel(
@@ -877,52 +710,23 @@ class OptionsEngine {
     }
   }
 
-  // ── Alert Trigger (TradingView → Options Engine) ─────────────────
-
-  /**
-   * Trigger the 0DTE pipeline from an external alert (TradingView webhook).
-   *
-   * Unlike the scheduled cycle, this is event-driven: a TradingView signal
-   * like "BULLISH" or "PUMP INCOMING" acts as a directional HINT, not a
-   * complete trade plan. The engine runs its own full analysis (GEX,
-   * technicals, AI conviction, contract selection) and decides independently.
-   *
-   * @param {object} alert - Parsed alert from spy-alerts.js
-   * @param {string} alert.action - 'BUY', 'SELL', 'TAKE_PROFIT', 'ALERT'
-   * @param {string} alert.ticker - Underlying symbol (default SPY)
-   * @param {number} [alert.price] - Alert trigger price
-   * @param {string} [alert.confidence] - Source confidence (LOW/MEDIUM/HIGH)
-   * @param {string} [alert.reason] - Signal text
-   * @param {string} [alert.interval] - Timeframe (1m, 5m, etc.)
-   */
   async triggerFromAlert(alert) {
     const cfg = policy.getConfig();
     if (!cfg.options_enabled) return;
     if (!alpaca.enabled) return;
-
     if (circuitBreaker.isPaused()) {
       this._log('alert_trigger', 'Circuit breaker active — ignoring alert trigger');
       return;
     }
-
     if (!this._isMarketHours()) return;
-
     const underlying = (alert.ticker || 'SPY').toUpperCase();
-
-    // Only process directional signals (BUY/SELL), skip TP and generic ALERT
     if (alert.action !== 'BUY' && alert.action !== 'SELL') {
       this._log('alert_trigger', `${underlying}: ignoring non-directional alert (${alert.action})`);
       return;
     }
-
-    // Map alert direction to our hint format
     const directionHint = alert.action === 'BUY' ? 'bullish' : 'bearish';
-
     this._log('alert_trigger', `${underlying}: TradingView ${alert.action} signal received — "${alert.reason || alert.action}" [${alert.confidence || 'no conf'}] — running full analysis`);
-
     const et = this._getETTime();
-
-    // Skip first 15 min after open
     const minutesSinceOpen = et.minutesToClose > 0
       ? (MARKET_CLOSE_HOUR * 60) - et.minutesToClose - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN)
       : 0;
@@ -930,40 +734,29 @@ class OptionsEngine {
       this._log('alert_trigger', `${underlying}: too early after open (${minutesSinceOpen} min) — skipping`);
       return;
     }
-
-    // Check position capacity
     const optionsPositions = await alpaca.getOptionsPositions();
     if (optionsPositions.length >= cfg.options_max_positions) {
       this._log('alert_trigger', `${underlying}: max positions reached (${optionsPositions.length}/${cfg.options_max_positions})`);
       return;
     }
-
     if (et.minutesToClose <= cfg.options_close_before_minutes) {
       this._log('alert_trigger', `${underlying}: too close to market close (${et.minutesToClose} min)`);
       return;
     }
-
     try {
-      // 1. Account info
       const account = await alpaca.getAccount();
       const equity = Number(account.equity || 0);
       policy.resetDaily(equity);
-
-      // 2. Macro regime — don't block on CAUTIOUS for alert-triggered trades
       let macroRegime = { regime: 'CAUTIOUS', score: 0 };
       try {
         macroRegime = await macro.getRegime();
       } catch (err) {
         this._log('alert_trigger', `${underlying}: macro unavailable — proceeding with CAUTIOUS`);
       }
-
-      // Still block on RISK_OFF
       if (macroRegime.regime === 'RISK_OFF') {
         this._log('alert_trigger', `${underlying}: RISK_OFF — blocking alert-triggered trade`);
         return;
       }
-
-      // 3. GEX analysis (OPTIONAL — failure does NOT block alert trades)
       let gexSummary = null;
       try {
         gexSummary = await this._gexEngine.analyze(underlying, { include_expiries: ['0dte'] });
@@ -971,8 +764,6 @@ class OptionsEngine {
       } catch (err) {
         this._log('alert_trigger', `${underlying}: GEX unavailable (${err.message}) — proceeding with technicals`);
       }
-
-      // 4. Intraday technicals — REQUIRED
       let intradayTech;
       const spot = gexSummary?.spot || null;
       try {
@@ -987,18 +778,12 @@ class OptionsEngine {
         this._log('alert_trigger', `${underlying}: intraday data error — ${err.message}`);
         return;
       }
-
       const spotPrice = spot || intradayTech.price;
-
-      // 5. Direction assessment — factor in the alert hint
       const gexRegime = gexSummary?.regime || { label: 'Unknown', confidence: 0 };
       const walls = gexSummary?.walls || { callWalls: [], putWalls: [] };
       const gammaFlip = gexSummary?.gammaFlip || null;
       const directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spotPrice, macroRegime);
-
-      // 5b. Boost conviction from TradingView alert (+2 if confirms, 0 if conflicts)
-      // External signal confirmation is worth more than internal indicators
-      let adjustedConviction = directionSignals.conviction;
+      const adjustedConviction = directionSignals.conviction;
       const alertMatchesAnalysis = directionSignals.direction === directionHint;
       if (alertMatchesAnalysis) {
         adjustedConviction = Math.min(adjustedConviction + 2, 10);
@@ -1006,21 +791,15 @@ class OptionsEngine {
       } else {
         directionSignals.reasons.push(`TradingView ${alert.action} signal conflicts with ${directionSignals.direction} analysis`);
       }
-
-      // 5c. Confidence boost from TradingView signal strength
       if (alert.confidence === 'HIGH') {
         adjustedConviction = Math.min(adjustedConviction + 1, 10);
         directionSignals.reasons.push('TradingView HIGH confidence (+1 conviction)');
       }
-
-      // 5d. Gamma squeeze signal boost (same as scan path)
       const squeezeSignal = gammaSqueeze.getSqueezeSignal(underlying);
       if (squeezeSignal.active) {
         adjustedConviction = Math.min(adjustedConviction + squeezeSignal.convictionBoost, 10);
         directionSignals.reasons.push(`Gamma squeeze: ${squeezeSignal.state} (${squeezeSignal.convictionBoost > 0 ? '+' : ''}${squeezeSignal.convictionBoost})`);
       }
-
-      // 5e. MTF EMA confluence (same as scan path)
       let mtfResult = null;
       try {
         mtfResult = await analyzeMTFEMA(underlying);
@@ -1029,35 +808,24 @@ class OptionsEngine {
       } catch (err) {
         this._log('alert_trigger', `${underlying}: MTF unavailable (${err.message})`);
       }
-
       directionSignals.conviction = adjustedConviction;
-
       this._log('alert_trigger', `${underlying}: direction=${directionSignals.direction}, conviction=${adjustedConviction}/10 (alert ${alertMatchesAnalysis ? 'CONFIRMS' : 'conflicts'}), strategy=${directionSignals.strategy}`);
-
-      // Alert-triggered trades have an external signal — lower floor to 2
       if (adjustedConviction < 2) {
         this._log('alert_trigger', `${underlying}: very weak signals (${adjustedConviction}/10) even with TradingView alert — skipping`);
         return;
       }
-
-      // 6. AI decision — pass the alert context for extra information
       const gexContext = gexSummary || this._buildMinimalGexContext(spotPrice);
       const aiDecision = await this._askOptionsAI(underlying, spotPrice, intradayTech, gexContext, macroRegime, { ...directionSignals, conviction: adjustedConviction }, et);
-
       if (!aiDecision || aiDecision.action === 'SKIP') {
         const reason = aiDecision?.reason || 'AI says skip';
         this._log('alert_trigger', `${underlying}: AI SKIP — ${reason}`);
         return;
       }
-
       if (aiDecision.conviction < cfg.options_min_conviction) {
         this._log('alert_trigger', `${underlying}: AI conviction ${aiDecision.conviction}/10 below min ${cfg.options_min_conviction}`);
         return;
       }
-
       this._log('alert_trigger', `${underlying}: AI ${aiDecision.action} — conviction ${aiDecision.conviction}/10 — EXECUTING from TradingView alert`);
-
-      // 7. Build signal and execute
       const signal = {
         underlying,
         direction: (aiDecision.action === 'BUY_CALL' || aiDecision.action === 'BUY') ? 'bullish' : 'bearish',
@@ -1071,7 +839,6 @@ class OptionsEngine {
         target: aiDecision.target,
         stopLevel: aiDecision.stopLevel,
       };
-
       const result = await this._executeEntry(signal, account, optionsPositions.length, et);
       if (result.success) {
         this._log('alert_trigger', `${underlying}: TRADE EXECUTED from alert trigger`);
@@ -1083,36 +850,20 @@ class OptionsEngine {
     }
   }
 
-  // ── Manual Trade ──────────────────────────────────────────────────
-
-  /**
-   * Manually trigger the 0DTE pipeline for a specific underlying.
-   * @param {string} underlying - SPY, QQQ, etc.
-   * @param {object} [opts]
-   * @param {string} [opts.direction] - 'call' or 'put' (override AI)
-   * @param {string} [opts.strategy] - 'scalp' or 'swing'
-   * @returns {{ success: boolean, message: string, details?: object }}
-   */
   async manualTrade(underlying, { direction, strategy } = {}) {
     underlying = underlying.toUpperCase();
-
     if (!alpaca.enabled) {
       return { success: false, message: 'Alpaca API not configured.' };
     }
-
     const cfg = policy.getConfig();
     if (!cfg.options_enabled) {
       return { success: false, message: 'Options trading is disabled. Use `/agent set key:options_enabled value:true` to enable.' };
     }
-
     if (policy.killSwitch) {
       return { success: false, message: 'Kill switch is active — trading halted.' };
     }
-
     const et = this._getETTime();
     const steps = [];
-
-    // 1. Account info
     let account;
     try {
       account = await alpaca.getAccount();
@@ -1120,8 +871,6 @@ class OptionsEngine {
       return { success: false, message: `Account fetch failed: ${err.message}` };
     }
     steps.push(`Account: $${Number(account.equity).toFixed(0)} equity`);
-
-    // 2. Macro regime
     let macroRegime = { regime: 'CAUTIOUS', score: 0 };
     try {
       macroRegime = await macro.getRegime();
@@ -1129,8 +878,6 @@ class OptionsEngine {
     } catch (err) {
       steps.push(`Macro: unavailable`);
     }
-
-    // 3. GEX analysis
     let gexSummary;
     try {
       gexSummary = await this._gexEngine.analyze(underlying, { include_expiries: ['0dte'] });
@@ -1139,8 +886,6 @@ class OptionsEngine {
       steps.push(`GEX: unavailable (${err.message})`);
       return { success: false, message: `GEX analysis failed: ${err.message}`, details: { steps } };
     }
-
-    // 4. Intraday technicals
     let tech;
     try {
       const bars = await alpaca.getIntradayBars(underlying, { timeframe: '5Min', limit: 50 });
@@ -1149,17 +894,12 @@ class OptionsEngine {
     } catch (err) {
       return { success: false, message: `Intraday data error: ${err.message}`, details: { steps } };
     }
-
-    // 5. Direction
     const dirSignals = this._assessDirection(tech, gexSummary.regime, gexSummary.walls, gexSummary.gammaFlip, gexSummary.spot, macroRegime);
     const finalDirection = direction || (dirSignals.direction === 'bullish' ? 'call' : 'put');
     const finalStrategy = strategy || dirSignals.strategy;
     steps.push(`Direction: ${dirSignals.direction} (${dirSignals.conviction}/10), strategy: ${finalStrategy}`);
-
-    // 6. AI decision (unless direction was forced)
     let conviction = dirSignals.conviction;
     let reason = dirSignals.reasons.join('; ');
-
     if (!direction) {
       const aiDecision = await this._askOptionsAI(underlying, gexSummary.spot, tech, gexSummary, macroRegime, dirSignals, et);
       if (aiDecision) {
@@ -1175,8 +915,6 @@ class OptionsEngine {
     } else {
       steps.push(`Direction forced: ${direction}`);
     }
-
-    // 7. Build signal and execute
     const signal = {
       underlying,
       direction: finalDirection === 'call' ? 'bullish' : 'bearish',
@@ -1188,10 +926,8 @@ class OptionsEngine {
       gex: gexSummary,
       technicals: tech,
     };
-
     const optionsPositions = await alpaca.getOptionsPositions();
     const result = await this._executeEntry(signal, account, optionsPositions.length, et);
-
     if (result.success) {
       steps.push(`ORDER PLACED: ${signal.optionType} on ${underlying}`);
       return { success: true, message: `0DTE ${signal.optionType.toUpperCase()} on ${underlying} — order placed.`, details: { steps } };
@@ -1201,13 +937,10 @@ class OptionsEngine {
     }
   }
 
-  // ── Status ────────────────────────────────────────────────────────
-
   async getStatus() {
     const cfg = policy.getConfig();
     const optionsPositions = await alpaca.getOptionsPositions().catch(() => []);
     const et = this._getETTime();
-
     return {
       enabled: cfg.options_enabled,
       paper: alpaca.isPaper,
@@ -1247,8 +980,6 @@ class OptionsEngine {
     };
   }
 
-  // ── Discord Formatting ────────────────────────────────────────────
-
   formatStatusForDiscord(status) {
     const lines = [
       `**0DTE Options Trading Engine**`,
@@ -1256,8 +987,6 @@ class OptionsEngine {
       `Market: ${status.isMarketHours ? '🟢 Open' : '🔴 Closed'} (${status.minutesToClose} min to close)`,
       ``,
     ];
-
-    // Positions
     if (status.positions.length > 0) {
       lines.push(`**Open Positions** (${status.activePositions}/${status.maxPositions})`);
       for (const p of status.positions) {
@@ -1270,8 +999,6 @@ class OptionsEngine {
       lines.push(`_No open options positions_`);
       lines.push(``);
     }
-
-    // Risk
     lines.push(`**Risk**`);
     lines.push(`Daily Loss: \`$${status.dailyLoss.toFixed(0)}/$${status.maxDailyLoss}\``);
     lines.push(`Max Premium/Trade: \`$${status.config.maxPremium}\``);
@@ -1279,11 +1006,8 @@ class OptionsEngine {
     lines.push(`Swing: TP \`${status.config.swingTP}\` / SL \`${status.config.swingSL}\``);
     lines.push(`Min Conviction: \`${status.config.minConviction}/10\``);
     lines.push(`Underlyings: \`${status.config.underlyings.join(', ')}\``);
-
     return lines.join('\n');
   }
-
-  // ── Persistence ───────────────────────────────────────────────────
 
   _persistTrades() {
     const trades = [...this._activeTrades.values()];
@@ -1292,3 +1016,4 @@ class OptionsEngine {
 }
 
 module.exports = new OptionsEngine();
+exports.OptionsEngine = OptionsEngine;
