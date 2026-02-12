@@ -19,6 +19,10 @@
  *   - Emergency stop via /yolo disable
  */
 
+const { execFileSync } = require('child_process');
+const { writeFileSync, unlinkSync, mkdtempSync } = require('fs');
+const { join } = require('path');
+const { tmpdir } = require('os');
 const Storage = require('./storage');
 const auditLog = require('./audit-log');
 const reactions = require('./reactions');
@@ -595,6 +599,25 @@ ${currentCode}`;
       }
     }
 
+    // Truncation guard: block if AI output lost >30% of the file
+    const oldLineCount = currentCode.split('\n').length;
+    const newLineCount = newCode.split('\n').length;
+    if (oldLineCount > 20 && newLineCount < oldLineCount * 0.7) {
+      const pctLost = Math.round((1 - newLineCount / oldLineCount) * 100);
+      console.log(`[YOLO] Blocked: file shrank ${pctLost}% (${oldLineCount} → ${newLineCount} lines) — likely AI truncation`);
+      this._addJournal('blocked', filePath, `Truncation detected: ${oldLineCount} → ${newLineCount} lines (${pctLost}% lost)`, source);
+      return null;
+    }
+
+    // Syntax validation: run node --check before committing .js files
+    if (filePath.endsWith('.js')) {
+      const valid = this._syntaxCheck(newCode, filePath);
+      if (!valid) {
+        this._addJournal('blocked', filePath, 'Syntax validation failed — code does not parse', source);
+        return null;
+      }
+    }
+
     // Commit the change
     const commitMsg = `YOLO: ${instruction.slice(0, 70)}`;
     const result = await github.updateFile(filePath, newCode, commitMsg);
@@ -653,6 +676,30 @@ ${currentCode}`;
     const obj = {};
     for (const [k, v] of this._fileCooldowns) obj[k] = v;
     this._storage.set('fileCooldowns', obj);
+  }
+
+  // ── Syntax Validation ──────────────────────────────────────────
+
+  /**
+   * Writes code to a temp file and runs `node --check` to verify it parses.
+   * Returns true if the code is syntactically valid JS.
+   */
+  _syntaxCheck(code, filePath) {
+    let tmpFile = null;
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'yolo-'));
+      tmpFile = join(dir, 'check.js');
+      writeFileSync(tmpFile, code);
+      execFileSync('node', ['--check', tmpFile], { timeout: 5000, stdio: 'pipe' });
+      console.log(`[YOLO] Syntax OK: ${filePath}`);
+      return true;
+    } catch (err) {
+      const stderr = err.stderr ? err.stderr.toString().slice(0, 200) : err.message;
+      console.log(`[YOLO] Syntax FAILED for ${filePath}: ${stderr}`);
+      return false;
+    } finally {
+      if (tmpFile) try { unlinkSync(tmpFile); } catch {}
+    }
   }
 
   // ── Journal ─────────────────────────────────────────────────────
