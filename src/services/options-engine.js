@@ -1,4 +1,4 @@
-const alpaca = require('./alpaca');
+const alpaca = require('./alpaca').alpaca;
 const gamma = require('./gamma');
 const GEXEngine = require('./gex-engine');
 const gammaSqueeze = require('./gamma-squeeze');
@@ -14,6 +14,7 @@ const config = require('../config');
 const Storage = require('./storage');
 
 const MAX_CONTRACTS_PER_SCAN = 20;
+
 const MARKET_OPEN_HOUR = 9;
 const MARKET_OPEN_MIN = 30;
 const MARKET_CLOSE_HOUR = 16;
@@ -92,7 +93,7 @@ class OptionsEngine {
     }
 
     const minutesSinceOpen = et.minutesToClose > 0
-      ? (MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MIN) - et.minutesToClose - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN)
+      ? (MARKET_CLOSE_HOUR * 60) - et.minutesToClose - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN)
       : 0;
     if (minutesSinceOpen < 15) {
       this._log('cycle', `Skipping — ${minutesSinceOpen} min since open (waiting for 15 min price discovery)`);
@@ -107,10 +108,8 @@ class OptionsEngine {
       policy.resetDaily(equity);
 
       const optionsPositions = await alpaca.getOptionsPositions();
-
-      await this._monitorPositions(et.minutesToClose, optionsPositions);
-
       if (optionsPositions.length < cfg.options_max_positions && et.minutesToClose > cfg.options_close_before_minutes) {
+        this._log('cycle', `Scanning for entries — ${optionsPositions.length}/${cfg.options_max_positions} positions, ${et.minutesToClose} min left`);
         await this._scanForEntries(account, optionsPositions.length, et);
       } else if (et.minutesToClose <= cfg.options_close_before_minutes) {
         this._log('cycle', `Too close to market close (${et.minutesToClose} min) — exit-only mode`);
@@ -125,8 +124,9 @@ class OptionsEngine {
     }
   }
 
-  async _monitorPositions(minutesToClose, optionsPositions) {
+  async _monitorPositions(minutesToClose) {
     try {
+      const optionsPositions = await alpaca.getOptionsPositions();
       if (optionsPositions.length === 0) return;
 
       this._log('monitor', `Monitoring ${optionsPositions.length} options position(s)`);
@@ -171,6 +171,7 @@ class OptionsEngine {
   async _scanForEntries(account, currentOptionsPositions, et) {
     const cfg = policy.getConfig();
     const underlyings = cfg.options_underlyings || ['SPY', 'QQQ'];
+
     let macroRegime = { regime: 'CAUTIOUS', score: 0 };
     try {
       macroRegime = await macro.getRegime();
@@ -194,6 +195,7 @@ class OptionsEngine {
       try {
         const signal = await this._analyzeUnderlying(underlying, macroRegime, et);
         if (!signal) continue;
+
         this._log('trade', `EXECUTING: ${signal.optionType.toUpperCase()} on ${underlying} — conviction ${signal.conviction}/10, strategy ${signal.strategy}`);
         const result = await this._executeEntry(signal, account, currentOptionsPositions, et);
         if (result.success) {
@@ -210,8 +212,10 @@ class OptionsEngine {
 
   async _analyzeUnderlying(underlying, macroRegime, et) {
     const cfg = policy.getConfig();
+
     const cooldownKey = `opts_${underlying}`;
-    const lastScan = this._scanTimestamps?.get(cooldownKey) || 0;
+    if (!this._scanTimestamps) this._scanTimestamps = new Map();
+    const lastScan = this._scanTimestamps.get(cooldownKey) || 0;
     if (Date.now() - lastScan < (cfg.options_cooldown_minutes || 5) * 60 * 1000) {
       return null;
     }
@@ -226,28 +230,28 @@ class OptionsEngine {
       this._log('gex', `${underlying}: GEX unavailable (${err.message}) — proceeding with technicals only`);
     }
 
-    let bars;
+    let intradayTech;
+    const spot = gexSummary?.spot || null;
     try {
-      bars = await alpaca.getIntradayBars(underlying, { timeframe: '5Min', limit: 50 });
+      const bars = await alpaca.getIntradayBars(underlying, { timeframe: '5Min', limit: 50 });
       if (bars.length < 10) {
         this._log('tech', `${underlying}: not enough intraday bars (${bars.length}) — skipping`);
         this._markScanned(cooldownKey);
         return null;
       }
+      const refPrice = spot || bars[bars.length - 1].close;
+      intradayTech = this._computeIntradayTechnicals(bars, refPrice);
+      this._log('tech', `${underlying}: RSI=${intradayTech.rsi?.toFixed(1)}, MACD hist=${intradayTech.macd?.histogram?.toFixed(3) || 'N/A'}, momentum=${intradayTech.momentum.toFixed(2)}%, VWAP=$${intradayTech.vwap.toFixed(2)}, vol=${intradayTech.volumeTrend.toFixed(1)}x`);
     } catch (err) {
       this._log('tech', `${underlying}: intraday data error — ${err.message}`);
       this._markScanned(cooldownKey);
       return null;
     }
 
-    const refPrice = gexSummary?.spot || bars[bars.length - 1].close;
-    const intradayTech = this._computeIntradayTechnicals(bars, refPrice);
-    this._log('tech', `${underlying}: RSI=${intradayTech.rsi?.toFixed(1)}, MACD hist=${intradayTech.macd?.histogram?.toFixed(3) || 'N/A'}, momentum=${intradayTech.momentum.toFixed(2)}%, VWAP=$${intradayTech.vwap.toFixed(2)}, vol=${intradayTech.volumeTrend.toFixed(1)}x`);
-
     const gexRegime = gexSummary?.regime || { label: 'Unknown', confidence: 0 };
     const walls = gexSummary?.walls || { callWalls: [], putWalls: [] };
     const gammaFlip = gexSummary?.gammaFlip || null;
-    const spotPrice = spot || refPrice;
+    const spotPrice = spot || intradayTech.price;
 
     const directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spotPrice, macroRegime);
 
@@ -266,14 +270,16 @@ class OptionsEngine {
       mtfResult = await analyzeMTFEMA(underlying);
       const mtfDir = mtfResult.confluenceScore > 0 ? 'bullish' : 'bearish';
       const mtfMatchesDirection = mtfDir === directionSignals.direction;
+
       directionSignals.conviction = Math.max(1, Math.min(directionSignals.conviction + mtfResult.convictionBoost, 10));
       directionSignals.reasons.push(`MTF EMA: ${mtfResult.consensus} (${mtfResult.confluenceScore > 0 ? '+' : ''}${mtfResult.confluenceScore.toFixed(2)}, boost ${mtfResult.convictionBoost}) — ${mtfMatchesDirection ? 'CONFIRMS' : 'CONFLICTS'}`);
+
       this._log('mtf', `${underlying}: MTF=${mtfResult.consensus}, score=${mtfResult.confluenceScore.toFixed(2)}, boost=${mtfResult.convictionBoost}, bull=${mtfResult.bullishCount} bear=${mtfResult.bearishCount}`);
     } catch (err) {
       this._log('mtf', `${underlying}: MTF EMA unavailable (${err.message}) — proceeding without`);
     }
 
-    this._log('scan', `${underlying}: direction=${directionSignals.direction}, bull=${directionSignals.bullPoints.toFixed(1)} vs bear=${directionSignals.bearPoints.toFixed(1)}, conviction=${directionSignals.conviction}/10, strategy=${directionSignals.strategy}`);
+    this._log('scan', `${underlying}: direction=${directionSignals.direction}, conviction=${directionSignals.conviction}/10, strategy=${directionSignals.strategy}, reasons=[${directionSignals.reasons.join(', ')}]`);
 
     if (directionSignals.conviction < 3) {
       this._log('scan', `${underlying}: weak directional signals (${directionSignals.conviction}/10) — skipping`);
@@ -333,11 +339,16 @@ class OptionsEngine {
   _computeIntradayTechnicals(bars, currentPrice) {
     const closes = bars.map(b => b.close);
     const volumes = bars.map(b => b.volume);
+
     const rsi = technicals.calculateRSI(closes, 14);
+
     const macd = technicals.calculateMACD(closes);
+
     const bb = technicals.calculateBollingerBands(closes, 20);
+
     const atrBars = bars.map(b => ({ h: b.high, l: b.low, c: b.close }));
     const atr = technicals.calculateATR(atrBars, 14);
+
     let cumTPV = 0, cumVol = 0;
     for (let i = 0; i < bars.length; i++) {
       const tp = (bars[i].high + bars[i].low + bars[i].close) / 3;
@@ -345,19 +356,23 @@ class OptionsEngine {
       cumVol += bars[i].volume;
     }
     const vwap = cumVol > 0 ? cumTPV / cumVol : currentPrice;
+
     const recentVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
     const earlierVol = volumes.slice(-15, -5).reduce((a, b) => a + b, 0) / Math.max(volumes.slice(-15, -5).length, 1);
     const volumeTrend = earlierVol > 0 ? recentVol / earlierVol : 1;
+
     const recentCloses = closes.slice(-5);
     const momentum = recentCloses.length >= 2
       ? ((recentCloses[recentCloses.length - 1] - recentCloses[0]) / recentCloses[0]) * 100
       : 0;
+
     const lows = bars.map(b => b.low);
     const highs = bars.map(b => b.high);
     const recentLows = lows.slice(-20);
     const recentHighs = highs.slice(-20);
     const nearestSupport = Math.min(...recentLows);
     const nearestResistance = Math.max(...recentHighs);
+
     return {
       price: currentPrice,
       rsi,
@@ -460,8 +475,7 @@ class OptionsEngine {
       }
     }
 
-    const recentVol = tech.volumeTrend > 1.5 ? 1 : 0;
-    if (recentVol) {
+    if (tech.volumeTrend > 1.5) {
       if (tech.momentum > 0) bullPoints += 0.5;
       else bearPoints += 0.5;
       reasons.push(`Volume surging ${tech.volumeTrend.toFixed(1)}x (+0.5 direction confirm)`);
@@ -502,7 +516,7 @@ class OptionsEngine {
       tech.macd ? `MACD: ${tech.macd.macd.toFixed(3)} | Signal: ${tech.macd.signal.toFixed(3)} | Hist: ${tech.macd.histogram.toFixed(3)}` : null,
       tech.bollinger ? `Bollinger: $${tech.bollinger.lower.toFixed(2)} — $${tech.bollinger.middle.toFixed(2)} — $${tech.bollinger.upper.toFixed(2)}` : null,
       `VWAP: $${tech.vwap.toFixed(2)} (price ${tech.priceAboveVWAP ? 'ABOVE' : 'BELOW'})`,
-      `ATR: $${tech.atr?.toFixed(2) || 'N/A'} | Momentum(5-bar): ${tech.momentum.toFixed(2)}%`,
+      `ATR: $${tech.atr?.toFixed(2) || 'N/A'} | Momentum: ${tech.momentum.toFixed(2)}%`,
       `Volume: ${tech.volumeTrend.toFixed(1)}x average`,
       `Support: $${tech.nearestSupport.toFixed(2)} | Resistance: $${tech.nearestResistance.toFixed(2)}`,
       ``,
@@ -575,6 +589,7 @@ class OptionsEngine {
 
     try {
       const options = await alpaca.getOptionsSnapshots(underlying, et.todayString, optionType);
+
       if (options.length === 0) {
         this._log('contract', `${underlying}: no ${optionType} options for ${et.todayString}`);
         return null;
@@ -629,7 +644,6 @@ class OptionsEngine {
 
       const best = scored[0];
       if (!best) return null;
-
       if (best.spread > cfg.options_max_spread_pct) {
         this._log('contract', `${underlying}: best contract spread ${(best.spread * 100).toFixed(1)}% exceeds max ${(cfg.options_max_spread_pct * 100).toFixed(0)}%`);
         return null;
@@ -646,6 +660,7 @@ class OptionsEngine {
 
   async _executeEntry(signal, account, currentOptionsPositions, et) {
     const cfg = policy.getConfig();
+
     const contract = await this._selectContract(signal);
     if (!contract) {
       return { success: false, reason: 'No suitable contract found' };
@@ -674,6 +689,7 @@ class OptionsEngine {
     }
 
     const limitPrice = Math.round(mid * 100) / 100;
+
     try {
       const order = await alpaca.createOptionsOrder({
         symbol: contract.symbol,
@@ -737,17 +753,20 @@ class OptionsEngine {
     if (!this._isMarketHours()) return;
 
     const underlying = (alert.ticker || 'SPY').toUpperCase();
+
     if (alert.action !== 'BUY' && alert.action !== 'SELL') {
       this._log('alert_trigger', `${underlying}: ignoring non-directional alert (${alert.action})`);
       return;
     }
 
     const directionHint = alert.action === 'BUY' ? 'bullish' : 'bearish';
+
     this._log('alert_trigger', `${underlying}: TradingView ${alert.action} signal received — "${alert.reason || alert.action}" [${alert.confidence || 'no conf'}] — running full analysis`);
 
     const et = this._getETTime();
+
     const minutesSinceOpen = et.minutesToClose > 0
-      ? (MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MIN) - et.minutesToClose - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN)
+      ? (MARKET_CLOSE_HOUR * 60) - et.minutesToClose - (MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN)
       : 0;
     if (minutesSinceOpen < 15) {
       this._log('alert_trigger', `${underlying}: too early after open (${minutesSinceOpen} min) — skipping`);
@@ -807,10 +826,10 @@ class OptionsEngine {
 
       const spotPrice = spot || intradayTech.price;
 
-      let gexRegime = gexSummary?.regime || { label: 'Unknown', confidence: 0 };
+      const gexRegime = gexSummary?.regime || { label: 'Unknown', confidence: 0 };
       const walls = gexSummary?.walls || { callWalls: [], putWalls: [] };
       const gammaFlip = gexSummary?.gammaFlip || null;
-      let directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spotPrice, macroRegime);
+      const directionSignals = this._assessDirection(intradayTech, gexRegime, walls, gammaFlip, spotPrice, macroRegime);
 
       let adjustedConviction = directionSignals.conviction;
       const alertMatchesAnalysis = directionSignals.direction === directionHint;
@@ -910,12 +929,13 @@ class OptionsEngine {
     const et = this._getETTime();
     const steps = [];
 
+    let account;
     try {
-      const account = await alpaca.getAccount();
-      steps.push(`Account: $${Number(account.equity).toFixed(0)} equity`);
+      account = await alpaca.getAccount();
     } catch (err) {
-      return { success: false, message: `Account fetch failed: ${err.message}`, details: { steps } };
+      return { success: false, message: `Account fetch failed: ${err.message}` };
     }
+    steps.push(`Account: $${Number(account.equity).toFixed(0)} equity`);
 
     let macroRegime = { regime: 'CAUTIOUS', score: 0 };
     try {
@@ -952,20 +972,16 @@ class OptionsEngine {
     let reason = dirSignals.reasons.join('; ');
 
     if (!direction) {
-      try {
-        const aiDecision = await this._askOptionsAI(underlying, gexSummary.spot, tech, gexSummary, macroRegime, dirSignals, et);
-        if (aiDecision) {
-          conviction = aiDecision.conviction;
-          reason = aiDecision.reason;
-          steps.push(`AI: ${aiDecision.action} — conviction ${aiDecision.conviction}/10`);
-          if (aiDecision.action === 'SKIP') {
-            return { success: false, message: `AI says SKIP: ${aiDecision.reason}`, details: { steps } };
-          }
-        } else {
-          steps.push(`AI: no response`);
+      const aiDecision = await this._askOptionsAI(underlying, gexSummary.spot, tech, gexSummary, macroRegime, dirSignals, et);
+      if (aiDecision) {
+        conviction = aiDecision.conviction;
+        reason = aiDecision.reason;
+        steps.push(`AI: ${aiDecision.action} — conviction ${aiDecision.conviction}/10`);
+        if (aiDecision.action === 'SKIP') {
+          return { success: false, message: `AI says SKIP: ${aiDecision.reason}`, details: { steps } };
         }
-      } catch (err) {
-        steps.push(`AI: error ${err.message}`);
+      } else {
+        steps.push(`AI: no response`);
       }
     } else {
       steps.push(`Direction forced: ${direction}`);
@@ -987,7 +1003,7 @@ class OptionsEngine {
     const result = await this._executeEntry(signal, account, optionsPositions.length, et);
 
     if (result.success) {
-      steps.push(`ORDER PLACED: ${signal.optionType.toUpperCase()} on ${underlying}`);
+      steps.push(`ORDER PLACED: ${signal.optionType} on ${underlying}`);
       return { success: true, message: `0DTE ${signal.optionType.toUpperCase()} on ${underlying} — order placed.`, details: { steps } };
     } else {
       steps.push(`ORDER FAILED: ${result.reason}`);
