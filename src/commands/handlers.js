@@ -24,16 +24,13 @@ const sectors = require('../services/sectors');
 const policy = require('../services/policy');
 const optionsEngine = require('../services/options-engine');
 const initiative = require('../services/initiative');
-const gammaSqueeze = require('../services/gamma-squeeze');
-const yoloMode = require('../services/yolo-mode');
+
 const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
 const { instrumentInteraction } = require('../utils/safe-send');
 
 async function handleCommand(interaction) {
-  // Instrument all outbound interaction methods (reply, editReply, followUp, deferReply)
-  // with diagnostic logging so we can trace send failures.
   instrumentInteraction(interaction);
 
   const { commandName } = interaction;
@@ -96,10 +93,6 @@ async function handleCommand(interaction) {
       return handleOdds(interaction);
     case 'bets':
       return handleBets(interaction);
-    case 'flow':
-      return handleFlow(interaction);
-    case 'whales':
-      return handleWhales(interaction);
     case 'options':
       return handleOptions(interaction);
     case 'brain':
@@ -149,7 +142,7 @@ async function handleMemory(interaction) {
     parts.push(`**Interactions:** ${userData.interactionCount}`);
 
     if (userData.firstSeen) {
-      parts.push(`**First seen:** ${new Date(userData.firstSeen).toLocaleDateString()}`);
+      parts.push(`**First seen:** ${new Date(userData.firstSeen).toLocaleDateString()}");
     }
 
     const frequentTickers = memory.getFrequentTickers(userId);
@@ -524,7 +517,7 @@ async function handleWatchlist(interaction) {
         const s = context.snapshot || {};
         const price = q.price != null ? `$${q.price.toFixed(2)}` : 'N/A';
         const pct = q.changePercent;
-        const changeStr = pct != null ? ` (${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
+        const changeStr = pct != null ? `(${pct > 0 ? '+' : ''}${pct.toFixed(2)}%)` : '';
         const name = s.name || '';
         lines.push(`**${symbol}** ${name ? `— ${name} ` : ''}— ${price}${changeStr}`);
         if (context.source) sources.add(context.source);
@@ -1240,7 +1233,7 @@ async function handleAgent(interaction) {
         if (cfg.dangerousMode) {
           const result = policy.disableDangerousMode();
           await interaction.editReply(
-            '**SHARK — Dangerous Mode DISABLED**\n' +
+            '**SHARK — DANGEROUS MODE DISABLED**\n' +
             'Restored previous trading parameters.\n\n' +
             '_Use `/agent config` to verify settings._'
           );
@@ -1286,7 +1279,7 @@ async function handleAgent(interaction) {
         const lines = [];
         if (result.success) {
           lines.push(`**SHARK Trade Executed**`);
-          lines.push(`${result.message}`);
+          lines.push(result.message);
         } else {
           lines.push(`**SHARK Trade — ${ticker.toUpperCase()}**`);
           lines.push(`❌ ${result.message}`);
@@ -1696,7 +1689,7 @@ async function handleBrain(interaction) {
     }
     const lines = [`**Initiative Journal** (last ${entries.length} entries)\n`];
     for (const e of entries.reverse()) {
-      const time = new Date(e.timestamp).toLocaleTimeString('en-US', {
+      const time = new Date(e.timestamp).toLocaleString('en-US', {
         timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit',
       });
       const typeEmoji = {
@@ -1705,7 +1698,7 @@ async function handleBrain(interaction) {
       }[e.type] || '📝';
       lines.push(`${typeEmoji} **${time} ET** [${e.type}] ${e.content.slice(0, 200)}`);
     }
-    return interaction.reply(lines.join('\n').slice(0, 2000));
+    return interaction.reply(lines.join('\n'));
   }
 
   if (action === 'tuning') {
@@ -1722,7 +1715,7 @@ async function handleBrain(interaction) {
       });
       lines.push(`🧠 **${time} ET**\n${e.content.slice(0, 300)}\n`);
     }
-    return interaction.reply(lines.join('\n').slice(0, 2000));
+    return interaction.reply(lines.join('\n'));
   }
 
   return interaction.reply({ content: 'Unknown brain action.', flags: MessageFlags.Ephemeral });
@@ -1792,7 +1785,8 @@ async function handleYolo(interaction) {
         `**Total improvements:** ${s.totalImprovements}`,
         `**Consecutive failures:** ${s.consecutiveFailures}/${s.failureThreshold}`,
         '',
-        '_The bot scans its own code, finds issues, generates fixes, and deploys them autonomously._',
+        '_The bot scans its own code, identifies improvements, ' +
+        'generates fixes, and deploys them autonomously._',
       ];
       return interaction.reply(lines.join('\n'));
     }
