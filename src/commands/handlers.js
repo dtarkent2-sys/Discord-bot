@@ -1826,9 +1826,13 @@ async function handleYolo(interaction) {
         `**Total improvements:** ${s.totalImprovements}`,
         `**Consecutive failures:** ${s.consecutiveFailures}/${s.failureThreshold}`,
         '',
-        '_The bot scans its own codebase, identifies improvements, ' +
-        'generates fixes, and deploys them autonomously via GitHub._',
-      ];
+        `**Branch:** \`${s.branch}\``,
+        `**Main protected:** ${s.mainProtected ? 'YES — commits go to branch' : 'NO'}`,
+        s.prUrl ? `**PR:** ${s.prUrl}` : '',
+        '',
+        '_Billy scans his own codebase and commits improvements to a branch. ' +
+        'Review & merge the PR when ready — main stays safe._',
+      ].filter(Boolean);
       return interaction.reply(lines.join('\n'));
     }
 
@@ -1836,10 +1840,11 @@ async function handleYolo(interaction) {
       yoloMode.enable();
       return interaction.reply(
         '**YOLO Mode ENABLED**\n' +
-        'The bot will now autonomously scan its own codebase, identify improvements, ' +
-        'generate fixes, and deploy them via GitHub.\n\n' +
-        'Safety: max 5 improvements/day, max 20 lines/commit, forbidden files protected, ' +
-        'auto-pause after 3 consecutive failures.\n\n' +
+        'Billy will autonomously scan his codebase, identify improvements, ' +
+        'and commit them to a **daily branch** (not main).\n\n' +
+        'A PR is auto-created for each day\'s changes — review & merge when ready.\n\n' +
+        'Safety: syntax validation, truncation guard, secret detection, ' +
+        'forbidden files protected, auto-pause after 10 consecutive failures.\n\n' +
         '_Use `/yolo status` to monitor, `/yolo disable` to stop._'
       );
     }
