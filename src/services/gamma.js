@@ -1,20 +1,3 @@
-/**
- * Gamma Exposure (GEX) Engine
- *
- * Pulls options chain data from Yahoo Finance (free, no API key needed),
- * calculates per-strike gamma exposure using Black-Scholes, finds the
- * gamma flip point, and generates bar-chart PNGs for Discord.
- *
- * Data source: Yahoo Finance options endpoint (OI, IV, strikes, expirations)
- * Spot price: FMP quote (already configured) with Yahoo fallback
- *
- * Key concepts:
- *   - GEX per strike = (CallOI × CallGamma − PutOI × PutGamma) × 100 × Spot
- *   - Gamma Flip = strike level where cumulative dealer GEX crosses zero
- *   - Above flip → dealers are long gamma (mean-reversion regime)
- *   - Below flip → dealers are short gamma (trend/volatility regime)
- */
-
 const path = require('path');
 
 // Ensure fontconfig can find a config file before canvas initialises.
@@ -95,7 +78,7 @@ class GammaService {
     return true;
   }
 
-  // ── Yahoo Finance auth (crumb + cookie) ──────────────────────────────
+  // ── Yahoo Finance auth (crumb + cookie) ───────────────────────────────────────
 
   /**
    * Yahoo Finance requires a session cookie + crumb token for API calls.
@@ -131,6 +114,7 @@ class GammaService {
     // Build cookie string (just the key=value parts)
     const cookieParts = rawCookies.map(c => c.split(';')[0]).filter(Boolean);
     if (cookieParts.length === 0) {
+      // Empty cookie list means no new set-cookie header was sent
       throw new Error('Yahoo Finance auth failed: no cookies returned from fc.yahoo.com');
     }
     this._yahooCookie = cookieParts.join('; ');
@@ -158,7 +142,7 @@ class GammaService {
     console.log(`[Gamma] Yahoo auth OK (crumb: ${this._yahooCrumb.slice(0, 8)}...)`);
   }
 
-  // ── Yahoo Finance options chain ──────────────────────────────────────
+  // ── Yahoo Finance options chain ────────────────────────────────────────────────
 
   /**
    * Fetch options chain from Yahoo Finance (with crumb auth).
@@ -332,7 +316,7 @@ class GammaService {
     return { chain, spotPrice, expiration: expDate, expirationEpoch: bestExp };
   }
 
-  // ── FMP spot price (fallback) ────────────────────────────────────────
+  // ── FMP spot price (fallback) ────────────────────────────────────────────────
 
   async _fmpSpotPrice(ticker) {
     if (!config.fmpApiKey) return null;
@@ -353,7 +337,7 @@ class GammaService {
     }
   }
 
-  // ── Black-Scholes gamma ──────────────────────────────────────────────
+  // ── Black-Scholes gamma ───────────────────────────────────────────────────────
 
   _normalPDF(x) {
     return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
@@ -377,7 +361,7 @@ class GammaService {
     return this._normalPDF(d1) / (S * sigma * Math.sqrt(T));
   }
 
-  // ── GEX calculation ──────────────────────────────────────────────────
+  // ── GEX calculation ───────────────────────────────────────────────────────────
 
   /**
    * Calculate net Gamma Exposure (GEX) per strike.
@@ -442,7 +426,7 @@ class GammaService {
     return { strikes, gex, totalGEX, maxGEX, minGEX };
   }
 
-  // ── Detailed GEX (canonical per-strike breakdown) ─────────────────────
+  // ── Detailed GEX (canonical per-strike breakdown) ─────────────────────────────
 
   /**
    * Calculate detailed per-strike Gamma Exposure with call/put breakdown.
@@ -571,7 +555,7 @@ class GammaService {
     return { strikes, 'totalNetGEX$': totalNetGEX };
   }
 
-  // ── Multi-expiry fetch ────────────────────────────────────────────────
+  // ── Multi-expiry fetch ──────────────────────────────────────────────────
 
   /**
    * Fetch available expirations for a ticker from Yahoo Finance.
@@ -644,7 +628,7 @@ class GammaService {
     return { ticker: upper, spotPrice, expirations: results, source };
   }
 
-  // ── Gamma flip detection ─────────────────────────────────────────────
+  // ── Gamma flip detection ───────────────────────────────────────────────────
 
   /**
    * Find the gamma flip point — the strike where cumulative GEX crosses zero.
@@ -682,7 +666,7 @@ class GammaService {
     };
   }
 
-  // ── Chart generation ─────────────────────────────────────────────────
+  // ── Chart generation ─────────────────────────────────────────────────────────
 
   /**
    * Generate a GEX bar chart as a PNG buffer (for Discord attachment).
@@ -806,220 +790,7 @@ class GammaService {
     return chartRenderer.renderToBuffer(chartConfig);
   }
 
-  // ── Alpaca GEX (uses pre-calculated greeks — no Black-Scholes needed) ─
-
-  /**
-   * Calculate GEX using Alpaca options snapshots.
-   * Alpaca provides gamma directly, so this is more accurate than our BS estimate.
-   */
-  calculateGEXFromAlpaca(options, spotPrice, expiration) {
-    const gexMap = new Map();
-
-    for (const opt of options) {
-      if (expiration && opt.expiration !== expiration) continue;
-
-      const strike = opt.strike;
-      const oi = opt.openInterest || 0;
-      const gamma = opt.gamma || 0;
-      const type = opt.type;
-
-      if (!strike || oi === 0 || gamma === 0) continue;
-
-      // GEX = OI × gamma × 100 (contract multiplier) × spot
-      const gexValue = oi * gamma * 100 * spotPrice;
-
-      const current = gexMap.get(strike) || 0;
-      if (type === 'call') {
-        gexMap.set(strike, current + gexValue);
-      } else if (type === 'put') {
-        gexMap.set(strike, current - gexValue);
-      }
-    }
-
-    const sorted = [...gexMap.entries()].sort((a, b) => a[0] - b[0]);
-    const lo = spotPrice * 0.85;
-    const hi = spotPrice * 1.15;
-    const filtered = sorted.filter(([k]) => k >= lo && k <= hi);
-
-    const strikes = filtered.map(([k]) => k);
-    const gex = filtered.map(([, v]) => v);
-
-    const totalGEX = gex.reduce((a, b) => a + b, 0);
-    let maxGEX = { strike: 0, value: -Infinity };
-    let minGEX = { strike: 0, value: Infinity };
-    for (let i = 0; i < strikes.length; i++) {
-      if (gex[i] > maxGEX.value) maxGEX = { strike: strikes[i], value: gex[i] };
-      if (gex[i] < minGEX.value) minGEX = { strike: strikes[i], value: gex[i] };
-    }
-
-    return { strikes, gex, totalGEX, maxGEX, minGEX };
-  }
-
-  /**
-   * Pick the best expiration from Alpaca options data based on user preference.
-   * @param {Array} options - options snapshots from Alpaca
-   * @param {string} pref - '0dte', 'weekly', or 'monthly'
-   */
-  _pickAlpacaExpiration(options, pref = '0dte') {
-    const expirations = [...new Set(options.map(o => o.expiration).filter(Boolean))].sort();
-    if (expirations.length === 0) return null;
-
-    const today = this._todayString();
-    const targetDate = this._computeTargetDate(pref);
-
-    // For 0DTE, look for today's expiration first
-    if (pref === '0dte') {
-      if (expirations.includes(today)) return today;
-      // If no 0DTE available, pick the nearest future expiration
-      const future = expirations.filter(e => e >= today);
-      return future[0] || expirations[expirations.length - 1];
-    }
-
-    // For weekly/monthly, find the closest match to the target date
-    if (targetDate && expirations.includes(targetDate)) return targetDate;
-
-    // Fallback: nearest expiration to the target
-    if (targetDate) {
-      const closest = expirations.reduce((best, e) =>
-        Math.abs(new Date(e) - new Date(targetDate)) < Math.abs(new Date(best) - new Date(targetDate)) ? e : best
-      );
-      return closest;
-    }
-
-    return expirations[0];
-  }
-
-  /**
-   * Compute the target expiration date based on user preference.
-   * @param {string} pref - '0dte', 'weekly', or 'monthly'
-   * @returns {string} YYYY-MM-DD
-   */
-  _computeTargetDate(pref = '0dte') {
-    const now = new Date();
-
-    if (pref === '0dte') {
-      return this._todayString();
-    }
-
-    if (pref === 'weekly') {
-      // This week's Friday
-      const dayOfWeek = now.getDay(); // 0=Sun
-      const daysUntilFriday = dayOfWeek <= 5 ? (5 - dayOfWeek) : (5 + 7 - dayOfWeek);
-      const friday = new Date(now);
-      friday.setDate(now.getDate() + (daysUntilFriday === 0 ? 0 : daysUntilFriday));
-      return this._formatDate(friday);
-    }
-
-    // monthly — 3rd Friday of current or next month
-    for (let offset = 0; offset <= 2; offset++) {
-      const d = new Date(now.getFullYear(), now.getMonth() + offset, 1);
-      const firstDay = d.getDay();
-      const firstFriday = firstDay <= 5 ? (5 - firstDay + 1) : (5 + 7 - firstDay + 1);
-      const thirdFriday = firstFriday + 14;
-      const opex = new Date(d.getFullYear(), d.getMonth(), thirdFriday);
-
-      if (opex >= now) {
-        return this._formatDate(opex);
-      }
-    }
-
-    return this._todayString();
-  }
-
-  /** Today's date as YYYY-MM-DD (ET timezone for market hours) */
-  _todayString() {
-    const now = new Date();
-    // Use ET for US markets
-    const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-    return this._formatDate(et);
-  }
-
-  /** Format a Date to YYYY-MM-DD */
-  _formatDate(d) {
-    const yyyy = d.getFullYear();
-    const mm = String(d.getMonth() + 1).padStart(2, '0');
-    const dd = String(d.getDate()).padStart(2, '0');
-    return `${yyyy}-${mm}-${dd}`;
-  }
-
-  // ── Full analysis (single entry point) ───────────────────────────────
-
-  /**
-   * Run full GEX analysis for a ticker.
-   * Prefers Alpaca (pre-calculated greeks, more reliable) → falls back to Yahoo Finance.
-   *
-   * @param {string} ticker - Stock symbol
-   * @param {string} [expirationPref='0dte'] - '0dte', 'weekly', or 'monthly'
-   * @returns {{ gexData, flip, spotPrice, expiration, chartBuffer, ticker, source }}
-   */
-  async analyze(ticker, expirationPref = '0dte') {
-    const upper = ticker.toUpperCase();
-
-    // ── Try Alpaca first (pre-calculated greeks, no auth headaches) ──
-    if (alpaca.enabled) {
-      try {
-        console.log(`[Gamma] Trying Alpaca for ${upper} (pref: ${expirationPref})...`);
-
-        // Compute target expiration based on user preference
-        const targetExp = this._computeTargetDate(expirationPref);
-        console.log(`[Gamma] Target expiration: ${targetExp}`);
-
-        const [options, snapshot] = await Promise.all([
-          alpaca.getOptionsSnapshots(upper, targetExp),
-          alpaca.getSnapshot(upper).catch(() => ({})),
-        ]);
-
-        // Get spot price from snapshot, or fall back to price fetcher
-        let alpacaSpot = snapshot.price;
-        if (!alpacaSpot && options.length > 0) {
-          console.log(`[Gamma] Alpaca snapshot missing price for ${upper}, trying price fetcher...`);
-          const pf = await priceFetcher.getCurrentPrice(upper);
-          if (!pf.error) alpacaSpot = pf.price;
-        }
-
-        if (options.length > 0 && alpacaSpot) {
-          const spotPrice = alpacaSpot;
-          // Use the actual expiration from returned data (may differ slightly)
-          const expiration = this._pickAlpacaExpiration(options, expirationPref) || targetExp;
-
-          const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
-          if (gexData.strikes.length > 0) {
-            const flip = this.findGammaFlip(gexData, spotPrice);
-            const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
-
-            console.log(`[Gamma] ${upper}: Alpaca OK — ${options.length} contracts, exp ${expiration}`);
-            return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Alpaca' };
-          }
-        }
-        console.log(`[Gamma] Alpaca returned insufficient data for ${upper}, falling back to Yahoo`);
-      } catch (err) {
-        console.warn(`[Gamma] Alpaca failed for ${upper}: ${err.message}, falling back to Yahoo`);
-      }
-    }
-
-    // ── Fallback: Yahoo Finance ──
-    const { chain, spotPrice: yahooSpot, expiration } = await this.fetchOptionsChain(upper, expirationPref);
-
-    let spotPrice = yahooSpot;
-    if (!spotPrice) {
-      // Try all price sources (FMP, Alpaca, yahoo-finance2)
-      const pf = await priceFetcher.getCurrentPrice(upper);
-      if (!pf.error) spotPrice = pf.price;
-    }
-    if (!spotPrice) throw new Error(`Could not determine spot price for ${upper}`);
-
-    const gexData = this.calculateGEX(chain, spotPrice);
-    if (gexData.strikes.length === 0) {
-      throw new Error(`Not enough options data at strikes near the current price for ${upper}`);
-    }
-
-    const flip = this.findGammaFlip(gexData, spotPrice);
-    const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
-
-    return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Yahoo' };
-  }
-
-  // ── Discord formatting ───────────────────────────────────────────────
+  // ── Discord formatting ───────────────────────────────────────────────────
 
   formatForDiscord(result) {
     const { ticker, spotPrice, expiration, gexData, flip } = result;
