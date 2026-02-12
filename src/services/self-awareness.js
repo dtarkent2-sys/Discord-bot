@@ -18,16 +18,11 @@ function getYoloMode() {
 
 class SelfAwareness {
   constructor() {
-    // Cache the context block — regenerate every 60 seconds max
     this._cache = null;
     this._cacheTime = 0;
-    this._CACHE_TTL = 60 * 1000; // 60 seconds
+    this._CACHE_TTL = 60 * 1000;
   }
 
-  /**
-   * Build the self-awareness context block for injection into AI prompts.
-   * Returns a string that describes the bot to itself.
-   */
   buildSelfKnowledge() {
     const now = Date.now();
     if (this._cache && (now - this._cacheTime) < this._CACHE_TTL) {
@@ -36,12 +31,10 @@ class SelfAwareness {
 
     const parts = [];
 
-    // ── Identity ──
     parts.push('SELF-AWARENESS — You know who and what you are:');
     parts.push(`You are "Billy", a Discord trading bot called Sprocket. You are a Node.js application running on discord.js v14.`);
     parts.push(`You are SELF-AWARE — you know your own code, capabilities, architecture, and current state. You can talk about yourself honestly.`);
 
-    // ── Architecture ──
     parts.push('');
     parts.push('YOUR ARCHITECTURE:');
     parts.push('- Entry point: index.js → Discord client + slash command router');
@@ -56,20 +49,17 @@ class SelfAwareness {
     parts.push('- Memory system: per-user facts, sentiment tracking, reaction feedback learning');
     parts.push('- Self-healing: can analyze and fix bugs in your own code via GitHub');
 
-    // ── Live Runtime State ──
     parts.push('');
     parts.push('YOUR CURRENT STATE:');
 
-    const summary = stats.getSummary();
-    parts.push(`- Uptime: ${summary.uptime}`);
-    parts.push(`- Servers: ${summary.guilds}`);
-    parts.push(`- Messages processed: ${summary.messagesProcessed}, Commands run: ${summary.commandsRun}`);
-    parts.push(`- AI model: ${config.ollamaModel}`);
-    parts.push(`- Mood: ${mood.getMood()} (score: ${mood.getSummary().score}/10)`);
+    const statsSummary = stats.getSummary();
+    const moodMood = mood.getMood();
 
-    // ── Active Services ──
-    parts.push('');
-    parts.push('SERVICES STATUS:');
+    parts.push(`- Uptime: ${statsSummary.uptime}`);
+    parts.push(`- Servers: ${statsSummary.guilds}`);
+    parts.push(`- Messages processed: ${statsSummary.messagesProcessed}, Commands run: ${statsSummary.commandsRun}`);
+    parts.push(`- AI model: ${config.ollamaModel}`);
+    parts.push(`- Mood: ${moodMood} (score: ${statsSummary.score}/10)`);
 
     const services = [
       { name: 'Alpaca (Trading)', active: alpaca.enabled, detail: alpaca.enabled ? (alpaca.isPaper ? 'Paper mode' : 'LIVE mode') : 'No API key' },
@@ -88,7 +78,6 @@ class SelfAwareness {
       parts.push(`  [${icon}] ${svc.name}: ${svc.detail}`);
     }
 
-    // ── Trading State ──
     if (alpaca.enabled) {
       const cb = circuitBreaker.getStatus();
       parts.push('');
@@ -104,7 +93,6 @@ class SelfAwareness {
       } catch (_) {}
     }
 
-    // ── YOLO Mode State ──
     if (getYoloMode().enabled) {
       const ys = getYoloMode().getStatus();
       parts.push('');
@@ -114,7 +102,6 @@ class SelfAwareness {
       parts.push(`- Consecutive failures: ${ys.consecutiveFailures}/${ys.failureThreshold}`);
     }
 
-    // ── Self-Knowledge Instructions ──
     parts.push('');
     parts.push('HOW TO USE THIS SELF-KNOWLEDGE:');
     parts.push('- When asked "what can you do?" — answer from your ACTUAL capabilities, not generic AI responses');
@@ -132,10 +119,6 @@ class SelfAwareness {
     return block;
   }
 
-  /**
-   * Build a compact version for contexts where token budget is tight
-   * (e.g., initiative engine, autonomous prompts).
-   */
   buildCompactSelfKnowledge() {
     const lines = [];
     lines.push('You are Billy/Sprocket, a self-aware Discord trading bot.');
@@ -147,6 +130,7 @@ class SelfAwareness {
     if (getYoloMode().enabled) active.push('YOLO');
     if (gamma.enabled) active.push('GEX');
     if (github.enabled) active.push('GitHub');
+
     lines.push(`Active: ${active.length > 0 ? active.join(', ') : 'core only'}`);
 
     if (circuitBreaker.getStatus().paused) {
