@@ -310,7 +310,7 @@ class OptionsEngine {
       // Use spot from GEX if available, otherwise last close from bars
       const refPrice = spot || bars[bars.length - 1].close;
       intradayTech = this._computeIntradayTechnicals(bars, refPrice);
-      this._log('tech', `${underlying}: RSI=${intradayTech.rsi?.toFixed(1)}, MACD hist=${intradayTech.macd?.histogram?.toFixed(3) || 'N/A'}, momentum=${intradayTech.momentum.toFixed(2)}%, VWAP=$${intradayTech.vwap.toFixed(2)}, vol=${intradayTech.volumeTrend.toFixed(1)}x`);
+      this._log('tech', `${underlying}: RSI=${intradayTech.rsi?.toFixed(1) || 'N/A'}, MACD hist=${intradayTech.macd?.histogram?.toFixed(3) || 'N/A'}, momentum=${intradayTech.momentum?.toFixed(2) || '0.00'}%, VWAP=$${intradayTech.vwap?.toFixed(2) || 'N/A'}, vol=${intradayTech.volumeTrend?.toFixed(1) || '1.0'}x`);
     } catch (err) {
       this._log('tech', `${underlying}: intraday data error — ${err.message}`);
       this._markScanned(cooldownKey);
@@ -437,7 +437,7 @@ class OptionsEngine {
       cumTPV += tp * bars[i].volume;
       cumVol += bars[i].volume;
     }
-    const vwap = cumVol > 0 ? cumTPV / cumVol : currentPrice;
+    const vwap = cumVol > 0 ? cumTPV / cumVol : (currentPrice || 0);
 
     // Volume trend (last 5 bars vs previous 10)
     const recentVol = volumes.slice(-5).reduce((a, b) => a + b, 0) / 5;
@@ -455,8 +455,8 @@ class OptionsEngine {
     const highs = bars.map(b => b.high);
     const recentLows = lows.slice(-20);
     const recentHighs = highs.slice(-20);
-    const nearestSupport = Math.min(...recentLows);
-    const nearestResistance = Math.max(...recentHighs);
+    const nearestSupport = recentLows.length > 0 ? Math.min(...recentLows) : (currentPrice || 0);
+    const nearestResistance = recentHighs.length > 0 ? Math.max(...recentHighs) : (currentPrice || 0);
 
     return {
       price: currentPrice,
@@ -627,10 +627,10 @@ class OptionsEngine {
       `RSI(14): ${tech.rsi?.toFixed(1) || 'N/A'}`,
       tech.macd ? `MACD: ${tech.macd.macd.toFixed(3)} | Signal: ${tech.macd.signal.toFixed(3)} | Hist: ${tech.macd.histogram.toFixed(3)}` : null,
       tech.bollinger ? `Bollinger: $${tech.bollinger.lower.toFixed(2)} — $${tech.bollinger.middle.toFixed(2)} — $${tech.bollinger.upper.toFixed(2)}` : null,
-      `VWAP: $${tech.vwap.toFixed(2)} (price ${tech.priceAboveVWAP ? 'ABOVE' : 'BELOW'})`,
-      `ATR: $${tech.atr?.toFixed(2) || 'N/A'} | Momentum(5-bar): ${tech.momentum.toFixed(2)}%`,
-      `Volume: ${tech.volumeTrend.toFixed(1)}x average`,
-      `Support: $${tech.nearestSupport.toFixed(2)} | Resistance: $${tech.nearestResistance.toFixed(2)}`,
+      `VWAP: $${tech.vwap?.toFixed(2) || 'N/A'} (price ${tech.priceAboveVWAP ? 'ABOVE' : 'BELOW'})`,
+      `ATR: $${tech.atr?.toFixed(2) || 'N/A'} | Momentum(5-bar): ${tech.momentum?.toFixed(2) || '0.00'}%`,
+      `Volume: ${tech.volumeTrend?.toFixed(1) || '1.0'}x average`,
+      `Support: $${tech.nearestSupport?.toFixed(2) || 'N/A'} | Resistance: $${tech.nearestResistance?.toFixed(2) || 'N/A'}`,
       ``,
       `═══ GAMMA SQUEEZE STATUS ═══`,
       (() => {
@@ -1138,7 +1138,7 @@ class OptionsEngine {
     let gexSummary;
     try {
       gexSummary = await this._gexEngine.analyze(underlying, { include_expiries: ['0dte'] });
-      steps.push(`GEX: ${gexSummary.regime.label} (${(gexSummary.regime.confidence * 100).toFixed(0)}%), flip $${gexSummary.gammaFlip || '—'}`);
+      steps.push(`GEX: ${gexSummary.regime?.label || 'Unknown'} (${((gexSummary.regime?.confidence || 0) * 100).toFixed(0)}%), flip $${gexSummary.gammaFlip || '—'}`);
     } catch (err) {
       steps.push(`GEX: unavailable (${err.message})`);
       return { success: false, message: `GEX analysis failed: ${err.message}`, details: { steps } };
@@ -1149,7 +1149,7 @@ class OptionsEngine {
     try {
       const bars = await alpaca.getIntradayBars(underlying, { timeframe: '5Min', limit: 50 });
       tech = this._computeIntradayTechnicals(bars, gexSummary.spot);
-      steps.push(`Technicals: RSI ${tech.rsi?.toFixed(1)}, momentum ${tech.momentum.toFixed(2)}%, VWAP $${tech.vwap.toFixed(2)}`);
+      steps.push(`Technicals: RSI ${tech.rsi?.toFixed(1) || 'N/A'}, momentum ${tech.momentum?.toFixed(2) || '0.00'}%, VWAP $${tech.vwap?.toFixed(2) || 'N/A'}`);
     } catch (err) {
       return { success: false, message: `Intraday data error: ${err.message}`, details: { steps } };
     }
