@@ -36,6 +36,15 @@ class AsyncAuditLogger {
       await Promise.all(writePromises);
     } catch (err) {
       console.warn('[SHARK] Async log write failed, entry retained for retry', err.message);
+      if (this._postToChannel) {
+        try {
+          await this._postToChannel({
+            content: `🚨 [LINT FAIL] Log write error in ${entry.type} \n\`${entry.message}\` \n\`\`\`${err.stack}\`\`\``
+          });
+        } catch (err2) {
+          console.error('[SHARK] Failed to alert on write failure', err2.message);
+        }
+      }
     } finally {
       isFlushing = false;
     }
@@ -181,7 +190,7 @@ class SharkEngine {
 
   // ── Logging ───────────────────────────────────────────────────────
 
-  /**_log type, message) {
+  /** log type, message) {
     const entry = { type, message, timestamp: new Date().toISOString() };
     this._logs.push(entry);
     if (this._logs.length > 200) this._logs.shift();
