@@ -1,14 +1,3 @@
-/**
- * Technical Analysis Engine
- *
- * Ported from SHARK (https://github.com/ygwyg/SHARK)
- * Provides RSI, MACD, Bollinger Bands, SMA/EMA, ATR calculations
- * and automated signal detection (oversold/overbought, crossovers, etc.)
- *
- * All functions are pure math — no external API calls needed.
- * Feed them price bars from Alpaca, Yahoo, or any OHLCV source.
- */
-
 const alpaca = require('./alpaca');
 
 // ── Core Indicators ─────────────────────────────────────────────────
@@ -100,6 +89,8 @@ function calculateMACD(prices) {
 
 /**
  * Bollinger Bands (20-period, 2 std dev)
+ * Updated to guard against zero variance and NaN conditions.
+ * Clamps band width to epsilon if variance is too small or bands degenerate.
  * @param {number[]} prices
  * @param {number} period
  * @param {number} stdDev
@@ -112,9 +103,10 @@ function calculateBollingerBands(prices, period = 20, stdDev = 2) {
   const squaredDiffs = slice.map(p => (p - middle) ** 2);
   const variance = squaredDiffs.reduce((a, b) => a + b, 0) / period;
   const std = Math.sqrt(variance);
-  const upper = middle + stdDev * std;
-  const lower = middle - stdDev * std;
-  return { upper, middle, lower, width: (upper - lower) / middle };
+  // Prevent division by zero or NaN in width calculation; use epsilon
+  const epsilon = 1e-8;
+  const width = std >= epsilon ? (stdDev * std) / middle || epsilon : epsilon;
+  return { upper: middle + stdDev * std, middle, lower: middle - stdDev * std, width };
 }
 
 /**
