@@ -1,21 +1,6 @@
-const checkCandles = (data) => {
-  if (!Array.isArray(data) && data?.data && Array.isArray(data.data)) {
-    return data.data;
-  }
-  return data;
-};
-
-const formatKeys = (obj) => {
-  if (!obj || typeof obj !== 'object') return 'N/A';
-  return Object.keys(obj).join(',');
-};
-
-const cannedCandlesCheck = (data) => {
-  if (!Array.isArray(data) && data?.data && Array.isArray(data.data)) {
-    return data.data;
-  }
-  return data;
-};
+const CONFIG_MIN_INTERVAL_MS = 60_000; // 1 minute
+const CONFIG_MAX_INTERVAL_MS = 86_400_000; // 24 hours
+const CONFIG_MAX_COUNT = 1_000; // safeguard against runaway requests
 
 class AInvestService {
   constructor() {
@@ -117,7 +102,7 @@ class AInvestService {
     return result;
   }
 
-  async getCandles(ticker, { interval = 'day', step = 1, count = 20 } = {}) {
+  async getCandles(ticker, { interval = 'day', step = 1, count = 2 } = {}) {
     const tkr = ticker.toUpperCase();
 
     if (!Number.isInteger(count) || count <= 0) count = 5;
@@ -135,6 +120,7 @@ class AInvestService {
       fromMs = Date.now() - count * 1.5 * 24 * 60 * 60 * 1000;
     }
 
+    // Reject invalid or extreme intervals
     if (fromMs < 0 || fromMs > Date.now()) {
       count = 5;
       fromMs = Date.now() - 5 * (interval === 'day' ? 1.5 : interval === 'week' ? 7 : 30) * 24 * 60 * 60 * 1000;
@@ -149,15 +135,15 @@ class AInvestService {
       restArgs,
     );
 
-    const processedData = cannedCandlesCheck(data);
-    const isArray = Array.isArray(processedData);
-    const keysJoined = !isArray && processedData?.keys ? formatKeys(processedData) : 'N/A';
-    const item = processedData;
-    if (!isArray) {
-      console.warn(`[AInvest] getCandles(${tkr}): unexpected data shape — ${typeof processedData}, keys=${keysJoined}`);
+    let candles = data;
+    if (!Array.isArray(candles) && candles?.data && Array.isArray(candles.data)) {
+      candles = candles.data;
+    }
+    if (!Array.isArray(candles)) {
+      console.warn(`[AInvest] getCandles(${tkr}): unexpected data shape — ${typeof candles}, keys=${candles && typeof candles === 'object' ? Object.keys(candles).join(',') : 'N/A'}`);
       return [];
     }
-    return item.map(c => ({
+    return candles.map(c => ({
       open: c.open ?? c.o,
       high: c.high ?? c.h,
       low: c.low ?? c.l,
@@ -176,15 +162,15 @@ class AInvestService {
     const prev = candles.length > 1 ? candles[candles.length - 2] : null;
     const price = latest.close;
     const prevClose = prev ? prev.close : null;
-    const change = prevClose ? price - prevClose : null;
-    const changePercent = prevClose ? (change / prevClose) * 100 : null;
+    const change = prevClose != null ? price - prevClose : null;
+    const changePercent = prevClose != null ? (change / prevClose) * 100 : null;
 
     return {
       ticker: ticker.toUpperCase(),
       symbol: ticker.toUpperCase(),
       price,
-      change,
-      changePercent,
+      change: change !== null ? change : null,
+      changePercent: changePercent !== null ? changePercent : null,
       volume: latest.volume,
       marketCap: null,
       dayHigh: latest.high,
@@ -207,8 +193,7 @@ class AInvestService {
       'get-marketdata-trades', mcpArgs,
       '/marketdata/trades', restParams,
     );
-    const processedData = cannedCandlesCheck(data);
-    let payload = processedData;
+    let payload = data;
     if (!Array.isArray(payload) && !payload?.list && payload?.data) {
       payload = payload.data;
     }
@@ -230,15 +215,14 @@ class AInvestService {
       '/news/v1/wire/page/history', restParams,
     );
 
-    const payload = cannedCandlesCheck(data);
-    let articlesData = payload;
+    let payload = data;
     if (!Array.isArray(payload) && !payload?.list && payload?.data) {
-      articlesData = payload.data;
+      payload = payload.data;
     }
-    const articles = Array.isArray(articlesData) ? articlesData : (articlesData?.list || []);
+    const articles = Array.isArray(payload) ? payload : (payload?.list || []);
     const articleLimit = Math.min(limit, articles.length);
     if (articleLimit === 0) {
-      console.warn(`[AInvest] getNews: 0 articles — data shape: ${typeof data}, keys=${formatKeys(data)}`);
+      console.warn(`[AInvest] getNews: 0 articles — data shape: ${typeof data}, keys=${data && typeof data === 'object' ? Object.keys(data).join(',') : 'N/A'}`);
     }
     return articles.slice(0, articleLimit).map(a => ({
       title: a.title || a.headline || '',
@@ -260,9 +244,8 @@ class AInvestService {
 
     const data = await this._fetch('/news/v1/article/page/history', params);
 
-    const articles = cannedCandlesCheck(data);
-    const arrArticles = Array.isArray(articles) ? articles : (articles?.list || []);
-    return arrArticles.slice(0, limit).map(a => ({
+    const articles = Array.isArray(data) ? data : (data?.list || []);
+    return articles.slice(0, limit).map(a => ({
       title: a.title || '',
       summary: (a.summary || a.description || '').slice(0, 500),
       url: a.url || '',
@@ -282,7 +265,7 @@ class AInvestService {
     if (!data) return null;
 
     let payload = data;
-    if (!payload.analysts_ratings && !payload.buy && payload?.data) {
+    if (!payload.analysts_ratings && !payload.buy && payload.data) {
       payload = payload.data;
     }
 
@@ -322,7 +305,7 @@ class AInvestService {
       rating: r.rating || r.current_rating || '',
       targetPrice: r.target_price ?? r.price_target ?? null,
       previousRating: r.previous_rating || r.rating_previous || null,
-      previousTarget: r.previous_target_price || r.target_price_previous || null,
+      previousTarget: r.previous_target_price ?? r.target_price_previous ?? null,
     }));
   }
 
