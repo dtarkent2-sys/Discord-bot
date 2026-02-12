@@ -53,18 +53,19 @@ class GitHubClient {
     }
   }
 
-  // Update a file (creates a commit)
-  async updateFile(filePath, newContent, commitMessage) {
+  // Update a file on a specific branch (creates a commit)
+  async updateFile(filePath, newContent, commitMessage, branch) {
+    const targetBranch = branch || config.githubBranch;
     const octokit = await this._getOctokit();
     if (!octokit) return { success: false, error: 'GitHub client not available' };
 
     try {
-      // Get the file's current SHA (required by GitHub API)
+      // Get the file's current SHA from the target branch
       const currentFile = await octokit.repos.getContent({
         owner: config.githubOwner,
         repo: config.githubRepo,
         path: filePath,
-        ref: config.githubBranch,
+        ref: targetBranch,
       });
 
       const response = await octokit.repos.createOrUpdateFileContents({
@@ -74,14 +75,91 @@ class GitHubClient {
         message: commitMessage,
         content: Buffer.from(newContent).toString('base64'),
         sha: currentFile.data.sha,
-        branch: config.githubBranch,
+        branch: targetBranch,
       });
 
-      console.log(`[GitHub] File ${filePath} updated successfully.`);
+      console.log(`[GitHub] File ${filePath} updated on ${targetBranch}.`);
       return { success: true, url: response.data.commit.html_url };
     } catch (error) {
       console.error(`[GitHub] Failed to update file ${filePath}:`, error.message);
       return { success: false, error: error.message };
+    }
+  }
+
+  // Create a new branch from the base branch (e.g. main)
+  async createBranch(branchName) {
+    const octokit = await this._getOctokit();
+    if (!octokit) return { success: false, error: 'GitHub client not available' };
+
+    try {
+      // Get the SHA of the base branch head
+      const { data: ref } = await octokit.git.getRef({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        ref: `heads/${config.githubBranch}`,
+      });
+
+      // Create the new branch pointing at the same SHA
+      await octokit.git.createRef({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        ref: `refs/heads/${branchName}`,
+        sha: ref.object.sha,
+      });
+
+      console.log(`[GitHub] Branch "${branchName}" created from ${config.githubBranch}.`);
+      return { success: true };
+    } catch (error) {
+      // 422 = branch already exists, which is fine
+      if (error.status === 422) {
+        console.log(`[GitHub] Branch "${branchName}" already exists.`);
+        return { success: true, existed: true };
+      }
+      console.error(`[GitHub] Failed to create branch "${branchName}":`, error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  // Create a pull request from a branch into the base branch
+  async createPullRequest(branchName, title, body) {
+    const octokit = await this._getOctokit();
+    if (!octokit) return { success: false, error: 'GitHub client not available' };
+
+    try {
+      const { data: pr } = await octokit.pulls.create({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        head: branchName,
+        base: config.githubBranch,
+        title,
+        body,
+      });
+
+      console.log(`[GitHub] PR #${pr.number} created: ${pr.html_url}`);
+      return { success: true, url: pr.html_url, number: pr.number };
+    } catch (error) {
+      console.error(`[GitHub] Failed to create PR:`, error.message);
+      return { success: false, error: error.message };
+    }
+  }
+
+  // Find an existing open PR from a branch
+  async findOpenPR(branchName) {
+    const octokit = await this._getOctokit();
+    if (!octokit) return null;
+
+    try {
+      const { data: prs } = await octokit.pulls.list({
+        owner: config.githubOwner,
+        repo: config.githubRepo,
+        head: `${config.githubOwner}:${branchName}`,
+        base: config.githubBranch,
+        state: 'open',
+      });
+      return prs.length > 0 ? prs[0] : null;
+    } catch (error) {
+      console.error(`[GitHub] Failed to find PR for ${branchName}:`, error.message);
+      return null;
     }
   }
 
