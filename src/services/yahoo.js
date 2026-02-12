@@ -1,15 +1,3 @@
-/**
- * Market data client using Financial Modeling Prep (FMP) API.
- * Requires an API key — set FMP_API_KEY in your .env file.
- * Get your free key at https://financialmodelingprep.com/developer
- * Supports stocks AND crypto (BTC, ETH, SOL, etc.)
- */
-
-const config = require('../config');
-
-const FMP_BASE = 'https://financialmodelingprep.com/stable';
-
-// Common crypto symbols → FMP format (BTCUSD, not BTC-USD)
 const CRYPTO_MAP = {
   BTC: 'BTCUSD', ETH: 'ETHUSD', SOL: 'SOLUSD', XRP: 'XRPUSD',
   DOGE: 'DOGEUSD', ADA: 'ADAUSD', AVAX: 'AVAXUSD', DOT: 'DOTUSD',
@@ -48,7 +36,9 @@ class MarketDataClient {
    * Handles crypto shorthand: BTC → BTCUSD, ETH → ETHUSD, etc.
    */
   resolveTicker(ticker) {
-    const upper = (this.sanitizeTicker(ticker) || ticker.toUpperCase().trim());
+    const cleaned = this.sanitizeTicker(ticker);
+    if (cleaned == null) return null;
+    const upper = cleaned;
     // Already in FMP crypto format (BTCUSD)
     if (upper.endsWith('USD') && CRYPTO_MAP[upper.replace('USD', '')]) return upper;
     // Yahoo-style crypto (BTC-USD) → FMP format
@@ -56,45 +46,20 @@ class MarketDataClient {
       const base = upper.replace('-USD', '');
       if (CRYPTO_MAP[base]) return CRYPTO_MAP[base];
     }
-    // Known crypto symbol
+    // Known crypto symbol (direct lookup)
     if (CRYPTO_MAP[upper]) return CRYPTO_MAP[upper];
     // Regular stock ticker
     return upper;
   }
 
   isCrypto(ticker) {
-    const upper = ticker.toUpperCase();
-    if (upper.endsWith('USD')) return !!CRYPTO_MAP[upper.replace('USD', '')];
-    if (upper.endsWith('-USD')) return !!CRYPTO_MAP[upper.replace('-USD', '')];
+    const cleaned = this.sanitizeTicker(ticker);
+    if (!cleaned) return false;
+    const upper = cleaned;
+    if (upper.endsWith('USD') && CRYPTO_MAP[upper.replace('USD', '')]) return true;
+    if (upper.endsWith('-USD') && CRYPTO_MAP[upper.replace('-USD', '')]) return true;
     return !!CRYPTO_MAP[upper];
   }
-
-  // ── FMP API fetch helper ──────────────────────────────────────────────
-
-  async _fmpFetch(endpoint, params = {}) {
-    if (!config.fmpApiKey) throw new Error('FMP API key not configured — set FMP_API_KEY in .env');
-
-    const url = new URL(`${FMP_BASE}${endpoint}`);
-    url.searchParams.set('apikey', config.fmpApiKey);
-    for (const [k, v] of Object.entries(params)) {
-      url.searchParams.set(k, String(v));
-    }
-
-    console.log(`[FMP] Fetching: ${endpoint}`);
-    const res = await fetch(url.toString(), {
-      headers: { 'Accept': 'application/json' },
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`FMP API ${res.status}: ${text.slice(0, 200)}`);
-    }
-
-    return res.json();
-  }
-
-  // ── Retry helper ──────────────────────────────────────────────────────
 
   async _retry(fn, label, maxRetries = 2) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -118,10 +83,9 @@ class MarketDataClient {
     }
   }
 
-  // ── Quote — current price + key stats ─────────────────────────────────
-
   async getQuote(ticker) {
-    const upper = ticker.toUpperCase();
+    const upper = this.resolveTicker(ticker);
+    if (upper == null) throw new Error('Invalid ticker');
     const data = await this._retry(
       () => this._fmpFetch('/quote', { symbol: upper }),
       `quote(${upper})`
@@ -130,7 +94,6 @@ class MarketDataClient {
     const q = Array.isArray(data) ? data[0] : data;
     if (!q || q.price == null) throw new Error(`No quote data for ${upper}`);
 
-    // Map to backward-compatible field names
     return {
       symbol: q.symbol,
       shortName: q.name,
@@ -149,16 +112,16 @@ class MarketDataClient {
     };
   }
 
-  // ── Quotes — batch price lookup ───────────────────────────────────────
-
   async getQuotes(tickers) {
     if (tickers.length === 0) return [];
 
-    // FMP stable API has a dedicated batch-quote endpoint
-    const symbols = tickers.map(t => t.toUpperCase()).join(',');
+    const symbols = tickers.map(t => this.resolveTicker(t)).filter(Boolean);
+    if (symbols.length === 0) return [];
+
+    const symbolsStr = symbols.join(',');
     try {
       const data = await this._retry(
-        () => this._fmpFetch('/batch-quote', { symbols }),
+        () => this._fmpFetch('/batch-quote', { symbols: symbolsStr }),
         `quotes(batch)`
       );
 
@@ -188,11 +151,12 @@ class MarketDataClient {
     }
   }
 
-  // ── Historical — price history ────────────────────────────────────────
-
   async getHistory(ticker, days = 30) {
-    const upper = ticker.toUpperCase();
-    // Calculate the "from" date
+    const upper = this.resolveTicker(ticker);
+    if (upper == null) {
+      console.warn(`[FMP] No historical data for ${ticker}`);
+      return [];
+    }
     const fromDate = new Date();
     fromDate.setDate(fromDate.getDate() - days);
     const from = fromDate.toISOString().slice(0, 10); // YYYY-MM-DD
@@ -202,14 +166,12 @@ class MarketDataClient {
       `history(${upper})`
     );
 
-    // Stable API may return array directly or wrapped in { historical: [...] }
     const historical = Array.isArray(data) ? data : (data?.historical || []);
     if (historical.length === 0) {
       console.warn(`[FMP] No historical data for ${upper}`);
       return [];
     }
 
-    // FMP returns newest-first → reverse to oldest-first
     return historical.reverse().map(d => ({
       date: new Date(d.date),
       open: d.open,
@@ -220,14 +182,13 @@ class MarketDataClient {
     }));
   }
 
-  // ── Ticker Snapshot — full fundamentals + technicals ──────────────────
-
   async getTickerSnapshot(ticker) {
-    const upper = ticker.toUpperCase();
+    const upper = this.resolveTicker(ticker);
+    if (upper == null) {
+      throw new Error('Invalid ticker for snapshot');
+    }
     const isCrypto = this.isCrypto(upper);
 
-    // Fetch quote + history in parallel (always needed)
-    // Also fetch profile + ratios for stocks (extra fundamentals)
     const [quoteData, history, profileData, ratiosData] = await Promise.all([
       this._retry(
         () => this._fmpFetch('/quote', { symbol: upper }),
@@ -239,14 +200,12 @@ class MarketDataClient {
         return [];
       }),
 
-      // Profile gives us beta, sector, description
       isCrypto ? Promise.resolve(null) :
         this._retry(
           () => this._fmpFetch('/profile', { symbol: upper }),
           `profile(${upper})`
         ).catch(err => { console.warn(`[FMP] Profile failed: ${err.message}`); return null; }),
 
-      // Key metrics TTM gives us ROE, P/B, profit margin, etc.
       isCrypto ? Promise.resolve(null) :
         this._retry(
           () => this._fmpFetch('/key-metrics-ttm', { symbol: upper }),
@@ -260,13 +219,11 @@ class MarketDataClient {
     const profile = Array.isArray(profileData) ? profileData?.[0] : profileData;
     const ratios = Array.isArray(ratiosData) ? ratiosData?.[0] : ratiosData;
 
-    // Compute technicals from history
     const closes = history.map(d => d.close).filter(c => c != null);
     const sma50 = closes.length >= 50 ? this._sma(closes, 50) : (quote.priceAvg50 || null);
     const sma200 = closes.length >= 200 ? this._sma(closes, 200) : (quote.priceAvg200 || null);
     const rsi14 = closes.length >= 15 ? this._rsi(closes, 14) : null;
 
-    // Compute dividend yield from profile if ratios unavailable
     let divYield = null;
     if (ratios?.dividendYieldTTM != null) {
       divYield = ratios.dividendYieldTTM * 100;
@@ -287,7 +244,6 @@ class MarketDataClient {
       change: quote.change,
       changePercent: quote.changesPercentage,
 
-      // Fundamentals
       pe: quote.pe || null,
       forwardPE: ratios?.peRatioTTM || null,
       pb: ratios?.pbRatioTTM || ratios?.priceToBookRatioTTM || null,
@@ -300,19 +256,15 @@ class MarketDataClient {
       fiftyTwoWeekHigh: quote.yearHigh,
       fiftyTwoWeekLow: quote.yearLow,
 
-      // Technicals (computed from history)
       sma50,
       sma200,
       rsi14,
 
-      // Recent price history for AI context
       priceHistory: history.slice(-30),
 
       timestamp: new Date().toISOString(),
     };
   }
-
-  // ── Search — find tickers by name ─────────────────────────────────────
 
   async search(query) {
     const data = await this._retry(
@@ -326,8 +278,6 @@ class MarketDataClient {
       exchange: r.exchangeShortName || r.stockExchange,
     }));
   }
-
-  // ── Screening — top gainers ───────────────────────────────────────────
 
   async screenByGainers() {
     const data = await this._retry(
@@ -346,8 +296,6 @@ class MarketDataClient {
       marketCap: q.marketCap || null,
     }));
   }
-
-  // ── Format helpers ────────────────────────────────────────────────────
 
   formatQuoteForDiscord(quote) {
     if (!quote) return 'No data available.';
@@ -386,8 +334,6 @@ class MarketDataClient {
     }
     return output;
   }
-
-  // ── Technical indicator calculations ──────────────────────────────────
 
   _sma(prices, period) {
     const recent = prices.slice(-period);
