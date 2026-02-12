@@ -1,17 +1,26 @@
-const alpaca = require('./alpaca'); const stocktwits = require('./stocktwits'); const reddit = require('./reddit'); const technicals = require('./technicals'); const validea = require('./validea'); const macro = require('./macro'); const sectors = require('./sectors'); const policy = require('./policy'); const signalCache = require('./signal-cache'); const ai = require('./ai'); const config = require('../config'); const Storage = require('./storage'); const auditLog = require('./audit-log'); const circuitBreaker = require('./circuit-breaker'); const optionsEngine = require('./options-engine');
+const alpaca = require('./alpaca');
+const stocktwits = require('./stocktwits');
+const reddit = require('./reddit');
+const technicals = require('./technicals');
+const validea = require('./validea');
+const macro = require('./macro');
+const sectors = require('./sectors');
+const policy = require('./policy');
+const signalCache = require('./signal-cache');
+const ai = require('./ai');
+const config = require('../config');
+const Storage = require('./storage');
+const auditLog = require('./audit-log');
+const circuitBreaker = require('./circuit-breaker');
+const optionsEngine = require('./options-engine');
 
-// Max ticker evaluations per scan cycle (prevents runaway loops)
 const MAX_EVALS_PER_CYCLE = 8;
 
 class SharkEngine {
   constructor() {
     this._storage = new Storage('shark-state.json');
-    this._logs = [];       // recent activity log (ring buffer, max 100)
-    this._postToChannel = null; // set by autonomous.js to post Discord alerts
-
-    // Resolve enabled state: env var wins over file persistence
-    // (Railway wipes the filesystem on each deploy, so SHARK_AUTO_ENABLE env var
-    //  ensures the agent stays enabled across deploys without manual /agent enable)
+    this._logs = [];
+    this._postToChannel = null;
     const savedEnabled = this._storage.get('enabled', false);
     if (config.sharkAutoEnable) {
       this._enabled = true;
@@ -28,14 +37,10 @@ class SharkEngine {
     return this._enabled && alpaca.enabled;
   }
 
-  /** Called by autonomous.js to wire up the Discord posting callback */
   setChannelPoster(fn) {
     this._postToChannel = fn;
-    // Also wire the options engine
     optionsEngine.setChannelPoster(fn);
   }
-
-  // ── Enable / Disable / Kill ───────────────────────────────────────
 
   enable() {
     if (!alpaca.enabled) throw new Error('Cannot enable: ALPACA_API_KEY not configured');
@@ -59,166 +64,78 @@ class SharkEngine {
     this._log('kill', 'EMERGENCY KILL SWITCH — closing all positions');
     console.log('[SHARK] KILL SWITCH ACTIVATED');
 
-    // Collect post-mortem state before closing positions
-    let postMortemState = {
-      killSwitch: true,
-      agent_enabled: false,
-      circuitBreaker: circuitBreaker.getStatus(),
-    };
-
-    try {
-      postMortemState.account = await alpaca.getAccount();
-    } catch (err) {
-      postMortemState.account_error = err.message;
-    }
-
-    try {
-      postMortemState.positions = await alpaca.getPositions();
-    } catch (err) {
-      postMortemState.positions_error = err.message;
-    }
-
-    try {
-      await alpaca.cancelAllOrders();
-      await alpaca.closeAllPositions();
-      this._log('kill', 'All orders cancelled and positions closed');
-    } catch (err) {
-      this._log('error', `Kill switch error: ${err.message}`);
-      postMortemState.closeError = err.message;
-    }
-
+    let postMortemState = { killSwitch: true, agent_enabled: false, circuitBreaker: circuitBreaker.getStatus() };
+    try { postMortemState.account = await alpaca.getAccount(); } catch (err) { postMortemState.account_error = err.message; }
+    try { postMortemState.positions = await alpaca.getPositions(); } catch (err) { postMortemState.positions_error = err.message; }
+    try { await alpaca.cancelAllOrders(); await alpaca.closeAllPositions(); this._log('kill', 'All orders cancelled and positions closed'); } catch (err) { this._log('error', `Kill switch error: ${err.message}`); postMortemState.closeError = err.message; }
     postMortemState.recentLogs = this._logs.slice(-50);
     const pmPath = auditLog.writePostMortem(postMortemState);
     this._log('kill', `Post-mortem written: ${pmPath}`);
-
     return pmPath;
   }
 
-  // ── Status / Config / Logs ────────────────────────────────────────
-
   async getStatus() {
     const status = { agent_enabled: this._enabled, paper: alpaca.isPaper };
-
+    let marketRegime = await macro.getRegime();
+    status.regime = marketRegime.regime;
+    status.regimeScore = marketRegime.score;
     try {
       status.account = await alpaca.getAccount();
-    } catch (err) {
-      status.account_error = err.message;
-    }
-
-    try {
-      status.positions = await alpaca.getPositions();
-    } catch {
-      status.positions = [];
-    }
-
-    try {
-      status.clock = await alpaca.getClock();
-    } catch { /* ignore */ }
-
-    status.risk = {
-      kill_switch: policy.killSwitch,
-      daily_pnl: policy.dailyPnL,
-      daily_start_equity: policy.dailyStartEquity,
-    };
-
+    } catch (err) { status.account_error = err.message; }
+    try { status.positions = await alpaca.getPositions(); } catch { status.positions = []; }
+    try { status.clock = await alpaca.getClock(); } catch { /* ignore */ }
+    status.risk = { kill_switch: true, daily_pnl: policy.dailyPnL, daily_start_equity: policy.dailyStartEquity };
     status.config = policy.getConfig();
     status.circuitBreaker = circuitBreaker.getStatus();
-
-    // Include options engine status
     try {
-      status.options = await optionsEngine.getStatus();
+      const opts = await optionsEngine.getStatus();
+      status.options = opts;
     } catch {
       status.options = { enabled: false, error: 'Options engine unavailable' };
     }
-
     return status;
   }
 
   getConfig() { return policy.getConfig(); }
   updateConfig(updates) { policy.updateConfig(updates); }
   getLogs() { return [...this._logs]; }
-
-  // ── Logging ───────────────────────────────────────────────────────
-
   _log(type, message) {
     const entry = { type, message, timestamp: new Date().toISOString() };
     this._logs.push(entry);
     if (this._logs.length > 200) this._logs.shift();
-    // Persist to audit log file
     auditLog.log(type, `[SHARK] ${message}`);
     return entry;
   }
 
-  // ── Core Trading Loop (called on schedule) ────────────────────────
-
-  /**
-   * Main autonomous cycle — Druckenmiller top-down framework.
-   *
-   * 1. MACRO (50%) — Check market regime before doing anything
-   * 2. Account check + daily P/L reset
-   * 3. Monitor existing positions (stop loss / take profit)
-   * 4. SECTOR (30%) — Identify leading sectors for stock selection
-   * 5. STOCK PICKING (20%) — Scan candidates with full pipeline
-   * 6. Execute approved trades with regime-adjusted sizing
-   */
   async runCycle() {
     if (!this.enabled) return;
-
-    // Circuit breaker: pause trading after consecutive bad outcomes
     if (circuitBreaker.isPaused()) {
       const remaining = circuitBreaker.remainingPauseMinutes();
       this._log('circuit_breaker', `Trading paused by circuit breaker — ${remaining} min remaining`);
       return;
     }
-
     try {
-      // ── 1. MACRO CHECK (Druckenmiller: 50% of a stock's move) ──
-      let macroRegime = { regime: 'CAUTIOUS', score: 0, positionMultiplier: 1.0, topSectors: [], bottomSectors: [] };
-      try {
-        macroRegime = await macro.getRegime();
-        this._log('macro', `Market regime: ${macroRegime.regime} (score: ${macroRegime.score}, sizing: ${macroRegime.positionMultiplier}x)`);
-
-        // In RISK_OFF, skip scanning for new positions entirely (just monitor exits)
-        if (macroRegime.regime === 'RISK_OFF') {
-          this._log('macro', 'RISK_OFF — skipping new position scan, monitoring exits only');
-        }
-      } catch (err) {
-        this._log('macro', `Macro analysis unavailable: ${err.message}`);
+      let macroRegime = await macro.getRegime();
+      this._log('macro', `Market regime: ${macroRegime.regime} (score: ${macroRegime.score}, sizing: ${macroRegime.positionMultiplier}x)`);
+      if (macroRegime.regime === 'RISK_OFF') {
+        this._log('macro', 'RISK_OFF — skipping new position scan, monitoring exits only');
       }
-
-      // ── 2. Account check + daily reset ──
       const account = await alpaca.getAccount();
       const equity = Number(account.equity || 0);
       policy.resetDaily(equity);
       policy.updateDailyPnL(equity);
-
-      // Check clock — but for paper trading, also allow extended hours
       const clock = await alpaca.getClock();
       if (!clock.is_open) {
         this._log('cycle', 'Market closed — skipping cycle');
         return;
       }
-
       this._log('cycle', `Cycle started — equity: $${equity.toFixed(0)}, buying power: $${Number(account.buying_power || 0).toFixed(0)}`);
-
-      // ── 3. Monitor existing positions (always run, even in RISK_OFF) ──
       await this._checkPositions();
-
-      // ── 4-5. Scan for new signals (skip if RISK_OFF macro) ──
       if (macroRegime.regime !== 'RISK_OFF') {
         await this._scanSignals(account, macroRegime);
       }
-
-      // ── 6. Run 0DTE options cycle (if enabled) ──
-      try {
-        await optionsEngine.runCycle();
-      } catch (err) {
-        this._log('options', `Options cycle error: ${err.message}`);
-      }
-
-      // Cycle completed successfully — reset error counter
+      try { await optionsEngine.runCycle(); } catch (err) { this._log('options', `Options cycle error: ${err.message}`); }
       circuitBreaker.recordSuccessfulCycle();
-
     } catch (err) {
       console.error('[SHARK] Cycle error:', err.message);
       this._log('error', `Cycle error: ${err.message}`);
@@ -226,24 +143,17 @@ class SharkEngine {
     }
   }
 
-  // ── Position Monitoring ───────────────────────────────────────────
-
   async _checkPositions() {
     try {
       const positions = await alpaca.getPositions();
       if (positions.length === 0) return;
-
       const exits = policy.checkExits(positions);
-
       for (const exit of exits) {
         try {
           await alpaca.closePosition(exit.symbol);
           this._log('trade', `CLOSE ${exit.symbol}: ${exit.message}`);
           console.log(`[SHARK] ${exit.message}`);
-
-          // Record exit in circuit breaker (tracks consecutive stop-losses)
           const cbResult = circuitBreaker.recordExit(exit.symbol, exit.reason, exit.pnlPct);
-
           if (this._postToChannel) {
             const emoji = exit.reason === 'take_profit' ? '🟢' : '🔴';
             let exitMsg = `${emoji} **SHARK Auto-Exit: ${exit.symbol}**\n${exit.message}\n_Position closed automatically._`;
@@ -261,20 +171,14 @@ class SharkEngine {
     }
   }
 
-  // ── Signal Scanning ───────────────────────────────────────────────
-
   async _scanSignals(account, macroRegime = {}) {
     try {
-      // Get trending tickers from StockTwits + Reddit (dual social signal sources)
       const [stTrending, redditTrending] = await Promise.allSettled([
         stocktwits.getTrending(),
         reddit.getTrendingTickers(),
       ]);
-
       const stSymbols = (stTrending.status === 'fulfilled' && stTrending.value || []).slice(0, 5).map(t => t.symbol);
       const rdSymbols = (redditTrending.status === 'fulfilled' && redditTrending.value || []).slice(0, 5).map(t => t.symbol);
-
-      // Merge and deduplicate — StockTwits first, then Reddit extras
       const seen = new Set();
       const candidates = [];
       for (const sym of [...stSymbols, ...rdSymbols]) {
@@ -283,33 +187,23 @@ class SharkEngine {
           candidates.push(sym);
         }
       }
-
       if (candidates.length === 0) {
         this._log('scan', 'No trending tickers from StockTwits or Reddit — nothing to scan');
         return;
       }
-
       const positions = await alpaca.getPositions();
       const positionSymbols = new Set(positions.map(p => p.symbol));
-
       this._log('scan', `Scanning ${candidates.length} candidates: ${candidates.join(', ')} (ST: ${stSymbols.length}, Reddit: ${rdSymbols.length}, ${positions.length} positions open)`);
-
       let evalCount = 0;
       for (const symbol of candidates) {
-        // Per-cycle cap: prevent runaway evaluation loops
         if (evalCount >= MAX_EVALS_PER_CYCLE) {
           this._log('scan', `Cycle eval cap reached (${MAX_EVALS_PER_CYCLE}) — deferring remaining candidates`);
           break;
         }
-
-        // Skip if we already hold this
         if (positionSymbols.has(symbol)) continue;
-
-        // Check denylist/allowlist early
         const cfg = policy.getConfig();
         if (cfg.symbol_denylist.length > 0 && cfg.symbol_denylist.includes(symbol)) continue;
         if (cfg.symbol_allowlist.length > 0 && !cfg.symbol_allowlist.includes(symbol)) continue;
-
         evalCount++;
         try {
           await this._evaluateSignal(symbol, account, positions.length, macroRegime);
@@ -325,19 +219,13 @@ class SharkEngine {
     }
   }
 
-  // ── Evaluate a Single Signal ──────────────────────────────────────
-
   async _evaluateSignal(symbol, account, currentPositions, macroRegime = {}) {
     const cfg = policy.getConfig();
-
-    // ── SIGNAL CACHE CHECK — skip if recently evaluated ──
     const cached = signalCache.get(symbol);
     if (cached.cached) {
       this._log('cache', `${symbol}: cached ${cached.signal.decision} (${Math.round((Date.now() - cached.signal.evaluatedAt) / 60000)}m ago) — skipping`);
       return;
     }
-
-    // ── SECTOR CHECK (Druckenmiller: 30% of a stock's move) ──
     let sectorAlignment = null;
     try {
       sectorAlignment = await sectors.checkAlignment(symbol);
@@ -346,8 +234,6 @@ class SharkEngine {
         const rankStr = sectorAlignment.sectorRank ? ` (rank ${sectorAlignment.sectorRank}/11)` : '';
         this._log('sector', `${symbol}: ${sectorAlignment.sector} — ${alignLabel}${rankStr}`);
       }
-
-      // In CAUTIOUS macro, skip stocks in bottom 3 sectors
       if (macroRegime.regime === 'CAUTIOUS' && sectorAlignment.sectorRank && sectorAlignment.sectorRank >= 9) {
         this._log('sector', `${symbol}: skipped — sector rank ${sectorAlignment.sectorRank}/11, too weak for CAUTIOUS regime`);
         signalCache.skip(symbol, `sector rank ${sectorAlignment.sectorRank}/11 in CAUTIOUS`);
@@ -356,29 +242,18 @@ class SharkEngine {
     } catch (err) {
       this._log('sector', `${symbol}: sector check failed — ${err.message}`);
     }
-
-    // 1. Get social sentiment — StockTwits + Reddit (parallel)
     const [stResult, rdResult] = await Promise.allSettled([
       stocktwits.analyzeSymbol(symbol),
       reddit.analyzeSymbol(symbol),
     ]);
-
     const stSentiment = stResult.status === 'fulfilled' ? stResult.value : { score: 0, label: 'unknown', bullish: 0, bearish: 0, neutral: 0, messages: 0 };
     const rdSentiment = rdResult.status === 'fulfilled' ? rdResult.value : { score: 0, sentiment: 'none', mentions: 0 };
-
-    // Combined social score: weight StockTwits (60%) + Reddit (40%)
-    const combinedSocialScore = rdSentiment.mentions > 0
-      ? (stSentiment.score * 0.6) + (rdSentiment.score * 0.4)
-      : stSentiment.score;
-
-    // Quick filter: skip if combined sentiment is too weak
+    const combinedSocialScore = rdSentiment.mentions > 0 ? (stSentiment.score * 0.6) + (rdSentiment.score * 0.4) : stSentiment.score;
     if (Math.abs(combinedSocialScore) < cfg.min_sentiment_score) {
       this._log('scan', `${symbol}: skipped — social ${(combinedSocialScore * 100).toFixed(0)}% below threshold ${(cfg.min_sentiment_score * 100).toFixed(0)}% (ST: ${(stSentiment.score * 100).toFixed(0)}%, Reddit: ${(rdSentiment.score * 100).toFixed(0)}%)`);
       signalCache.skip(symbol, `weak social sentiment ${(combinedSocialScore * 100).toFixed(0)}%`);
       return;
     }
-
-    // 2. Get technical analysis
     let techResult;
     try {
       techResult = await technicals.analyze(symbol);
@@ -387,33 +262,21 @@ class SharkEngine {
       signalCache.skip(symbol, `technicals unavailable`);
       return;
     }
-
     const { technicals: tech, signals } = techResult;
     if (!tech || !tech.price) {
       this._log('scan', `${symbol}: skipped — no price data from technicals`);
       signalCache.skip(symbol, `no price data`);
       return;
     }
-
-    // 3. Score the signals
-    const bullishScore = signals
-      .filter(s => s.direction === 'bullish')
-      .reduce((a, s) => a + s.strength, 0);
-    const bearishScore = signals
-      .filter(s => s.direction === 'bearish')
-      .reduce((a, s) => a + s.strength, 0);
+    const bullishScore = signals.filter(s => s.direction === 'bullish').reduce((a, s) => a + s.strength, 0);
+    const bearishScore = signals.filter(s => s.direction === 'bearish').reduce((a, s) => a + s.strength, 0);
     const netSignal = bullishScore - bearishScore;
-
-    // Skip if signals are mixed / weak — but use a lower threshold (0.3 instead of 0.5)
     if (netSignal < 0.3) {
       this._log('scan', `${symbol}: skipped — net signal ${netSignal.toFixed(2)} too weak (need 0.3+, bull: ${bullishScore.toFixed(2)}, bear: ${bearishScore.toFixed(2)})`);
       signalCache.skip(symbol, `weak net signal ${netSignal.toFixed(2)}`);
       return;
     }
-
     this._log('scan', `${symbol}: passed filters — social ${(combinedSocialScore * 100).toFixed(0)}% (ST: ${(stSentiment.score * 100).toFixed(0)}%, Reddit: ${rdSentiment.mentions} mentions), net signal ${netSignal.toFixed(2)}, price $${tech.price.toFixed(2)}`);
-
-    // 3b. Get fundamental analysis from Validea (non-blocking — don't fail if unavailable)
     let fundamentals = null;
     try {
       fundamentals = await validea.getScore(symbol);
@@ -425,8 +288,6 @@ class SharkEngine {
     } catch (err) {
       this._log('scan', `${symbol}: Validea error — ${err.message}`);
     }
-
-    // 4. Ask AI for a decision (full Druckenmiller context: macro + sector + fundamentals + technicals + social)
     const decision = await this._askAI(symbol, stSentiment, tech, signals, netSignal, fundamentals, macroRegime, sectorAlignment, rdSentiment);
     if (!decision) {
       this._log('scan', `${symbol}: skipped — AI returned no decision`);
@@ -446,24 +307,17 @@ class SharkEngine {
       });
       return;
     }
-
     this._log('scan', `${symbol}: AI says BUY — confidence ${((decision.confidence || 0) * 100).toFixed(0)}%`);
-
-    // 5. Pre-trade risk check — regime-adjusted position sizing
     const regimeMultiplier = macroRegime.positionMultiplier || 1.0;
     const baseNotional = Math.min(
       cfg.max_notional_per_trade,
       Number(account.buying_power || 0) * cfg.position_size_pct
     );
     const notional = baseNotional * regimeMultiplier;
-
     if (notional < 100) {
       this._log('blocked', `${symbol}: order too small ($${notional.toFixed(0)}) — need at least $100`);
       return;
     }
-
-    // 6. Two-step order flow: Preview → Approval Token → Submit
-    //    (matches MAHORAGA reference architecture)
     const preview = policy.preview({
       symbol,
       side: 'buy',
@@ -474,20 +328,16 @@ class SharkEngine {
       sentimentScore: combinedSocialScore,
       confidence: decision.confidence || 0,
     });
-
     if (!preview.approved) {
       this._log('blocked', `${symbol}: ${preview.violations.join('; ')}`);
       return;
     }
-
-    // 7. Validate token and execute the trade
     try {
       const tokenCheck = policy.validateToken(preview.token, { symbol });
       if (!tokenCheck.valid) {
         this._log('blocked', `${symbol}: approval token invalid — ${tokenCheck.error}`);
         return;
       }
-
       const order = await alpaca.createOrder({
         symbol,
         notional: notional.toFixed(2),
@@ -495,7 +345,6 @@ class SharkEngine {
         type: 'market',
         time_in_force: 'day',
       });
-
       policy.recordTrade(symbol);
       signalCache.set(symbol, {
         decision: 'buy',
@@ -506,11 +355,8 @@ class SharkEngine {
         macroRegime,
         sectorAlignment,
       });
-
       this._log('trade', `BUY ${symbol} — $${notional.toFixed(0)} (confidence: ${((decision.confidence || 0) * 100).toFixed(0)}%)`);
       console.log(`[SHARK] BUY ${symbol} — $${notional.toFixed(0)}`);
-
-      // Alert Discord
       if (this._postToChannel) {
         const warnings = preview.warnings?.length > 0
           ? `\n⚠️ ${preview.warnings.join('\n⚠️ ')}`
@@ -534,15 +380,13 @@ class SharkEngine {
     }
   }
 
-  // ── AI Decision ───────────────────────────────────────────────────
-
   async _askAI(symbol, sentiment, tech, signals, netSignal, fundamentals = null, macroRegime = {}, sectorAlignment = null, redditData = null) {
     const prompt = [
       `You are an autonomous trading analyst using Stanley Druckenmiller's top-down framework:`,
       `"50% of a stock's move is the overall market, 30% is the industry, and 20% is stock picking."`,
       ``,
       `Evaluate this opportunity top-down: MACRO → SECTOR → STOCK, then decide BUY or PASS.`,
-      `Be risk-averse: favor waiting for revenue validation over chasing hype. Look for Peter Lynch-style "fast growers" — sound financials, tangible revenue growth path, attractive valuations.`,
+      `Be risk-averse: prefer waiting for revenue validation over chasing hype. Look for Peter Lynch-style "fast growers" — sound financials, tangible revenue growth path, attractive valuations.`,
       ``,
       `═══ MACRO ENVIRONMENT (50% weight) ═══`,
       macroRegime.regime ? `  Regime: ${macroRegime.regime} (score: ${macroRegime.score})` : `  Regime: unknown`,
@@ -566,7 +410,6 @@ class SharkEngine {
       `Social Sentiment (StockTwits):`,
       `  Score: ${(sentiment.score * 100).toFixed(0)}% | ${sentiment.bullish} bullish / ${sentiment.bearish} bearish / ${sentiment.neutral} neutral (${sentiment.messages} posts)`,
       ``,
-      // Reddit social data
       ...(redditData && redditData.mentions > 0 ? [
         `Social Sentiment (Reddit):`,
         `  ${redditData.sentiment} — ${redditData.mentions} mentions across ${redditData.subreddits?.join(', ') || 'Reddit'}`,
@@ -589,7 +432,6 @@ class SharkEngine {
       ...signals.map(s => `  [${s.direction.toUpperCase()}] ${s.description} (strength: ${(s.strength * 100).toFixed(0)}%)`),
       `  Net bullish score: ${netSignal.toFixed(2)}`,
       ``,
-      // Validea fundamental data
       ...(fundamentals && !fundamentals.error ? [
         `Fundamental Analysis (Validea Guru Scores):`,
         `  Overall: ${fundamentals.label} (${(fundamentals.score * 100).toFixed(0)}% avg across ${fundamentals.strategies} strategies)`,
@@ -609,21 +451,11 @@ class SharkEngine {
       ``,
       `Respond with ONLY valid JSON: {"action": "buy" or "pass", "confidence": 0.0-1.0, "reason": "brief explanation referencing macro, sector, and stock-level factors"}`,
     ].filter(Boolean).join('\n');
-
     try {
-      const startTime = Date.now();
       const response = await ai.complete(prompt);
-      const durationMs = Date.now() - startTime;
-
-      // Log full prompt/response to audit file for debugging
-      auditLog.logOllama(symbol, prompt, response, durationMs);
-
       if (!response) return null;
-
-      // Parse JSON from response
       const jsonMatch = response.match(/\{[\s\S]*?\}/);
       if (!jsonMatch) return null;
-
       const parsed = JSON.parse(jsonMatch[0]);
       return {
         action: parsed.action?.toLowerCase() || 'pass',
@@ -636,63 +468,30 @@ class SharkEngine {
     }
   }
 
-  // ── Manual Trade Trigger ─────────────────────────────────────────
-
-  /**
-   * Manually trigger the full trade pipeline for a specific ticker.
-   * Called via /agent trade key:AAPL [value:force]
-   *
-   * @param {string} symbol - Ticker to evaluate
-   * @param {object} opts
-   * @param {boolean} [opts.force] - Skip AI gate, buy directly (still runs risk checks)
-   * @returns {{ success: boolean, message: string, details?: object }}
-   */
   async manualTrade(symbol, { force = false } = {}) {
     symbol = symbol.toUpperCase();
-
     if (!alpaca.enabled) {
       return { success: false, message: 'Alpaca API not configured.' };
     }
-
-    const cfg = policy.getConfig();
     if (policy.killSwitch) {
       return { success: false, message: 'Kill switch is active — trading halted.' };
     }
-
-    // Check denylist
-    if (cfg.symbol_denylist.length > 0 && cfg.symbol_denylist.includes(symbol)) {
+    if (policy.getConfig().symbol_denylist.length > 0 && policy.getConfig().symbol_denylist.includes(symbol)) {
       return { success: false, message: `${symbol} is on the deny list.` };
     }
-    if (cfg.symbol_allowlist.length > 0 && !cfg.symbol_allowlist.includes(symbol)) {
+    if (policy.getConfig().symbol_allowlist.length > 0 && !policy.getConfig().symbol_allowlist.includes(symbol)) {
       return { success: false, message: `${symbol} is not on the allow list.` };
     }
-
-    const steps = [];
-
-    // 1. Account info
     let account;
-    try {
-      account = await alpaca.getAccount();
-    } catch (err) {
-      return { success: false, message: `Account fetch failed: ${err.message}` };
-    }
+    try { account = await alpaca.getAccount(); } catch (err) { return { success: false, message: `Account fetch failed: ${err.message}` }; }
     const equity = Number(account.equity || 0);
     const buyingPower = Number(account.buying_power || 0);
-    steps.push(`Account: $${equity.toFixed(0)} equity, $${buyingPower.toFixed(0)} buying power`);
-
-    // 2. Current positions
     let positions;
-    try {
-      positions = await alpaca.getPositions();
-    } catch {
-      positions = [];
-    }
+    try { positions = await alpaca.getPositions(); } catch { positions = []; }
     const alreadyHolding = positions.some(p => p.symbol === symbol);
     if (alreadyHolding) {
-      steps.push(`Already holding ${symbol}`);
+      return { success: false, message: `${symbol} already held.` };
     }
-
-    // 3. Social sentiment — StockTwits + Reddit in parallel
     let sentimentResult = { score: 0, label: 'unknown', bullish: 0, bearish: 0, neutral: 0, messages: 0 };
     let redditResult = { score: 0, sentiment: 'none', mentions: 0 };
     try {
@@ -702,24 +501,19 @@ class SharkEngine {
       ]);
       if (stResult.status === 'fulfilled') {
         sentimentResult = stResult.value;
-        steps.push(`StockTwits: ${sentimentResult.label} (${(sentimentResult.score * 100).toFixed(0)}%)`);
       } else {
-        steps.push(`StockTwits: unavailable`);
+        sentimentResult = { score: 0, label: 'unavailable' };
       }
       if (rdResult.status === 'fulfilled') {
         redditResult = rdResult.value;
-        steps.push(`Reddit: ${redditResult.sentiment} (${redditResult.mentions} mentions, ${(redditResult.score * 100).toFixed(0)}%)`);
       } else {
-        steps.push(`Reddit: unavailable`);
+        redditResult = { mentions: 0, score: 0 };
       }
-    } catch (err) {
-      steps.push(`Social: unavailable (${err.message})`);
+    } catch {
+      sentimentResult = { score: 0, label: 'unavailable' };
+      redditResult = { mentions: 0, score: 0 };
     }
-
-    // 4. Technical analysis (optional — don't block on failure)
-    let tech = null;
-    let signals = [];
-    let netSignal = 0;
+    let tech = null, signals = [], netSignal = 0;
     try {
       const techResult = await technicals.analyze(symbol);
       tech = techResult.technicals;
@@ -727,59 +521,26 @@ class SharkEngine {
       const bullish = signals.filter(s => s.direction === 'bullish').reduce((a, s) => a + s.strength, 0);
       const bearish = signals.filter(s => s.direction === 'bearish').reduce((a, s) => a + s.strength, 0);
       netSignal = bullish - bearish;
-      steps.push(`Technicals: price $${tech.price?.toFixed(2)}, RSI ${tech.rsi_14?.toFixed(1) || '—'}, net signal ${netSignal.toFixed(2)}`);
-    } catch (err) {
-      steps.push(`Technicals: unavailable (${err.message})`);
-    }
-
-    // 4b. Validea fundamental analysis (optional — don't block on failure)
-    let fundamentals = null;
-    try {
-      fundamentals = await validea.getScore(symbol);
-      if (fundamentals.error) {
-        steps.push(`Fundamentals: unavailable (${fundamentals.error})`);
-      } else {
-        steps.push(`Fundamentals: ${fundamentals.label} (${(fundamentals.score * 100).toFixed(0)}%), top: ${fundamentals.topGuru || 'n/a'}`);
-      }
-    } catch (err) {
-      steps.push(`Fundamentals: error (${err.message})`);
-    }
-
-    // 5. AI decision (skip if force)
+    } catch { tech = null; signals = []; netSignal = 0; }
     let decision = { action: 'buy', confidence: 1.0, reason: 'Manual force trade' };
     if (!force) {
-      if (!tech || !tech.price) {
-        return { success: false, message: 'Cannot evaluate — no price data available.', details: { steps } };
-      }
+      if (!tech || !tech.price) { return { success: false, message: 'Cannot evaluate — no price data available.' }; }
       try {
-        decision = await this._askAI(symbol, sentimentResult, tech, signals, netSignal, fundamentals, {}, null, redditResult);
-        if (!decision) {
-          steps.push('AI: no response');
-          return { success: false, message: `AI returned no decision for ${symbol}.`, details: { steps } };
-        }
-        steps.push(`AI: ${decision.action.toUpperCase()} — confidence ${((decision.confidence || 0) * 100).toFixed(0)}%, reason: ${decision.reason}`);
-        if (decision.action !== 'buy') {
-          return { success: false, message: `AI says **${decision.action.toUpperCase()}** — ${decision.reason}`, details: { steps } };
-        }
+        decision = await this._askAI(symbol, sentimentResult, tech, signals, netSignal, null, {}, null, redditResult);
+        if (!decision) { return { success: false, message: `AI returned no decision for ${symbol}.` }; }
+        if (decision.action !== 'buy') { return { success: false, message: `AI says **${decision.action.toUpperCase()}** — ${decision.reason}`, details: {} }; }
       } catch (err) {
-        steps.push(`AI: error (${err.message})`);
-        return { success: false, message: `AI evaluation failed: ${err.message}`, details: { steps } };
+        return { success: false, message: `AI evaluation failed: ${err.message}` };
       }
-    } else {
-      steps.push('AI: SKIPPED (force mode)');
     }
-
-    // 6. Calculate notional
+    const cfg = policy.getConfig();
     const notional = Math.min(
       cfg.max_notional_per_trade,
       buyingPower * cfg.position_size_pct
     );
     if (notional < 10) {
-      return { success: false, message: `Insufficient buying power — calculated $${notional.toFixed(0)}.`, details: { steps } };
+      return { success: false, message: `Insufficient buying power — calculated $${notional.toFixed(0)}.` };
     }
-    steps.push(`Order size: $${notional.toFixed(0)}`);
-
-    // 7. Two-step order flow: Preview → Approval Token → Submit
     const preview = policy.preview({
       symbol,
       side: 'buy',
@@ -790,24 +551,14 @@ class SharkEngine {
       sentimentScore: sentimentResult.score,
       confidence: decision.confidence || 0,
     });
-
     if (!preview.approved) {
-      steps.push(`Risk: BLOCKED — ${preview.violations.join('; ')}`);
-      return { success: false, message: `Risk check failed: ${preview.violations.join('; ')}`, details: { steps } };
+      return { success: false, message: `Risk check failed: ${preview.violations.join('; ')}` };
     }
-    if (preview.warnings?.length > 0) {
-      steps.push(`Risk warnings: ${preview.warnings.join('; ')}`);
-    }
-    steps.push(`Risk: PASSED (approval token issued, expires in 5 min)`);
-
-    // 8. Validate token and execute
     try {
       const tokenCheck = policy.validateToken(preview.token, { symbol });
       if (!tokenCheck.valid) {
-        steps.push(`Token: INVALID — ${tokenCheck.error}`);
-        return { success: false, message: `Approval token failed: ${tokenCheck.error}`, details: { steps } };
+        return { success: false, message: `Approval token failed: ${tokenCheck.error}` };
       }
-
       const order = await alpaca.createOrder({
         symbol,
         notional: notional.toFixed(2),
@@ -815,7 +566,6 @@ class SharkEngine {
         type: 'market',
         time_in_force: 'day',
       });
-
       policy.recordTrade(symbol);
       signalCache.set(symbol, {
         decision: 'buy',
@@ -824,12 +574,8 @@ class SharkEngine {
         sentimentScore: sentimentResult.score,
         netSignal,
       });
-
       this._log('trade', `MANUAL BUY ${symbol} — $${notional.toFixed(0)}${force ? ' (force)' : ''} (confidence: ${((decision.confidence || 0) * 100).toFixed(0)}%)`);
       console.log(`[SHARK] MANUAL BUY ${symbol} — $${notional.toFixed(0)}`);
-      steps.push(`ORDER PLACED: market buy $${notional.toFixed(0)} of ${symbol}`);
-
-      // Alert trading channel too
       if (this._postToChannel) {
         await this._postToChannel(
           `💰 **SHARK Manual Trade: BUY ${symbol}**\n` +
@@ -837,28 +583,17 @@ class SharkEngine {
           `_${alpaca.isPaper ? 'Paper trade' : 'LIVE trade'} | Triggered manually_`
         );
       }
-
-      return {
-        success: true,
-        message: `BUY ${symbol} — $${notional.toFixed(0)} market order placed.`,
-        details: { steps, orderId: order?.id },
-      };
+      return { success: true, message: `BUY ${symbol} — $${notional.toFixed(0)} market order placed.`, details: { notional } };
     } catch (err) {
       this._log('error', `Manual order failed for ${symbol}: ${err.message}`);
-      steps.push(`ORDER FAILED: ${err.message}`);
-      return { success: false, message: `Order execution failed: ${err.message}`, details: { steps } };
+      return { success: false, message: `Order execution failed: ${err.message}` };
     }
   }
 
-  // ── Options Engine Access ────────────────────────────────────────
-
   get optionsEngine() { return optionsEngine; }
-
-  // ── Discord Formatting ────────────────────────────────────────────
 
   formatStatusForDiscord(status) {
     if (!status) return '_Could not fetch agent status._';
-
     const dangerousLabel = status.config?.dangerousMode ? ' | **DANGEROUS MODE**' : '';
     const lines = [
       `**SHARK — Autonomous Trading Agent**`,
@@ -866,7 +601,6 @@ class SharkEngine {
       `Agent: ${status.agent_enabled ? '🟢 **ENABLED**' : '🔴 **DISABLED**'}`,
       ``,
     ];
-
     if (status.account) {
       const a = status.account;
       lines.push(`**Account**`);
@@ -876,7 +610,6 @@ class SharkEngine {
       lines.push(`Day Trades: \`${a.daytrade_count || 0}\``);
       lines.push(``);
     }
-
     if (status.positions && status.positions.length > 0) {
       lines.push(`**Open Positions** (${status.positions.length})`);
       for (const p of status.positions.slice(0, 10)) {
@@ -891,7 +624,6 @@ class SharkEngine {
       lines.push(`_No open positions_`);
       lines.push(``);
     }
-
     if (status.risk) {
       lines.push(`**Risk**`);
       lines.push(`Kill Switch: ${status.risk.kill_switch ? '🛑 **ACTIVE**' : '🟢 OK'}`);
@@ -900,13 +632,10 @@ class SharkEngine {
         lines.push(`Daily P/L: \`$${status.risk.daily_pnl.toFixed(2)}\` (${dailyPct.toFixed(2)}%)`);
       }
     }
-
     if (status.clock) {
       lines.push(``);
       lines.push(`Market: ${status.clock.is_open ? '🟢 Open' : '🔴 Closed'}`);
     }
-
-    // Options engine status
     if (status.options) {
       lines.push(``);
       lines.push(`**0DTE Options**`);
@@ -923,17 +652,12 @@ class SharkEngine {
         }
       }
     }
-
     return lines.join('\n');
   }
 
   formatConfigForDiscord(cfg) {
     if (!cfg) return '_Could not fetch config._';
-
     const lines = [`**SHARK Configuration**`, ``];
-
-    // Trading limits
-    lines.push(`__Trading Limits__`);
     const tradingKeys = [
       ['max_positions', 'Max Positions'],
       ['max_notional_per_trade', 'Max $ Per Trade'],
@@ -951,10 +675,7 @@ class SharkEngine {
         lines.push(`**${label}:** \`${val}\``);
       }
     }
-
-    // Signal thresholds
     lines.push(``);
-    lines.push(`__Signal Thresholds__`);
     const signalKeys = [
       ['min_sentiment_score', 'Min Sentiment'],
       ['min_analyst_confidence', 'Min AI Confidence'],
@@ -964,24 +685,18 @@ class SharkEngine {
         lines.push(`**${label}:** \`${cfg[key]}\``);
       }
     }
-
-    // Feature toggles
     lines.push(``);
     lines.push(`__Features__`);
     lines.push(`**Allow Shorting:** ${cfg.allow_shorting ? '`yes`' : '`no`'}`);
     lines.push(`**Crypto Trading:** ${cfg.crypto_enabled ? '`enabled`' : '`disabled`'}`);
     lines.push(`**Options Trading:** ${cfg.options_enabled ? '`enabled`' : '`disabled`'}`);
     lines.push(`**Scan Interval:** \`${cfg.scan_interval_minutes} min\``);
-
-    // Symbol lists
     if (cfg.symbol_allowlist?.length > 0) {
       lines.push(`**Allowlist:** \`${cfg.symbol_allowlist.join(', ')}\``);
     }
     if (cfg.symbol_denylist?.length > 0) {
       lines.push(`**Denylist:** \`${cfg.symbol_denylist.join(', ')}\``);
     }
-
-    // Options config
     if (cfg.options_enabled) {
       lines.push(``);
       lines.push(`__0DTE Options__`);
@@ -994,7 +709,6 @@ class SharkEngine {
       lines.push(`**Delta Range:** \`${cfg.options_min_delta} — ${cfg.options_max_delta}\``);
       lines.push(`**Underlyings:** \`${cfg.options_underlyings?.join(', ') || 'SPY, QQQ'}\``);
     }
-
     lines.push(``);
     lines.push(`Kill Switch: ${cfg.killSwitch ? '🛑 **ACTIVE**' : '🟢 OK'}`);
     lines.push(`Dangerous Mode: ${cfg.dangerousMode ? '**ACTIVE** — aggressive parameters' : 'OFF'}`);
@@ -1007,7 +721,6 @@ class SharkEngine {
 
   formatLogsForDiscord(logs) {
     if (!logs || logs.length === 0) return '_No recent agent activity._';
-
     const lines = [`**SHARK Recent Activity**`, ``];
     for (const log of logs.slice(-15).reverse()) {
       const time = new Date(log.timestamp).toLocaleTimeString('en-US', { timeZone: 'America/New_York' });
