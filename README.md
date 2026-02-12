@@ -82,6 +82,7 @@ All settings are configured through environment variables. See `.env.example`.
 | `KIMI_BASE_URL` | Kimi API base URL | `https://api.moonshot.ai/v1` |
 | `KIMI_MODEL` | Kimi model name | `kimi-k2.5-preview` |
 | `FMP_API_KEY` | Financial Modeling Prep API key (market data for `/price`, `/analyze`, etc.) | — |
+| `ALPHA_API_KEY` | Alpha Vantage API key (market data, server-side technicals, news sentiment, fundamentals) | — |
 | `ALPACA_API_KEY` | Alpaca Markets API key (real-time data, options, WebSocket, trading) | — |
 | `ALPACA_API_SECRET` | Alpaca Markets API secret | — |
 | `ALPACA_PAPER` | Use paper trading (`true`) or live trading (`false`) | `true` |
@@ -160,6 +161,45 @@ All outbound API calls (AInvest, FMP, SearXNG) are wrapped with:
 | 5 consecutive errors | Disable for 5 minutes |
 
 When the circuit is open, cached data is returned if available; otherwise a `ProviderUnavailableError` is thrown.
+
+---
+
+## Alpha Vantage Integration
+
+Alpha Vantage provides a free API for market data, **server-side technical indicators**, news sentiment, and fundamentals. It serves as a fallback data source when Alpaca and FMP are unavailable.
+
+### Data Priority Chain
+```
+Alpaca (preferred) → FMP → Alpha Vantage (fallback)
+```
+
+### Capabilities
+
+| Feature | Endpoint | Cache TTL |
+|---|---|---|
+| Real-time quote | `GLOBAL_QUOTE` | 60s |
+| Intraday candles | `TIME_SERIES_INTRADAY` (1m/5m/15m/30m/60m) | 20s-10m |
+| Daily history | `TIME_SERIES_DAILY` | 1h |
+| Server-side RSI | `RSI` | varies by interval |
+| Server-side MACD | `MACD` | varies by interval |
+| Bollinger Bands | `BBANDS` | varies by interval |
+| ATR | `ATR` | varies by interval |
+| VWAP (intraday) | `VWAP` | varies by interval |
+| News + AI sentiment | `NEWS_SENTIMENT` | 20m |
+| Company overview | `OVERVIEW` | 24h |
+| Earnings | `EARNINGS` | 12h |
+| Top movers | `TOP_GAINERS_LOSERS` | 5m |
+| Ticker search | `SYMBOL_SEARCH` | 1h |
+
+### Rate Limits
+- Free tier: 25 requests/day — the resilience layer caches aggressively to stay within budget
+- Rate limited to ~5 requests/minute via the token bucket
+- Circuit breaker trips on 429 responses (15 min cooldown)
+- [MCP server](https://mcp.alphavantage.co/) available for AI agent integration
+
+### Setup
+1. Get a free API key at https://www.alphavantage.co/support/#api-key
+2. Set `ALPHA_API_KEY` in your `.env` or Railway Variables
 
 ---
 

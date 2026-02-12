@@ -59,6 +59,14 @@ try {
   console.warn('[Bot] AInvest module failed to load (non-critical):', err.message);
 }
 
+// Alpha Vantage — free market data, server-side technicals, news sentiment
+try {
+  const alphaVantage = require('./src/services/alpha-vantage');
+  log.info(`Alpha Vantage: ${alphaVantage.enabled ? 'ENABLED' : 'DISABLED (set ALPHA_API_KEY to enable)'}`);
+} catch (err) {
+  console.warn('[Bot] Alpha Vantage module failed to load (non-critical):', err.message);
+}
+
 log.info('Health server started, all modules loaded');
 
 // ── Discord Client Setup ─────────────────────────────────────────────

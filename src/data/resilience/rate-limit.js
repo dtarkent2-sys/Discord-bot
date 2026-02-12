@@ -13,11 +13,12 @@ const log = require('../../logger')('RateLimit');
 
 // ── Default rate limits per provider ─────────────────────────────────────
 const DEFAULT_LIMITS = {
-  ainvest:  { maxTokens: 30, refillPerSecond: 2 },    // 30 burst, 2/sec steady
-  fmp:     { maxTokens: 20, refillPerSecond: 1 },    // 20 burst, 1/sec steady
-  searxng: { maxTokens: 10, refillPerSecond: 0.5 },  // 10 burst, 1 per 2s
-  alpaca:  { maxTokens: 50, refillPerSecond: 5 },    // 50 burst, 5/sec
-  default: { maxTokens: 20, refillPerSecond: 2 },
+  ainvest:       { maxTokens: 30, refillPerSecond: 2 },     // 30 burst, 2/sec steady
+  fmp:           { maxTokens: 20, refillPerSecond: 1 },     // 20 burst, 1/sec steady
+  searxng:       { maxTokens: 10, refillPerSecond: 0.5 },   // 10 burst, 1 per 2s
+  alpaca:        { maxTokens: 50, refillPerSecond: 5 },     // 50 burst, 5/sec
+  alphavantage:  { maxTokens: 5,  refillPerSecond: 0.08 },  // 5 burst, ~5/min (free tier: 25/day)
+  default:       { maxTokens: 20, refillPerSecond: 2 },
 };
 
 // Parse env override

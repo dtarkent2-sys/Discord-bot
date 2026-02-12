@@ -1,5 +1,5 @@
 /**
- * Market context provider — fetches data from Alpaca (preferred) or FMP.
+ * Market context provider — fetches data from Alpaca (preferred) → FMP → Alpha Vantage.
  */
 
 const { assertFresh, FreshnessError } = require('./freshness');
@@ -7,6 +7,7 @@ const yahoo = require('../services/yahoo');
 const alpaca = require('../services/alpaca');
 const technicals = require('../services/technicals');
 const stocktwits = require('../services/stocktwits');
+const alphaVantage = require('../services/alpha-vantage');
 
 // Default freshness limits (in seconds)
 const FRESHNESS = {
@@ -188,6 +189,37 @@ async function getMarketContext(ticker, opts = {}) {
         console.error(`[Market] Alpaca fallback also failed for ${resolvedTicker}:`, alpErr.message);
       }
     }
+
+    // ── Fallback: Alpha Vantage (if Alpaca and FMP both failed) ──
+    if (!context.quote && alphaVantage.enabled) {
+      console.log(`[Market] Trying Alpha Vantage fallback for ${resolvedTicker}`);
+      try {
+        const avSnapshot = await alphaVantage.getTickerSnapshot(resolvedTicker);
+        if (avSnapshot && avSnapshot.price != null) {
+          context.source = 'AlphaVantage (fallback)';
+          context.snapshot = avSnapshot;
+          context.quote = {
+            price: avSnapshot.price,
+            volume: avSnapshot.volume,
+            mktCap: avSnapshot.marketCap,
+            pe: avSnapshot.pe,
+            rsi14: avSnapshot.rsi14,
+            sma50: avSnapshot.sma50,
+            sma200: avSnapshot.sma200,
+            changePercent: avSnapshot.changePercent,
+            timestamp: avSnapshot.timestamp,
+          };
+          context.priceHistory = avSnapshot.priceHistory;
+
+          // Clear previous failures from missing since we recovered
+          const failIdx = missing.findIndex(m => m.field === 'snapshot');
+          if (failIdx !== -1) missing.splice(failIdx, 1);
+          console.log(`[Market] Alpha Vantage fallback succeeded for ${resolvedTicker}: $${avSnapshot.price}`);
+        }
+      } catch (avErr) {
+        console.error(`[Market] Alpha Vantage fallback also failed for ${resolvedTicker}:`, avErr.message);
+      }
+    }
   }
 
   // Apply freshness gate to quote data
@@ -232,6 +264,18 @@ async function getMarketContext(ticker, opts = {}) {
     }
   } catch {
     // StockTwits is supplementary — silently skip
+  }
+
+  // ── Enrich with Alpha Vantage news sentiment (non-blocking) ──
+  if (alphaVantage.enabled) {
+    try {
+      const avNews = await alphaVantage.getNewsSentiment(resolvedTicker, { limit: 5 });
+      if (avNews && avNews.length > 0) {
+        context.avNewsSentiment = avNews;
+      }
+    } catch {
+      // Alpha Vantage news is supplementary — silently skip
+    }
   }
 
   // Partial data is OK — include what we have and note what's missing
@@ -325,6 +369,15 @@ function formatContextForAI(context) {
   if (context.socialSentiment) {
     const s = context.socialSentiment;
     lines.push(`  Social Sentiment (StockTwits): ${s.label} (score: ${(s.score * 100).toFixed(0)}%) — ${s.bullish} bullish / ${s.bearish} bearish / ${s.neutral} neutral (${s.messages} posts)`);
+  }
+
+  // Alpha Vantage news sentiment
+  if (context.avNewsSentiment && context.avNewsSentiment.length > 0) {
+    lines.push('  News Sentiment (Alpha Vantage):');
+    for (const item of context.avNewsSentiment.slice(0, 3)) {
+      const sentiment = item.overallSentiment || 'N/A';
+      lines.push(`    [${sentiment}] ${item.title} (${item.source})`);
+    }
   }
 
   if (context.quoteStale) {

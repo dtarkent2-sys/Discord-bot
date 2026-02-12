@@ -79,4 +79,7 @@ module.exports = {
   gexCandleInterval: process.env.GEX_CANDLE_INTERVAL || '5Min',
   gexMinRegimeConfidence: parseFloat(process.env.GEX_MIN_REGIME_CONFIDENCE) || 0.4,
   gexMinAbsGex: parseFloat(process.env.GEX_MIN_ABS_GEX) || 1e6, // $1M minimum to consider dominant
+
+  // Alpha Vantage API (market data, technicals, fundamentals, news sentiment)
+  alphaApiKey: process.env.ALPHA_API_KEY || '',
 };
