@@ -2,6 +2,7 @@ const { Ollama } = require('ollama');
 const config = require('../config');
 const memory = require('./memory');
 const mood = require('./mood');
+const reactions = require('./reactions');
 const { persona, buildPersonalityPrompt } = require('../personality');
 const { webSearch, formatResultsForAI } = require('../tools/web-search');
 const auditLog = require('./audit-log');
@@ -177,7 +178,39 @@ ${searchResults ? `\nWEB SEARCH RESULTS (fetched ${now} — use as source of tru
 ${mood.buildMoodContext()}
 
 ${selfAwareness.buildSelfKnowledge()}
+${this._buildReactionContext()}
 `.trim();
+  }
+
+  /**
+   * Build context from reaction feedback (thumbs up/down learning).
+   * Tells the AI what topics/styles users respond well to.
+   */
+  _buildReactionContext() {
+    try {
+      const stats = reactions.getStats();
+      if (stats.total < 3) return ''; // Not enough data yet
+
+      const parts = [];
+      parts.push(`LEARNING FROM FEEDBACK: Users have rated ${stats.total} of your responses (${stats.ratio}% positive).`);
+
+      if (stats.patterns.length > 0) {
+        const good = stats.patterns.filter(p => p.ratio >= 70);
+        if (good.length > 0) {
+          parts.push(`Topics users respond well to: ${good.map(p => `${p.topic} (${p.ratio}% positive)`).join(', ')}.`);
+        }
+      }
+
+      // Get recent negative feedback to learn from
+      const recentFeedback = reactions.getRecentNegative ? reactions.getRecentNegative(3) : [];
+      if (recentFeedback.length > 0) {
+        parts.push(`Recent thumbs-down responses to avoid repeating: ${recentFeedback.map(f => `"${f.botResponse.slice(0, 60)}..."`).join('; ')}`);
+      }
+
+      return parts.length > 0 ? parts.join(' ') : '';
+    } catch {
+      return '';
+    }
   }
 
   /**
