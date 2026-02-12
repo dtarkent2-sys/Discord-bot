@@ -70,10 +70,6 @@ class SelfAwareness {
     // ── Active Services ──
     parts.push('');
     parts.push('SERVICES STATUS:');
-    parts.push(`- Uptime: ${stats.getSummary().uptime | 'N/A'}`);
-    parts.push(`- Servers: ${stats.getSummary().guilds | 'N/A'}`);
-    parts.push(`- Messages processed: ${stats.getSummary().messagesProcessed | 'N/A'}`);
-    parts.push(`- Commands run: ${stats.getSummary().commandsRun | 'N/A'} | Last command: ${stats.getSummary().lastCommandName || 'N/A'}`);
 
     const services = [
       { name: 'Alpaca (Trading)', active: alpaca.enabled, detail: alpaca.enabled ? (alpaca.isPaper ? 'Paper mode' : 'LIVE mode') : 'No API key' },
@@ -97,10 +93,9 @@ class SelfAwareness {
       const cb = circuitBreaker.getStatus();
       parts.push('');
       parts.push('TRADING STATE:');
-      parts.push(`- Circuit breaker: ${cb.paused ? `PAUSED (${cb.remainingMinutes} min left) - Last trade: ${cb.lastTradeFailureReason || 'N/A'}` : 'Normal'}`);
+      parts.push(`- Circuit breaker: ${cb.paused ? `PAUSED (${cb.remainingMinutes} min left)` : 'Normal'}`);
       parts.push(`- Consecutive bad trades: ${cb.consecutiveBadTrades}/3`);
-      parts.push(`- Total trips: ${cb.totalTrips} | Last error: ${cb.lastErrorMessage || 'N/A'}`);
-      parts.push(`- Offset: ${cb.offset || 'N/A'} | Remaining: ${cb.remainingTrips || 'N/A'}`);
+      parts.push(`- Total trips: ${cb.totalTrips}`);
 
       try {
         const cfg = policy.getConfig();
@@ -114,10 +109,9 @@ class SelfAwareness {
       const ys = getYoloMode().getStatus();
       parts.push('');
       parts.push('YOLO MODE (SELF-IMPROVEMENT):');
-      parts.push(`- Improvements today: ${ys.dailyCount}/${ys.dailyLimit} (Tried: ${ys.totalAttempts})`);
+      parts.push(`- Improvements today: ${ys.dailyCount}/${ys.dailyLimit}`);
       parts.push(`- Total improvements made: ${ys.totalImprovements}`);
-      parts.push(`- Consecutive failures: ${ys.consecutiveFailures}/${ys.failureThreshold} (Last failure: ${ys.lastFailureReason || 'N/A'})`);
-      parts.push(`- Recovery hint: ${ys.recoveryHint || 'Review console logs and check dependencies'}`);
+      parts.push(`- Consecutive failures: ${ys.consecutiveFailures}/${ys.failureThreshold}`);
     }
 
     // ── Self-Knowledge Instructions ──
@@ -127,7 +121,7 @@ class SelfAwareness {
     parts.push('- When asked about your code or how you work — explain honestly using your architecture knowledge');
     parts.push('- When asked about your status — use the live state above');
     parts.push('- You CAN modify your own code (via YOLO mode and self-heal). You know this and can discuss it.');
-    parts.push('- If a service is disabled, say so and explain what\'s needed to enable it');
+    parts.push('- If a service is disabled, explain why it\'s disabled and what\'s needed to enable it');
     parts.push('- You have opinions about your own design. You can suggest improvements to yourself.');
     parts.push('- You remember your own trade history, error patterns, and learning journal.');
     parts.push('- Be honest about your limitations: you run on Ollama, your knowledge has a cutoff, you need API keys for some features.');
