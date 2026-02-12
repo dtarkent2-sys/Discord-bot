@@ -204,7 +204,12 @@ class AutonomousBehaviorEngine {
       if (day === 0 || day === 6) return; // weekend
       if (etHour < 9 || etHour >= 16) return; // outside market hours
       auditLog.log('schedule', 'Running SHARK autonomous trading cycle');
-      await mahoraga.runCycle();
+      try {
+        await mahoraga.runCycle();
+      } catch (err) {
+        console.error('[Sprocket] SHARK trading cycle error:', err.message);
+        auditLog.log('error', `SHARK trading cycle error: ${err.message}`);
+      }
     }, scanMinutes * 60 * 1000);
     console.log(`[Sprocket] SHARK trading schedule active — every ${scanMinutes}min (when enabled via /agent enable)`);
 
