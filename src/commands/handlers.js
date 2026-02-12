@@ -3,6 +3,13 @@ const memory = require('../services/memory');
 const mood = require('../services/mood');
 const stats = require('../services/stats');
 const reactions = require('../services/reactions');
+
+// Lazy-load yoloMode to avoid circular dependency (yolo-mode requires self-awareness)
+let _yoloMode = null;
+function getYoloMode() {
+  if (!_yoloMode) _yoloMode = require('../services/yolo-mode');
+  return _yoloMode;
+}
 const sentiment = require('../services/sentiment');
 const yahoo = require('../services/yahoo');
 const alpaca = require('../services/alpaca');
@@ -1820,7 +1827,7 @@ async function handleYolo(interaction) {
 
   switch (action) {
     case 'status': {
-      const s = yoloMode.getStatus();
+      const s = getYoloMode().getStatus();
       const lines = [
         '**YOLO Mode — Autonomous Self-Improvement**',
         '',
@@ -1844,7 +1851,7 @@ async function handleYolo(interaction) {
     }
 
     case 'enable': {
-      yoloMode.enable();
+      getYoloMode().enable();
       return interaction.reply(
         '**YOLO Mode ENABLED**\n' +
         'Billy will autonomously scan his codebase, identify improvements, ' +
@@ -1857,7 +1864,7 @@ async function handleYolo(interaction) {
     }
 
     case 'disable': {
-      yoloMode.disable();
+      getYoloMode().disable();
       return interaction.reply('**YOLO Mode DISABLED**\nAutonomous self-improvement stopped.');
     }
 
@@ -1865,7 +1872,7 @@ async function handleYolo(interaction) {
       await interaction.deferReply();
       await interaction.editReply('**YOLO Mode — Manual Cycle**\nRunning improvement scan now...');
 
-      const result = await yoloMode.runNow();
+      const result = await getYoloMode().runNow();
       if (result.success) {
         await interaction.editReply('**YOLO Mode — Manual Cycle Complete**\nCheck `/yolo history` and `/yolo logs` for details.');
       } else {
@@ -1875,7 +1882,7 @@ async function handleYolo(interaction) {
     }
 
     case 'history': {
-      const history = yoloMode.getHistory(10);
+      const history = getYoloMode().getHistory(10);
       if (history.length === 0) {
         return interaction.reply({ content: '_No improvements yet. Enable YOLO mode to start._', flags: MessageFlags.Ephemeral });
       }
@@ -1894,7 +1901,7 @@ async function handleYolo(interaction) {
     }
 
     case 'logs': {
-      const journal = yoloMode.getJournal(15);
+      const journal = getYoloMode().getJournal(15);
       if (journal.length === 0) {
         return interaction.reply({ content: '_No journal entries yet. The brain logs decisions once YOLO mode runs._', flags: MessageFlags.Ephemeral });
       }

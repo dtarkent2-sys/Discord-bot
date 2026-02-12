@@ -676,6 +676,19 @@ ${currentCode}`;
       return null;
     }
 
+    // Content destruction guard: block if new code lost most require/function/class/module.exports
+    // (catches the case where AI replaces code with padding/arrays but keeps the line count)
+    if (filePath.endsWith('.js') && oldLineCount > 30) {
+      const codePatterns = /\b(require|module\.exports|function |class |async |const |let |if |return |await )\b/g;
+      const oldCodeHits = (currentCode.match(codePatterns) || []).length;
+      const newCodeHits = (newCode.match(codePatterns) || []).length;
+      if (oldCodeHits > 10 && newCodeHits < oldCodeHits * 0.3) {
+        console.log(`[YOLO] Blocked: code structure destroyed in ${filePath} (${oldCodeHits} → ${newCodeHits} code patterns)`);
+        this._addJournal('blocked', filePath, `Code destruction detected: ${oldCodeHits} → ${newCodeHits} code patterns`, source);
+        return null;
+      }
+    }
+
     // Syntax validation: run node --check before committing .js files
     if (filePath.endsWith('.js')) {
       const valid = this._syntaxCheck(newCode, filePath);
