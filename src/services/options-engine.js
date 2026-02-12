@@ -294,11 +294,18 @@ class OptionsEngine {
   async _analyzeUnderlying(underlying, macroRegime, et) {
     const cfg = policy.getConfig();
 
-    // Cooldown per-underlying (not using signal cache — that was blocking too aggressively)
+    // Cooldown per-underlying — only applies after a TRADE was executed (not after analysis skips).
+    // This lets the engine re-evaluate quickly as conditions change, while preventing
+    // rapid repeat entries on the same underlying.
     const cooldownKey = `opts_${underlying}`;
+    const lastTrade = this._tradeCooldowns?.get(cooldownKey) || 0;
+    if (Date.now() - lastTrade < (cfg.options_cooldown_minutes || 5) * 60 * 1000) {
+      return null; // Recently traded this underlying, skip
+    }
+    // Shorter re-scan cooldown to avoid hammering APIs every cycle (90 seconds)
     const lastScan = this._scanTimestamps?.get(cooldownKey) || 0;
-    if (Date.now() - lastScan < (cfg.options_cooldown_minutes || 5) * 60 * 1000) {
-      return null; // Still on cooldown, silently skip
+    if (Date.now() - lastScan < 90 * 1000) {
+      return null; // Scanned very recently, skip
     }
 
     this._log('scan', `${underlying}: Starting 0DTE analysis...`);
@@ -378,27 +385,32 @@ class OptionsEngine {
     this._log('scan', `${underlying}: conviction ${directionSignals.conviction}/10 — asking AI...`);
     const aiDecision = await this._askOptionsAI(underlying, spotPrice, intradayTech, gexSummary || this._buildMinimalGexContext(spotPrice), macroRegime, directionSignals, et);
 
+    // Mark scanned after full analysis completes (90s re-scan cooldown).
+    // Trade cooldown (options_cooldown_minutes) only applies after actual execution.
+    this._markScanned(cooldownKey);
+
     if (!aiDecision || aiDecision.action === 'SKIP') {
       const reason = aiDecision?.reason || 'AI says skip';
       this._log('scan', `${underlying}: AI SKIP — ${reason}`);
-      this._markScanned(cooldownKey);
       return null;
     }
 
     if (aiDecision.conviction < cfg.options_min_conviction) {
       this._log('scan', `${underlying}: AI conviction ${aiDecision.conviction}/10 below min ${cfg.options_min_conviction} — skipping`);
-      this._markScanned(cooldownKey);
       return null;
     }
 
     this._log('scan', `${underlying}: AI says ${aiDecision.action} — conviction ${aiDecision.conviction}/10, strategy: ${aiDecision.strategy || directionSignals.strategy} — PROCEEDING TO EXECUTE`);
 
-    this._markScanned(cooldownKey);
+    // Map AI action to direction — bare 'BUY' falls back to the technical assessment
+    const aiDirection = aiDecision.action === 'BUY_CALL' ? 'bullish'
+      : aiDecision.action === 'BUY_PUT' ? 'bearish'
+      : directionSignals.direction; // bare 'BUY' keeps technical direction
 
     return {
       underlying,
-      direction: aiDecision.action === 'BUY_CALL' || aiDecision.action === 'BUY' ? 'bullish' : 'bearish',
-      optionType: (aiDecision.action === 'BUY_CALL' || aiDecision.action === 'BUY') ? 'call' : 'put',
+      direction: aiDirection,
+      optionType: aiDirection === 'bullish' ? 'call' : 'put',
       strategy: aiDecision.strategy || directionSignals.strategy,
       conviction: aiDecision.conviction,
       reason: aiDecision.reason,
@@ -410,10 +422,16 @@ class OptionsEngine {
     };
   }
 
-  /** Track when we last scanned an underlying */
+  /** Track when we last scanned an underlying (light 90s cooldown) */
   _markScanned(key) {
     if (!this._scanTimestamps) this._scanTimestamps = new Map();
     this._scanTimestamps.set(key, Date.now());
+  }
+
+  /** Track when we last TRADED an underlying (full cooldown_minutes cooldown) */
+  _markTraded(underlying) {
+    if (!this._tradeCooldowns) this._tradeCooldowns = new Map();
+    this._tradeCooldowns.set(`opts_${underlying}`, Date.now());
   }
 
   /** Build minimal GEX context when real GEX is unavailable (so AI prompt doesn't break) */
@@ -930,6 +948,7 @@ class OptionsEngine {
       this._persistTrades();
 
       policy.recordOptionsTrade(signal.underlying);
+      this._markTraded(signal.underlying);
 
       this._log('trade', `BUY ${qty}x ${contract.symbol} @ $${limitPrice} (${signal.strategy}) — conviction ${signal.conviction}/10`);
 
@@ -1229,7 +1248,7 @@ class OptionsEngine {
 
     // 5. Direction
     const dirSignals = this._assessDirection(tech, gexSummary.regime, gexSummary.walls, gexSummary.gammaFlip, gexSummary.spot, macroRegime);
-    const finalDirection = direction || (dirSignals.direction === 'bullish' ? 'call' : 'put');
+    let finalDirection = direction || (dirSignals.direction === 'bullish' ? 'call' : 'put');
     const finalStrategy = strategy || dirSignals.strategy;
     steps.push(`Direction: ${dirSignals.direction} (${dirSignals.conviction}/10), strategy: ${finalStrategy}`);
 
@@ -1246,6 +1265,13 @@ class OptionsEngine {
         if (aiDecision.action === 'SKIP') {
           return { success: false, message: `AI says SKIP: ${aiDecision.reason}`, details: { steps } };
         }
+        // Let the AI override direction — it may see a put setup the technicals missed
+        if (aiDecision.action === 'BUY_CALL') {
+          finalDirection = 'call';
+        } else if (aiDecision.action === 'BUY_PUT') {
+          finalDirection = 'put';
+        }
+        // Note: bare 'BUY' keeps the technical direction (finalDirection unchanged)
       } else {
         steps.push(`AI: no response`);
       }
