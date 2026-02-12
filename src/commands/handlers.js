@@ -237,25 +237,30 @@ async function handleAnalyze(interaction) {
 
   const ticker = yahoo.resolveTicker(interaction.options.getString('ticker'));
 
-  // Fetch real market data from the preferred provider
-  const context = await getMarketContext(ticker);
+  try {
+    // Fetch real market data from the preferred provider
+    const context = await getMarketContext(ticker);
 
-  if (context.error) {
-    await interaction.editReply(`**Cannot analyze ${ticker}**\n${context.message}`);
-    return;
+    if (context.error) {
+      await interaction.editReply(`**Cannot analyze ${ticker}**\n${context.message}`);
+      return;
+    }
+
+    // Format the data and send to AI for analysis
+    const liveData = formatContextForAI(context);
+
+    const response = await ai.chat(
+      interaction.user.id,
+      interaction.user.username,
+      `Analyze ${ticker} for me. Give me the key takeaways from this data, technical outlook, and whether it looks like a good setup. Include the actual numbers from the data.`,
+      { liveData }
+    );
+
+    await interaction.editReply(response);
+  } catch (err) {
+    console.error(`[Analyze] Error for ${ticker}:`, err);
+    await interaction.editReply(`**${ticker} — Analysis Failed**\n${err.message}`);
   }
-
-  // Format the data and send to AI for analysis
-  const liveData = formatContextForAI(context);
-
-  const response = await ai.chat(
-    interaction.user.id,
-    interaction.user.username,
-    `Analyze ${ticker} for me. Give me the key takeaways from this data, technical outlook, and whether it looks like a good setup. Include the actual numbers from the data.`,
-    { liveData }
-  );
-
-  await interaction.editReply(response);
 }
 
 // ── /price — Quick price + stats lookup ─────────────────────────────
@@ -451,19 +456,24 @@ async function handleSentiment(interaction) {
 async function handleTopic(interaction) {
   await interaction.deferReply();
 
-  const response = await ai.complete(
-    'Generate a single interesting discussion topic for a stock trading Discord server. ' +
-    'It can be about markets, trading strategies, economic trends, a specific sector, ' +
-    'or a thought-provoking investing question. Keep it to 1-2 sentences. ' +
-    'Just output the topic, no labels or prefixes.'
-  );
+  try {
+    const response = await ai.complete(
+      'Generate a single interesting discussion topic for a stock trading Discord server. ' +
+      'It can be about markets, trading strategies, economic trends, a specific sector, ' +
+      'or a thought-provoking investing question. Keep it to 1-2 sentences. ' +
+      'Just output the topic, no labels or prefixes.'
+    );
 
-  if (!response) {
-    await interaction.editReply('Could not generate a topic right now. Try again later!');
-    return;
+    if (!response) {
+      await interaction.editReply('Could not generate a topic right now. Try again later!');
+      return;
+    }
+
+    await interaction.editReply(`**Discussion Topic:**\n${response}`);
+  } catch (err) {
+    console.error('[Topic] Error:', err);
+    await interaction.editReply('Could not generate a topic right now. Try again later.');
   }
-
-  await interaction.editReply(`**Discussion Topic:**\n${response}`);
 }
 
 // ── /watchlist — Manage personal watchlist ───────────────────────────

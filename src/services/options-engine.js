@@ -150,11 +150,13 @@ class OptionsEngine {
       const equity = Number(account.equity || 0);
       policy.resetDaily(equity);
 
-      // 2. Monitor existing options positions FIRST (always run)
-      await this._monitorPositions(et.minutesToClose);
-
-      // 3. If we have room and time, scan for new entries
+      // 2. Fetch options positions once (used by both monitor + entry scan)
       const optionsPositions = await alpaca.getOptionsPositions();
+
+      // 3. Monitor existing options positions FIRST (always run)
+      await this._monitorPositions(et.minutesToClose, optionsPositions);
+
+      // 4. If we have room and time, scan for new entries
       if (optionsPositions.length < cfg.options_max_positions && et.minutesToClose > cfg.options_close_before_minutes) {
         this._log('cycle', `Scanning for entries — ${optionsPositions.length}/${cfg.options_max_positions} positions, ${et.minutesToClose} min left`);
         await this._scanForEntries(account, optionsPositions.length, et);
@@ -173,10 +175,9 @@ class OptionsEngine {
 
   // ── Position Monitoring ───────────────────────────────────────────
 
-  async _monitorPositions(minutesToClose) {
+  async _monitorPositions(minutesToClose, optionsPositions) {
     try {
-      const optionsPositions = await alpaca.getOptionsPositions();
-      if (optionsPositions.length === 0) return;
+      if (!optionsPositions || optionsPositions.length === 0) return;
 
       this._log('monitor', `Monitoring ${optionsPositions.length} options position(s)`);
 

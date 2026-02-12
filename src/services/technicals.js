@@ -114,7 +114,8 @@ function calculateBollingerBands(prices, period = 20, stdDev = 2) {
   const std = Math.sqrt(variance);
   const upper = middle + stdDev * std;
   const lower = middle - stdDev * std;
-  return { upper, middle, lower, width: (upper - lower) / middle };
+  const width = middle > 0 ? (upper - lower) / middle : 0;
+  return { upper, middle, lower, width };
 }
 
 /**
