@@ -1,18 +1,3 @@
-/**
- * AInvest MCP Client — Lightweight Model Context Protocol client.
- *
- * Connects to https://docsmcp.ainvest.com via HTTP Streamable transport.
- * Discovers all available tools on startup and provides a callTool() interface.
- *
- * MCP Protocol (JSON-RPC 2.0 over HTTP):
- *   1. POST initialize → get session ID
- *   2. POST initialized (notification)
- *   3. POST tools/list → discover available tools
- *   4. POST tools/call → invoke a tool
- *
- * No external dependencies — uses native fetch.
- */
-
 const config = require('../config');
 
 const MCP_URL = 'https://docsmcp.ainvest.com';
@@ -32,7 +17,7 @@ class AInvestMCP {
     return !!config.ainvestApiKey;
   }
 
-  // ── JSON-RPC helpers ──────────────────────────────────────────────────
+  // ── JSON-RPC helpers ────────────────────────────────────────────────────
 
   _makeRequest(method, params) {
     const req = {
