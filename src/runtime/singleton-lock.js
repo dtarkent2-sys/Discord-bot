@@ -169,34 +169,46 @@ async function acquireLock() {
     _redis = await _createRedisClient(redisUrl);
     _lockValue = _generateLockValue();
 
-    // SET key value NX EX ttl
-    const result = await _redis.sendCommand('SET', LOCK_KEY, _lockValue, 'NX', 'EX', String(DEFAULT_TTL));
+    // Try to acquire the lock, retrying up to TTL seconds if a stale lock exists.
+    // This handles the common case where a previous instance crashed without releasing.
+    const maxAttempts = Math.ceil(DEFAULT_TTL / 5) + 1; // retry every 5s up to TTL
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const result = await _redis.sendCommand('SET', LOCK_KEY, _lockValue, 'NX', 'EX', String(DEFAULT_TTL));
 
-    if (result === 'OK') {
-      log.info(`Leader lock ACQUIRED (key=${LOCK_KEY}, ttl=${DEFAULT_TTL}s, value=${_lockValue})`);
+      if (result === 'OK') {
+        log.info(`Leader lock ACQUIRED (key=${LOCK_KEY}, ttl=${DEFAULT_TTL}s, value=${_lockValue})`);
 
-      // Start renewal
-      _renewInterval = setInterval(async () => {
-        try {
-          await _renewLock();
-        } catch (err) {
-          log.error(`Lock renewal failed: ${err.message}`);
-          _stopRenewal();
-          log.error('Lost leader lock — exiting to allow another instance to take over');
-          process.exit(0);
-        }
-      }, DEFAULT_RENEW * 1000);
+        // Start renewal
+        _renewInterval = setInterval(async () => {
+          try {
+            await _renewLock();
+          } catch (err) {
+            log.error(`Lock renewal failed: ${err.message}`);
+            _stopRenewal();
+            log.error('Lost leader lock — exiting to allow another instance to take over');
+            process.exit(0);
+          }
+        }, DEFAULT_RENEW * 1000);
 
-      // Don't let the interval keep the process alive if everything else shuts down
-      if (_renewInterval.unref) _renewInterval.unref();
+        // Don't let the interval keep the process alive if everything else shuts down
+        if (_renewInterval.unref) _renewInterval.unref();
 
-      return;
+        return;
+      }
+
+      // Lock held — check remaining TTL to decide whether to wait or bail
+      const ttl = await _redis.sendCommand('TTL', LOCK_KEY);
+      const waitSec = Math.min(ttl > 0 ? ttl : 5, 10);
+
+      if (attempt < maxAttempts) {
+        log.info(`Leader lock held by another instance (TTL ${ttl}s). Retrying in ${waitSec}s... (attempt ${attempt}/${maxAttempts})`);
+        await new Promise(r => setTimeout(r, waitSec * 1000));
+      } else {
+        log.info(`Leader lock NOT acquired after ${maxAttempts} attempts — exiting gracefully.`);
+        _redis.quit();
+        process.exit(0);
+      }
     }
-
-    // Lock NOT acquired — another instance is leader
-    log.info(`Leader lock NOT acquired — another instance holds the lock. Exiting gracefully.`);
-    _redis.quit();
-    process.exit(0);
   } catch (err) {
     log.error(`Redis lock error: ${err.message} — proceeding WITHOUT lock (fallback mode)`);
     if (_redis) { try { _redis.quit(); } catch {} }
