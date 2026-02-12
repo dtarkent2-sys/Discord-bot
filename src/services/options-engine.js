@@ -61,11 +61,13 @@ const CORRELATED_GROUPS = [
 // Hard limits that dangerous mode CANNOT override
 const HARD_LIMITS = {
   maxTradesPerSymbolPerHour: 3,   // max 3 round trips per underlying per hour
-  maxTradesPerDay: 15,            // max 15 total options trades per day
+  maxTradesPerDay: 10,            // max 10 total options trades per day (user: "2-10 trades a day MAX")
   maxCorrelatedPositions: 2,      // max 2 simultaneous positions in correlated underlyings
-  consecutiveLossCooldownMin: 30, // 30 min pause after 2 consecutive losses on same underlying
+  consecutiveLossCooldownMin: 30, // 30 min pause after 2 consecutive losses ("stop trading after 2 losses in a row")
   consecutiveLossThreshold: 2,    // how many losses trigger the cooldown
   minCooldownAfterLoss: 10,       // 10 min minimum cooldown after any loss (overrides config)
+  maxScalpHoldMinutes: 15,        // "don't hold more than 10-15 mins"
+  scalpBailMinutes: 5,            // "if it's not working in 5, get out"
 };
 
 class OptionsEngine {
@@ -198,12 +200,38 @@ class OptionsEngine {
   }
 
   /**
-   * Record a completed trade for discipline tracking.
+   * Record a completed trade for discipline tracking + trade journal.
    * Called after every exit (both P&L and forced exits).
+   * "journal EVERY trade. I need to track WHY I entered, not just what happened"
    */
-  _recordTradeResult(underlying, pnl) {
+  _recordTradeResult(underlying, pnl, exitReason) {
     const won = pnl > 0;
-    this._tradeHistory.push({ underlying, time: Date.now(), pnl, won });
+    const now = Date.now();
+    this._tradeHistory.push({ underlying, time: now, pnl, won });
+
+    // ── Trade Journal (persistent) ──
+    // "review losers within 24hrs. figure out if it was a bad read or bad timing"
+    const tracked = [...this._activeTrades.values()].find(t => t.underlying === underlying);
+    const journal = this._storage.get('tradeJournal', []);
+    journal.push({
+      date: new Date().toISOString(),
+      underlying,
+      symbol: tracked?.symbol || underlying,
+      direction: tracked?.optionType || 'unknown',
+      strategy: tracked?.strategy || 'scalp',
+      conviction: tracked?.conviction || 0,
+      entryReason: tracked?.reason || 'unknown',
+      entryPrice: tracked?.entryPrice || 0,
+      entryTime: tracked?.entryTime || null,
+      exitTime: new Date().toISOString(),
+      holdMinutes: tracked?.entryTime ? ((now - new Date(tracked.entryTime).getTime()) / 60000).toFixed(1) : 'N/A',
+      exitReason: exitReason || 'unknown',
+      pnl: Number(pnl.toFixed(2)),
+      won,
+    });
+    // Keep last 200 journal entries
+    while (journal.length > 200) journal.shift();
+    this._storage.set('tradeJournal', journal);
 
     if (won) {
       // Reset consecutive losses on a win
@@ -215,6 +243,7 @@ class OptionsEngine {
       this._consecutiveLosses.set(underlying, newCount);
 
       // If threshold hit, set cooldown
+      // "stop trading after 2 losses in a row. tilt is real"
       if (newCount >= HARD_LIMITS.consecutiveLossThreshold) {
         const cooldownExpiry = Date.now() + HARD_LIMITS.consecutiveLossCooldownMin * 60 * 1000;
         this._lossCooldowns.set(underlying, cooldownExpiry);
@@ -238,6 +267,24 @@ class OptionsEngine {
     const losses = todayTrades.length - wins;
     const totalPnL = todayTrades.reduce((sum, t) => sum + t.pnl, 0);
     this._log('discipline', `Daily stats: ${todayTrades.length} trades (${wins}W/${losses}L), net P&L: $${totalPnL.toFixed(2)}`);
+  }
+
+  /**
+   * Get recent trade journal entries for review.
+   * "review losers within 24hrs"
+   */
+  getTradeJournal(count = 20) {
+    const journal = this._storage.get('tradeJournal', []);
+    return journal.slice(-count);
+  }
+
+  /**
+   * Get today's losers for review.
+   */
+  getTodayLosers() {
+    const journal = this._storage.get('tradeJournal', []);
+    const todayStr = new Date().toISOString().slice(0, 10);
+    return journal.filter(j => j.date.startsWith(todayStr) && !j.won);
   }
 
   // ── Main Cycle ────────────────────────────────────────────────────
@@ -331,6 +378,66 @@ class OptionsEngine {
       for (const pos of optionsPositions) {
         const tracked = this._activeTrades.get(pos.symbol);
         const strategy = tracked?.strategy || 'scalp';
+        const pnlPct = Number(pos.unrealized_plpc || 0);
+
+        // ── Scalp time-based exits (hard limits) ──
+        // "don't hold more than 10-15 mins. if it's not working in 5, get out"
+        if (strategy === 'scalp' && tracked?.entryTime) {
+          const holdMinutes = (Date.now() - new Date(tracked.entryTime).getTime()) / 60000;
+
+          // Bail at 5 min if not profitable
+          if (holdMinutes >= HARD_LIMITS.scalpBailMinutes && pnlPct <= 0) {
+            const pnl = Number(pos.unrealized_pl || 0);
+            this._log('monitor', `${pos.symbol}: SCALP BAIL — held ${holdMinutes.toFixed(0)} min, not profitable (${(pnlPct * 100).toFixed(1)}%)`);
+            try {
+              await alpaca.closeOptionsPosition(pos.symbol);
+              policy.recordOptionsTradeResult(pnl);
+              circuitBreaker.recordExit(pos.symbol, 'scalp_bail', pnlPct);
+              const parsed1 = alpaca._parseOccSymbol(pos.symbol);
+              this._recordTradeResult(parsed1.underlying, pnl, 'scalp_bail_5min');
+              this._activeTrades.delete(pos.symbol);
+              this._persistTrades();
+              if (this._postToChannel) {
+                await this._postToChannel(
+                  `⏱️ **Scalp Bail: ${parsed1.underlying} $${parsed1.strike} ${parsed1.type.toUpperCase()}**\n` +
+                  `Held ${holdMinutes.toFixed(0)} min, not working — cutting it.\n` +
+                  `P/L: \`$${pnl.toFixed(2)}\` (${(pnlPct * 100).toFixed(1)}%)\n` +
+                  `_${alpaca.isPaper ? 'Paper' : 'LIVE'} | "if it's not working in 5, get out"_`
+                );
+              }
+              continue; // Already closed, skip to next position
+            } catch (err) {
+              this._log('error', `Scalp bail failed for ${pos.symbol}: ${err.message}`);
+            }
+          }
+
+          // Hard max hold — 15 min regardless of P&L
+          if (holdMinutes >= HARD_LIMITS.maxScalpHoldMinutes) {
+            const pnl = Number(pos.unrealized_pl || 0);
+            this._log('monitor', `${pos.symbol}: SCALP TIME LIMIT — held ${holdMinutes.toFixed(0)} min (max ${HARD_LIMITS.maxScalpHoldMinutes})`);
+            try {
+              await alpaca.closeOptionsPosition(pos.symbol);
+              policy.recordOptionsTradeResult(pnl);
+              circuitBreaker.recordExit(pos.symbol, 'scalp_time_limit', pnlPct);
+              const parsed1 = alpaca._parseOccSymbol(pos.symbol);
+              this._recordTradeResult(parsed1.underlying, pnl, 'scalp_time_limit_15min');
+              this._activeTrades.delete(pos.symbol);
+              this._persistTrades();
+              if (this._postToChannel) {
+                const emoji = pnl >= 0 ? '🟢' : '🔴';
+                await this._postToChannel(
+                  `${emoji} **Scalp Time Exit: ${parsed1.underlying} $${parsed1.strike} ${parsed1.type.toUpperCase()}**\n` +
+                  `Max hold time reached (${HARD_LIMITS.maxScalpHoldMinutes} min)\n` +
+                  `P/L: \`$${pnl.toFixed(2)}\` (${(pnlPct * 100).toFixed(1)}%)\n` +
+                  `_${alpaca.isPaper ? 'Paper' : 'LIVE'} | "don't hold more than 10-15 mins"_`
+                );
+              }
+              continue; // Already closed, skip to next position
+            } catch (err) {
+              this._log('error', `Scalp time exit failed for ${pos.symbol}: ${err.message}`);
+            }
+          }
+        }
 
         const exits = policy.checkOptionsExits([pos], strategy, minutesToClose);
         for (const exit of exits) {
@@ -345,7 +452,7 @@ class OptionsEngine {
 
             // Record for trade discipline (consecutive loss tracking, hourly caps, etc.)
             const parsed0 = alpaca._parseOccSymbol(exit.symbol);
-            this._recordTradeResult(parsed0.underlying, pnl);
+            this._recordTradeResult(parsed0.underlying, pnl, exit.reason);
 
             // Remove from tracking
             this._activeTrades.delete(exit.symbol);
