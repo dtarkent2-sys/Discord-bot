@@ -22,60 +22,7 @@ const tradier = require('./tradier');
 const publicService = require('./public');
 const priceFetcher = require('../tools/price-fetcher');
 const alpaca = require('./alpaca');
-
-// ── Black-Scholes gamma estimation (fallback when real greeks unavailable) ──
-const RISK_FREE_RATE = 0.045;
-const SQRT_2PI = Math.sqrt(2 * Math.PI);
-
-function _normalPDF(x) {
-  return Math.exp(-0.5 * x * x) / SQRT_2PI;
-}
-
-function _bsGamma(S, K, sigma, T) {
-  if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
-  const d1 = (Math.log(S / K) + (RISK_FREE_RATE + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
-  return _normalPDF(d1) / (S * sigma * Math.sqrt(T));
-}
-
-function _estimateIV(midPrice, spotPrice, strike, T, isCall) {
-  if (midPrice <= 0 || T <= 0) return 0.25;
-  let sigma = Math.sqrt(2 * Math.PI / T) * midPrice / spotPrice;
-  if (sigma <= 0.01 || sigma > 5) sigma = 0.25;
-  for (let i = 0; i < 3; i++) {
-    const bsPrice = _bsPrice(spotPrice, strike, RISK_FREE_RATE, sigma, T, isCall);
-    const vega = _bsVega(spotPrice, strike, RISK_FREE_RATE, sigma, T);
-    if (vega < 1e-10) break;
-    const newSigma = sigma - (bsPrice - midPrice) / vega;
-    if (!isFinite(newSigma)) { sigma = 0.25; break; }
-    sigma = newSigma;
-    if (sigma <= 0.01) { sigma = 0.25; break; }
-    if (sigma > 5) { sigma = 0.25; break; }
-  }
-  return Math.max(0.01, Math.min(sigma, 5));
-}
-
-function _bsPrice(S, K, r, sigma, T, isCall) {
-  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
-  const d2 = d1 - sigma * Math.sqrt(T);
-  const Nd1 = _normalCDF(d1);
-  const Nd2 = _normalCDF(d2);
-  if (isCall) return S * Nd1 - K * Math.exp(-r * T) * Nd2;
-  return K * Math.exp(-r * T) * (1 - Nd2) - S * (1 - Nd1);
-}
-
-function _bsVega(S, K, r, sigma, T) {
-  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
-  return S * _normalPDF(d1) * Math.sqrt(T);
-}
-
-function _normalCDF(x) {
-  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
-  const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
-  const sign = x < 0 ? -1 : 1;
-  const t = 1 / (1 + p * Math.abs(x));
-  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x / 2);
-  return 0.5 * (1 + sign * y);
-}
+const { bsGamma: _bsGamma, estimateIV: _estimateIV } = require('../lib/black-scholes');
 
 // ── Canvas setup (mirrors gamma.js pattern) ──────────────────────────────
 
@@ -168,11 +115,12 @@ class GammaHeatmapService {
     // If a source has expirations but produces no usable chain data (e.g. OI=0), fall back to next
     const sourcesToTry = [];
     if (databentoLive && databentoLive.hasDataFor(upper)) sourcesToTry.push('DatabentoLive');
-    // Databento Historical REST API skipped — too slow for interactive use
-    // (3 HTTP reqs × 6 expirations × 30-45s each = 3-5 min total)
     if (tradier.enabled) sourcesToTry.push('Tradier');
     if (publicService.enabled) sourcesToTry.push('Public.com');
     sourcesToTry.push('Yahoo');
+    if (sourcesToTry.length === 1) {
+      console.warn('[GammaHeatmap] No premium sources configured — using Yahoo only. Set TRADIER_API_KEY for real greeks (free sandbox).');
+    }
 
     let source = null;
     let expirationData = [];
@@ -187,9 +135,6 @@ class GammaHeatmapService {
       try {
         if (trySource === 'DatabentoLive') {
           const dates = databentoLive.getExpirations(upper);
-          if (dates.length > 0) allExpDates = dates;
-        } else if (trySource === 'Databento') {
-          const dates = await databento.getOptionExpirations(upper);
           if (dates.length > 0) allExpDates = dates;
         } else if (trySource === 'Tradier') {
           const dates = await tradier.getOptionExpirations(upper);
@@ -270,8 +215,6 @@ class GammaHeatmapService {
             let contracts;
             if (trySource === 'DatabentoLive') {
               contracts = databentoLive.getOptionsChain(upper, expDate);
-            } else if (trySource === 'Databento') {
-              contracts = await databento.getOptionsWithGreeks(upper, expDate);
             } else if (trySource === 'Tradier') {
               contracts = await tradier.getOptionsWithGreeks(upper, expDate);
             } else {
@@ -588,7 +531,6 @@ class GammaHeatmapService {
    */
   formatForDiscord(ticker, spotPrice, expirations, source) {
     const sourceLabel = source === 'DatabentoLive' ? 'Databento Live OPRA (real-time)'
-      : source === 'Databento' ? 'Databento OPRA + ORATS greeks'
       : source === 'Tradier' ? 'Tradier (ORATS real greeks)'
       : source === 'Public.com' ? 'Public.com (real greeks)'
       : 'Yahoo Finance (Black-Scholes est.)';

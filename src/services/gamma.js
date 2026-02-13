@@ -64,7 +64,7 @@ function getDatabentoLive() {
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
-const RISK_FREE_RATE = 0.045; // approximate 10Y yield
+const bs = require('../lib/black-scholes');
 
 const FONT_FAMILY = 'Inter';
 
@@ -374,74 +374,10 @@ class GammaService {
     }
   }
 
-  // ── Black-Scholes gamma ──────────────────────────────────────────────
+  // ── Black-Scholes gamma (delegates to shared lib/black-scholes.js) ──
 
-  _normalPDF(x) {
-    return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
-  }
-
-  _d1(S, K, r, sigma, T) {
-    return (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
-  }
-
-  /**
-   * Black-Scholes gamma for a single option.
-   * @param {number} S - spot price
-   * @param {number} K - strike price
-   * @param {number} sigma - implied volatility (decimal, e.g. 0.30 = 30%)
-   * @param {number} T - time to expiry in years
-   * @returns {number} gamma value
-   */
-  _bsGamma(S, K, sigma, T) {
-    if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
-    const d1 = this._d1(S, K, RISK_FREE_RATE, sigma, T);
-    return this._normalPDF(d1) / (S * sigma * Math.sqrt(T));
-  }
-
-  /** Abramowitz-Stegun CDF approximation */
-  _normalCDF(x) {
-    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
-    const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
-    const sign = x < 0 ? -1 : 1;
-    const t = 1 / (1 + p * Math.abs(x));
-    const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x / 2);
-    return 0.5 * (1 + sign * y);
-  }
-
-  /** Black-Scholes option price */
-  _bsPrice(S, K, r, sigma, T, isCall) {
-    const d1v = this._d1(S, K, r, sigma, T);
-    const d2 = d1v - sigma * Math.sqrt(T);
-    const Nd1 = this._normalCDF(d1v);
-    const Nd2 = this._normalCDF(d2);
-    if (isCall) return S * Nd1 - K * Math.exp(-r * T) * Nd2;
-    return K * Math.exp(-r * T) * (1 - Nd2) - S * (1 - Nd1);
-  }
-
-  /** Black-Scholes vega */
-  _bsVega(S, K, r, sigma, T) {
-    const d1v = this._d1(S, K, r, sigma, T);
-    return S * this._normalPDF(d1v) * Math.sqrt(T);
-  }
-
-  /**
-   * Estimate IV from option mid-price using Brenner-Subrahmanyam + Newton-Raphson.
-   * Falls back to 25% default if estimation fails.
-   */
-  _estimateIV(midPrice, spotPrice, strike, T, isCall) {
-    if (midPrice <= 0 || T <= 0) return 0.25;
-    let sigma = Math.sqrt(2 * Math.PI / T) * midPrice / spotPrice;
-    if (sigma <= 0.01 || sigma > 5) sigma = 0.25;
-    for (let i = 0; i < 3; i++) {
-      const bsP = this._bsPrice(spotPrice, strike, RISK_FREE_RATE, sigma, T, isCall);
-      const vega = this._bsVega(spotPrice, strike, RISK_FREE_RATE, sigma, T);
-      if (vega < 1e-10) break;
-      sigma -= (bsP - midPrice) / vega;
-      if (sigma <= 0.01) { sigma = 0.25; break; }
-      if (sigma > 5) { sigma = 0.25; break; }
-    }
-    return Math.max(0.01, Math.min(sigma, 5));
-  }
+  _bsGamma(S, K, sigma, T) { return bs.bsGamma(S, K, sigma, T); }
+  _estimateIV(midPrice, spotPrice, strike, T, isCall) { return bs.estimateIV(midPrice, spotPrice, strike, T, isCall); }
 
   // ── GEX calculation ──────────────────────────────────────────────────
 
@@ -1206,37 +1142,45 @@ class GammaService {
 
         if (options.length > 0 && alpacaSpot) {
           const spotPrice = alpacaSpot;
-          // Use the actual expiration from returned data (may differ slightly)
           const expiration = this._pickAlpacaExpiration(options, expirationPref) || targetExp;
 
-          // If all gammas are 0 (indicative feed with no greeks), estimate via BS
-          const hasGreeks = options.some(o => o.gamma > 0 && o.expiration === expiration);
-          if (!hasGreeks) {
-            console.log(`[Gamma] Alpaca ${upper}: no greeks (indicative feed), estimating gamma via BS...`);
-            const T = Math.max((new Date(expiration).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
-            for (const o of options) {
-              if (o.expiration !== expiration) continue;
-              if (!o.gamma || o.gamma === 0) {
-                const mid = o.lastPrice || (o.bid > 0 && o.ask > 0 ? (o.bid + o.ask) / 2 : 0);
-                if (mid > 0) {
-                  const iv = this._estimateIV(mid, spotPrice, o.strike, T, o.type === 'call');
-                  o.gamma = this._bsGamma(spotPrice, o.strike, iv, T);
-                  o.impliedVolatility = iv;
+          // Check if open interest is available — indicative feed returns OI=0 for all contracts,
+          // making GEX calculation impossible (GEX = OI × gamma × 100 × spot)
+          const hasOI = options.some(o => o.openInterest > 0 && o.expiration === expiration);
+          if (!hasOI) {
+            console.log(`[Gamma] Alpaca ${upper}: no open interest data (indicative feed) — cannot compute GEX, falling back`);
+          } else {
+            // If all gammas are 0 (indicative feed with no greeks), estimate via BS
+            const hasGreeks = options.some(o => o.gamma > 0 && o.expiration === expiration);
+            if (!hasGreeks) {
+              console.log(`[Gamma] Alpaca ${upper}: no greeks (indicative feed), estimating gamma via BS...`);
+              const T = Math.max((new Date(expiration).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+              for (const o of options) {
+                if (o.expiration !== expiration) continue;
+                if (!o.gamma || o.gamma === 0) {
+                  const mid = o.lastPrice || (o.bid > 0 && o.ask > 0 ? (o.bid + o.ask) / 2 : 0);
+                  if (mid > 0) {
+                    const iv = this._estimateIV(mid, spotPrice, o.strike, T, o.type === 'call');
+                    o.gamma = this._bsGamma(spotPrice, o.strike, iv, T);
+                    o.impliedVolatility = iv;
+                  }
                 }
               }
             }
-          }
 
-          const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
-          if (gexData.strikes.length > 0) {
-            const flip = this.findGammaFlip(gexData, spotPrice);
-            const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
+            const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
+            if (gexData.strikes.length > 0) {
+              const flip = this.findGammaFlip(gexData, spotPrice);
+              const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
 
-            console.log(`[Gamma] ${upper}: Alpaca OK — ${options.length} contracts, exp ${expiration}`);
-            return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Alpaca' };
+              console.log(`[Gamma] ${upper}: Alpaca OK — ${options.length} contracts, exp ${expiration}`);
+              return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Alpaca' };
+            }
+            console.log(`[Gamma] Alpaca returned insufficient data for ${upper}, falling back to Yahoo`);
           }
+        } else {
+          console.log(`[Gamma] Alpaca returned no contracts for ${upper}, falling back to Yahoo`);
         }
-        console.log(`[Gamma] Alpaca returned insufficient data for ${upper}, falling back to Yahoo`);
       } catch (err) {
         console.warn(`[Gamma] Alpaca failed for ${upper}: ${err.message}, falling back to Yahoo`);
       }
