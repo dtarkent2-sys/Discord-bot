@@ -6,7 +6,7 @@
  *
  * Strategy types:
  *   - SCALP: Quick in/out, +20-30% target, tight stops, 5-30 min hold
- *   - SWING: Larger move, +50-75% target, wider stops, hold hours
+ *   (0DTE only — no swing trades on options)
  *
  * Decision pipeline:
  *   1. Market regime check (macro + GEX)
@@ -879,9 +879,8 @@ class OptionsEngine {
     const rawConviction = Math.min(dominantPoints * clarity * 2.5, 10);
     const conviction = Math.round(rawConviction);
 
-    // Strategy: scalp if low ATR / mean-reversion setup, swing if trending
-    const atrPct = tech.atr ? tech.atr / tech.price : 0;
-    const strategy = (gexRegime.label === 'Short Gamma' || atrPct > 0.005) ? 'swing' : 'scalp';
+    // Strategy: always scalp for 0DTE (no swing trades on options)
+    const strategy = 'scalp';
 
     return { direction, conviction, strategy, reasons, bullPoints, bearPoints };
   }
@@ -947,7 +946,7 @@ class OptionsEngine {
       `10. YOU WANT TO TRADE. The system already filtered weak setups before asking you. If you're being asked, there's likely something here. Find the trade.`,
       ``,
       `Respond with ONLY valid JSON:`,
-      `{"action": "BUY_CALL" | "BUY_PUT" | "SKIP", "conviction": 1-10, "strategy": "scalp" | "swing", "target": "$X.XX", "stopLevel": "$X.XX", "reason": "1-2 sentences"}`,
+      `{"action": "BUY_CALL" | "BUY_PUT" | "SKIP", "conviction": 1-10, "strategy": "scalp", "target": "$X.XX", "stopLevel": "$X.XX", "reason": "1-2 sentences"}`,
     ].filter(Boolean).join('\n');
 
     try {
@@ -1445,7 +1444,7 @@ class OptionsEngine {
    * @param {string} underlying - SPY, QQQ, etc.
    * @param {object} [opts]
    * @param {string} [opts.direction] - 'call' or 'put' (override AI)
-   * @param {string} [opts.strategy] - 'scalp' or 'swing'
+   * @param {string} [opts.strategy] - always 'scalp' for 0DTE (swing not used)
    * @returns {{ success: boolean, message: string, details?: object }}
    */
   async manualTrade(underlying, { direction, strategy } = {}) {
@@ -1606,8 +1605,6 @@ class OptionsEngine {
         maxPremium: cfg.options_max_premium_per_trade,
         scalpTP: `${(cfg.options_scalp_take_profit_pct * 100).toFixed(0)}%`,
         scalpSL: `${(cfg.options_scalp_stop_loss_pct * 100).toFixed(0)}%`,
-        swingTP: `${(cfg.options_swing_take_profit_pct * 100).toFixed(0)}%`,
-        swingSL: `${(cfg.options_swing_stop_loss_pct * 100).toFixed(0)}%`,
         minConviction: cfg.options_min_conviction,
         underlyings: cfg.options_underlyings,
       },
@@ -1675,7 +1672,6 @@ class OptionsEngine {
     lines.push(`Daily Loss: \`$${status.dailyLoss.toFixed(0)}/$${status.maxDailyLoss}\``);
     lines.push(`Max Premium/Trade: \`$${status.config.maxPremium}\``);
     lines.push(`Scalp: TP \`${status.config.scalpTP}\` / SL \`${status.config.scalpSL}\``);
-    lines.push(`Swing: TP \`${status.config.swingTP}\` / SL \`${status.config.swingSL}\``);
     lines.push(`Min Conviction: \`${status.config.minConviction}/10\``);
     lines.push(`Underlyings: \`${status.config.underlyings.join(', ')}\``);
 

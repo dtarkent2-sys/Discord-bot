@@ -50,8 +50,6 @@ const ACTION_COOLDOWNS = {
 const TUNING_BOUNDS = {
   options_scalp_take_profit_pct:  { min: 0.15, max: 0.60 },
   options_scalp_stop_loss_pct:    { min: 0.10, max: 0.40 },
-  options_swing_take_profit_pct:  { min: 0.40, max: 1.50 },
-  options_swing_stop_loss_pct:    { min: 0.20, max: 0.60 },
   options_min_conviction:         { min: 4, max: 8 },
   options_max_premium_per_trade:  { min: 200, max: 2000 },
   options_cooldown_minutes:       { min: 2, max: 15 },
@@ -351,9 +349,8 @@ class InitiativeEngine {
     const avgWinPct = wins.length > 0 ? wins.reduce((s, t) => s + t.pnlPct, 0) / wins.length : 0;
     const avgLossPct = losses.length > 0 ? Math.abs(losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length) : 0;
 
-    // Separate by strategy
-    const scalps = recent.filter(t => t.strategy === 'scalp');
-    const swings = recent.filter(t => t.strategy === 'swing');
+    // All options trades are scalps (0DTE only, no swing)
+    const scalps = recent.filter(t => t.strategy === 'scalp' || !t.strategy);
 
     // ── Scalp Take Profit Adjustment ──
     if (scalps.length >= 3) {
@@ -375,26 +372,6 @@ class InitiativeEngine {
         const newSL = Math.max(cfg.options_scalp_stop_loss_pct - 0.05, TUNING_BOUNDS.options_scalp_stop_loss_pct.min);
         if (newSL !== cfg.options_scalp_stop_loss_pct) {
           changes.push({ key: 'options_scalp_stop_loss_pct', from: cfg.options_scalp_stop_loss_pct, to: newSL, reason: `Low scalp win rate (${(scalpWinRate * 100).toFixed(0)}%) — tightening SL to limit losses` });
-        }
-      }
-    }
-
-    // ── Swing TP/SL Adjustment ──
-    if (swings.length >= 3) {
-      const swingWins = swings.filter(t => t.pnl > 0);
-      const swingWinRate = swingWins.length / swings.length;
-
-      if (swingWinRate > 0.65) {
-        const newTP = Math.min(cfg.options_swing_take_profit_pct + 0.10, TUNING_BOUNDS.options_swing_take_profit_pct.max);
-        if (newTP !== cfg.options_swing_take_profit_pct) {
-          changes.push({ key: 'options_swing_take_profit_pct', from: cfg.options_swing_take_profit_pct, to: newTP, reason: `Swing win rate ${(swingWinRate * 100).toFixed(0)}% — expanding target` });
-        }
-      }
-
-      if (swingWinRate < 0.35) {
-        const newSL = Math.max(cfg.options_swing_stop_loss_pct - 0.05, TUNING_BOUNDS.options_swing_stop_loss_pct.min);
-        if (newSL !== cfg.options_swing_stop_loss_pct) {
-          changes.push({ key: 'options_swing_stop_loss_pct', from: cfg.options_swing_stop_loss_pct, to: newSL, reason: `Low swing win rate (${(swingWinRate * 100).toFixed(0)}%) — tighter stops` });
         }
       }
     }

@@ -71,8 +71,6 @@ const DEFAULT_CONFIG = {
   options_max_positions: 3,             // max concurrent options positions
   options_scalp_take_profit_pct: 0.20,  // 20% profit target for scalps (quick in/out)
   options_scalp_stop_loss_pct: 0.10,    // 10% stop loss for scalps ("tight stops, 5-10% max on the premium")
-  options_swing_take_profit_pct: 0.50,  // 50% profit target for swings
-  options_swing_stop_loss_pct: 0.25,    // 25% stop loss for swings
   options_min_conviction: 5,            // min AI conviction (1-10) to enter a trade
   options_close_before_minutes: 30,     // close 0DTE positions X min before market close
   options_min_delta: 0.15,              // min option delta for contract selection (widened for 0DTE)
@@ -92,7 +90,6 @@ const NUMERIC_KEYS = new Set([
   // Options-specific
   'options_max_premium_per_trade', 'options_max_daily_loss', 'options_max_positions',
   'options_scalp_take_profit_pct', 'options_scalp_stop_loss_pct',
-  'options_swing_take_profit_pct', 'options_swing_stop_loss_pct',
   'options_min_conviction', 'options_close_before_minutes',
   'options_min_delta', 'options_max_delta', 'options_max_spread_pct',
   'options_cooldown_minutes', 'options_min_open_interest',
@@ -288,14 +285,9 @@ class PolicyEngine {
         this.config.options_scalp_take_profit_pct = DEFAULT_CONFIG.options_scalp_take_profit_pct;
         console.log(`[Policy] Migrated options_scalp_take_profit_pct: 0.30 → ${DEFAULT_CONFIG.options_scalp_take_profit_pct}`);
       }
-      if (this.config.options_swing_stop_loss_pct === 0.40) {
-        this.config.options_swing_stop_loss_pct = DEFAULT_CONFIG.options_swing_stop_loss_pct;
-        console.log(`[Policy] Migrated options_swing_stop_loss_pct: 0.40 → ${DEFAULT_CONFIG.options_swing_stop_loss_pct}`);
-      }
-      if (this.config.options_swing_take_profit_pct === 0.75) {
-        this.config.options_swing_take_profit_pct = DEFAULT_CONFIG.options_swing_take_profit_pct;
-        console.log(`[Policy] Migrated options_swing_take_profit_pct: 0.75 → ${DEFAULT_CONFIG.options_swing_take_profit_pct}`);
-      }
+      // Swing config keys removed — 0DTE is scalp-only
+      delete this.config.options_swing_stop_loss_pct;
+      delete this.config.options_swing_take_profit_pct;
     }
 
     this._persist();
@@ -572,9 +564,10 @@ class PolicyEngine {
   /**
    * Check options positions for exit signals.
    * Options use % of premium for stop/take-profit, plus time-based exits.
+   * All options trades are 0DTE scalps — no swing trades.
    *
    * @param {Array} positions - Alpaca options positions
-   * @param {string} strategy - 'scalp' or 'swing'
+   * @param {string} strategy - always 'scalp' for 0DTE
    * @param {number} minutesToClose - minutes until market close
    * @returns {Array<{symbol, reason, pnlPct, message}>}
    */
@@ -582,8 +575,9 @@ class PolicyEngine {
     const exits = [];
     const cfg = this.config;
 
-    const stopPct = strategy === 'scalp' ? cfg.options_scalp_stop_loss_pct : cfg.options_swing_stop_loss_pct;
-    const tpPct = strategy === 'scalp' ? cfg.options_scalp_take_profit_pct : cfg.options_swing_take_profit_pct;
+    // 0DTE = scalp only, always use scalp thresholds
+    const stopPct = cfg.options_scalp_stop_loss_pct;
+    const tpPct = cfg.options_scalp_take_profit_pct;
 
     for (const pos of positions) {
       const pnlPct = Number(pos.unrealized_plpc || 0);
