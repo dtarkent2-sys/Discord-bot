@@ -91,13 +91,20 @@ def _download_folder(folder_id, output_dir):
     log(f"Downloading folder: {url}")
     log(f"Target directory: {output_dir}")
 
-    # gdown.download_folder downloads all files in the folder
-    gdown.download_folder(
-        url=url,
-        output=output_dir,
-        quiet=False,
-        use_cookies=False,
-    )
+    # gdown prints progress to stdout — redirect to stderr so it doesn't
+    # contaminate the JSON output that Node.js parses from stdout.
+    import contextlib
+    old_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        gdown.download_folder(
+            url=url,
+            output=output_dir,
+            quiet=False,
+            use_cookies=False,
+        )
+    finally:
+        sys.stdout = old_stdout
 
 
 def load_prices(data_dir=None, ticker=None):
