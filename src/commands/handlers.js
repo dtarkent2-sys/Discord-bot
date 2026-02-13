@@ -28,7 +28,7 @@ const gammaSqueeze = require('../services/gamma-squeeze');
 const gammaHeatmap = require('../services/gamma-heatmap');
 const yoloMode = require('../services/yolo-mode');
 const channelHistory = require('../services/channel-history');
-const { AttachmentBuilder, MessageFlags, PermissionsBitField, ChannelType } = require('discord.js');
+const { AttachmentBuilder, MessageFlags, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
 const { instrumentInteraction } = require('../utils/safe-send');
@@ -903,14 +903,34 @@ async function handleGEXHeatmap(interaction) {
     const result = await gammaHeatmap.generate(ticker, { strikeRange });
     const summary = gammaHeatmap.formatForDiscord(ticker, result.spotPrice, result.expirations);
 
-    // Dashboard link for interactive view
-    const dashLine = `\n🖥️ **Interactive Dashboard** → \`/gex\` route on the bot's web server (port ${require('../config').port}) — real-time updates, toggle expirations, hover for details`;
-
     const attachment = new AttachmentBuilder(result.buffer, { name: `${ticker}-gamma-heatmap.png` });
-    await interaction.editReply({
-      content: summary + dashLine,
-      files: [attachment],
-    });
+
+    // Build interactive dashboard URL
+    const cfg = require('../config');
+    const baseUrl = cfg.dashboardUrl;
+    const replyPayload = { content: summary, files: [attachment] };
+
+    if (baseUrl) {
+      const dashUrl = `${baseUrl}/gex`;
+      replyPayload.content += `\n🖥️ **[Open Interactive Dashboard](${dashUrl})** — real-time updates, toggle expirations, hover details`;
+
+      // Add button row for opening dashboard
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setLabel('Open Live Dashboard')
+          .setStyle(ButtonStyle.Link)
+          .setURL(dashUrl)
+          .setEmoji('🖥️'),
+        new ButtonBuilder()
+          .setCustomId(`gex_refresh_${ticker}`)
+          .setLabel('Refresh')
+          .setStyle(ButtonStyle.Secondary)
+          .setEmoji('🔄'),
+      );
+      replyPayload.components = [row];
+    }
+
+    await interaction.editReply(replyPayload);
   } catch (err) {
     console.error(`[GEX Heatmap] Error for ${ticker}:`, err);
     await interaction.editReply(`**${ticker} — Gamma Heat Map**\n❌ ${err.message || 'Unknown error'}`);
@@ -2036,4 +2056,50 @@ async function handleIngest(interaction) {
   }
 }
 
-module.exports = { handleCommand };
+// ── Button Interaction Handler ─────────────────────────────────────────
+async function handleButtonInteraction(interaction) {
+  const id = interaction.customId;
+
+  // GEX heatmap refresh: gex_refresh_<TICKER>
+  if (id.startsWith('gex_refresh_')) {
+    const ticker = id.replace('gex_refresh_', '').toUpperCase();
+    await interaction.deferUpdate();
+
+    try {
+      const result = await gammaHeatmap.generate(ticker, { strikeRange: 20 });
+      const summary = gammaHeatmap.formatForDiscord(ticker, result.spotPrice, result.expirations);
+
+      const attachment = new AttachmentBuilder(result.buffer, { name: `${ticker}-gamma-heatmap.png` });
+
+      const cfg = require('../config');
+      const baseUrl = cfg.dashboardUrl;
+      const replyPayload = { content: summary, files: [attachment] };
+
+      if (baseUrl) {
+        const dashUrl = `${baseUrl}/gex`;
+        replyPayload.content += `\n🖥️ **[Open Interactive Dashboard](${dashUrl})** — real-time updates, toggle expirations, hover details`;
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setLabel('Open Live Dashboard')
+            .setStyle(ButtonStyle.Link)
+            .setURL(dashUrl)
+            .setEmoji('🖥️'),
+          new ButtonBuilder()
+            .setCustomId(`gex_refresh_${ticker}`)
+            .setLabel('Refresh')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('🔄'),
+        );
+        replyPayload.components = [row];
+      }
+
+      await interaction.editReply(replyPayload);
+    } catch (err) {
+      console.error(`[GEX Heatmap Refresh] Error for ${ticker}:`, err);
+    }
+    return;
+  }
+}
+
+module.exports = { handleCommand, handleButtonInteraction };
