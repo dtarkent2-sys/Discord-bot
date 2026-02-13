@@ -901,7 +901,7 @@ async function handleGEXHeatmap(interaction) {
     await interaction.editReply(`**${ticker} — Gamma Heat Map**\n⏳ Fetching options chains across expirations...`);
 
     const result = await gammaHeatmap.generate(ticker, { strikeRange });
-    const summary = gammaHeatmap.formatForDiscord(ticker, result.spotPrice, result.expirations);
+    const summary = gammaHeatmap.formatForDiscord(ticker, result.spotPrice, result.expirations, result.source);
 
     const attachment = new AttachmentBuilder(result.buffer, { name: `${ticker}-gamma-heatmap.png` });
 
@@ -2067,7 +2067,7 @@ async function handleButtonInteraction(interaction) {
 
     try {
       const result = await gammaHeatmap.generate(ticker, { strikeRange: 20 });
-      const summary = gammaHeatmap.formatForDiscord(ticker, result.spotPrice, result.expirations);
+      const summary = gammaHeatmap.formatForDiscord(ticker, result.spotPrice, result.expirations, result.source);
 
       const attachment = new AttachmentBuilder(result.buffer, { name: `${ticker}-gamma-heatmap.png` });
 

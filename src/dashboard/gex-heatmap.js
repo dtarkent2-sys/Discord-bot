@@ -13,6 +13,7 @@
 
 const gamma = require('../services/gamma');
 const alpaca = require('../services/alpaca');
+const tradier = require('../services/tradier');
 const publicService = require('../services/public');
 const priceFetcher = require('../tools/price-fetcher');
 
@@ -105,23 +106,44 @@ function registerGEXHeatmapRoutes(app) {
 // ── Data fetching ─────────────────────────────────────────────────────
 
 async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
-  // ── Primary: Public.com (real greeks) / Fallback: Yahoo (Black-Scholes) ──
-  const usePublic = publicService.enabled;
+  // ── Data source priority: Tradier (ORATS) > Public.com > Yahoo (Black-Scholes) ──
   let source = 'Yahoo';
 
-  // 1. Get available expirations
-  let allExpDates;
-  if (usePublic) {
+  // 1. Get available expirations — try sources in order
+  let allExpDates = null;
+  let yahooExps = null;
+
+  // Try Tradier first (ORATS real greeks, clean API)
+  if (!allExpDates && tradier.enabled) {
     try {
-      allExpDates = await publicService.getOptionExpirations(ticker);
-      source = 'Public.com';
+      allExpDates = await tradier.getOptionExpirations(ticker);
+      if (allExpDates.length > 0) {
+        source = 'Tradier';
+      } else {
+        allExpDates = null;
+      }
     } catch (err) {
-      console.warn(`[GEXHeatmap] Public.com expirations failed, falling back to Yahoo: ${err.message}`);
+      console.warn(`[GEXHeatmap] Tradier expirations failed: ${err.message}`);
       allExpDates = null;
     }
   }
-  // Yahoo fallback
-  let yahooExps = null;
+
+  // Try Public.com next (real broker greeks)
+  if (!allExpDates && publicService.enabled) {
+    try {
+      allExpDates = await publicService.getOptionExpirations(ticker);
+      if (allExpDates && allExpDates.length > 0) {
+        source = 'Public.com';
+      } else {
+        allExpDates = null;
+      }
+    } catch (err) {
+      console.warn(`[GEXHeatmap] Public.com expirations failed: ${err.message}`);
+      allExpDates = null;
+    }
+  }
+
+  // Yahoo fallback (always available, no auth)
   if (!allExpDates) {
     yahooExps = await gamma.fetchAvailableExpirations(ticker);
     if (yahooExps.length === 0) throw new Error(`No expirations for ${ticker}`);
@@ -141,11 +163,16 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
   }
   if (targetExpDates.length === 0) throw new Error('No valid expirations found');
 
-  // 2. Get spot price
+  // 2. Get spot price — try sources in order
   let spotPrice = null;
-  if (usePublic && source === 'Public.com') {
+  if (source === 'Tradier') {
     try {
-      // Public.com spot via quotes endpoint
+      const q = await tradier.getQuote(ticker);
+      spotPrice = q.price;
+    } catch { /* fallback */ }
+  }
+  if (!spotPrice && publicService.enabled) {
+    try {
       const accountId = require('../config').publicAccountId;
       const quoteData = await publicService._post(
         `/userapigateway/marketdata/${accountId}/quotes`,
@@ -176,10 +203,15 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
       let strikeGEXMap;
       let totalGEX;
 
-      if (source === 'Public.com') {
-        // ── Public.com: real greeks (gamma from broker, not Black-Scholes) ──
-        const contracts = await publicService.getOptionsWithGreeks(ticker, expDate);
-        if (contracts.length === 0) continue;
+      if (source === 'Tradier' || source === 'Public.com') {
+        // ── Real greeks path: Tradier (ORATS) or Public.com ──
+        let contracts;
+        if (source === 'Tradier') {
+          contracts = await tradier.getOptionsWithGreeks(ticker, expDate);
+        } else {
+          contracts = await publicService.getOptionsWithGreeks(ticker, expDate);
+        }
+        if (!contracts || contracts.length === 0) continue;
 
         // Compute GEX per strike using real gamma
         // GEX = OI × Gamma × 100 × Spot (calls positive, puts negative for dealer)
@@ -187,7 +219,6 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
         for (const c of contracts) {
           if (!c.strike || !c.openInterest || !c.gamma) continue;
           const gex = c.openInterest * c.gamma * 100 * spotPrice;
-          const sign = c.type === 'call' ? 1 : -1;
 
           const entry = strikeMap.get(c.strike) || { net: 0, call: 0, put: 0, callOI: 0, putOI: 0 };
           if (c.type === 'call') {
@@ -975,7 +1006,7 @@ function updateFooter() {
   const src = state.data.source || 'Yahoo';
   document.getElementById('footerLeft').textContent =
     'GEX = OI \\u00d7 Gamma \\u00d7 100 \\u00d7 Spot | Data: ' + src
-    + (src === 'Public.com' ? ' (real greeks)' : ' (Black-Scholes est.)');
+    + (src === 'Tradier' ? ' (ORATS real greeks)' : src === 'Public.com' ? ' (real greeks)' : ' (Black-Scholes est.)');
   document.getElementById('footerRight').textContent =
     'Updated: ' + new Date(state.data.timestamp).toLocaleTimeString() + ' | '
     + state.data.expirations.length + ' expirations | '
