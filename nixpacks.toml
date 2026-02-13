@@ -14,7 +14,7 @@ aptPkgs = [
   "librsvg2-dev",
   "libpixman-1-0",
   "fonts-dejavu-core",
-  # Python 3 + pip for ML predictor (databento, scikit-learn, matplotlib)
+  # Python 3 + pip for ML predictor (scikit-learn, matplotlib)
   "python3",
   "python3-pip",
   "python3-venv",

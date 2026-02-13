@@ -1,33 +1,44 @@
 #!/usr/bin/env python3
 """
-ML Trading Predictor — Multi-Day Walk-Forward Backtesting Pipeline
+ML Trading Predictor — Stock Backtest on Local Parquet Data
 
-Uses the official Databento Python client to fetch 10-level market depth
-(MBP-10) data for CME Globex futures across a DATE RANGE, then runs a
-walk-forward (chronological, no-leakage) backtest with scikit-learn models.
+Uses 30 years of EOD pricing + financial fundamentals stored as parquet files
+(auto-downloaded from Google Drive on first use). Trains scikit-learn models
+with walk-forward chronological split to predict forward returns.
 
-Based on: https://databento.com/blog/hft-sklearn-python
-Docs:     https://databento.com/docs/api-reference-historical/client
-Schema:   https://databento.com/docs/schemas-and-data-formats/mbp-10
+Data sources (parquet):
+  - all_prices_yahoo.parquet   — EOD prices (OHLCV) for all tickers
+  - all_balance_sheets.parquet — Balance sheet items
+  - all_income_statements.parquet — Income statement items
+  - all_cash_flow.parquet      — Cash flow items
 
-Features (from MBP-10 order book):
-  - Skew: log(bid_sz_00) - log(ask_sz_00)
-  - Imbalance: log(sum(bid_ct)) - log(sum(ask_ct))
-  - Depth pressure: weighted bid/ask size ratio across 10 levels
-  - Spread: ask_px_00 - bid_px_00
-  - Micro price deviation: size-weighted mid vs simple mid
+Technical features (from EOD prices):
+  - Momentum: 5d, 20d, 60d, 252d returns
+  - Volatility: 20d, 60d rolling std of returns
+  - Volume: 20d relative volume ratio
+  - RSI (14-day)
+  - Bollinger Band %B (20d)
+  - Distance from 52-week high / low
+  - SMA crossovers: 20/50, 50/200
+
+Fundamental features (from financials, if available):
+  - Revenue growth (YoY)
+  - Net margin, gross margin
+  - ROE, ROA
+  - Debt-to-equity
+  - Current ratio
+  - Free cash flow yield
 
 Models:
   - Linear Regression (baseline)
   - HistGradientBoostingRegressor (non-linear)
 
-Split: Walk-forward chronological (first 70% train, last 30% test).
-       No leakage — features at time t never use future data.
+Split: Walk-forward chronological (70% train / 30% test). No leakage.
 
 Usage:
-  python predictor.py --product ES --days 60
-  python predictor.py --product NQ --start-date 2026-01-01 --end-date 2026-02-12
-  python predictor.py --product ES --date 2026-02-12  # single-day (deprecated)
+  python predictor.py --ticker AAPL --days 1260        # 5 years
+  python predictor.py --ticker MSFT --forward 20       # predict 20-day return
+  python predictor.py --ticker SPY --start-date 2020-01-01 --end-date 2025-12-31
 """
 
 import sys
@@ -40,7 +51,6 @@ from datetime import datetime, timedelta
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Heavy imports deferred for fast CLI startup
 np = None
 pd = None
 
@@ -53,185 +63,195 @@ def _ensure_imports():
             np = _np
             pd = _pd
         except ImportError as e:
-            print(json.dumps({"error": f"Missing Python dependency: {e}. Run: pip install -r ml/requirements.txt"}))
+            print(json.dumps({"error": f"Missing dependency: {e}. Run: pip install -r ml/requirements.txt"}))
             sys.exit(1)
 
-# ── Constants ────────────────────────────────────────────────────────────
-
-PRODUCTS = {
-    "ES":  {"dataset": "GLBX.MDP3", "name": "E-mini S&P 500"},
-    "NQ":  {"dataset": "GLBX.MDP3", "name": "E-mini Nasdaq-100"},
-    "YM":  {"dataset": "GLBX.MDP3", "name": "E-mini Dow"},
-    "RTY": {"dataset": "GLBX.MDP3", "name": "E-mini Russell 2000"},
-    "CL":  {"dataset": "GLBX.MDP3", "name": "Crude Oil"},
-    "GC":  {"dataset": "GLBX.MDP3", "name": "Gold"},
-    "SI":  {"dataset": "GLBX.MDP3", "name": "Silver"},
-    "ZB":  {"dataset": "GLBX.MDP3", "name": "30-Year Treasury Bond"},
-    "ZN":  {"dataset": "GLBX.MDP3", "name": "10-Year Treasury Note"},
-    "ZF":  {"dataset": "GLBX.MDP3", "name": "5-Year Treasury Note"},
-    "HG":  {"dataset": "GLBX.MDP3", "name": "Copper"},
-    "NG":  {"dataset": "GLBX.MDP3", "name": "Natural Gas"},
-}
-
-DEFAULT_MARKOUT = 300
-DEFAULT_DAYS = 60
+DEFAULT_FORWARD = 20        # predict 20-day forward return
+DEFAULT_DAYS = 1260         # ~5 years of trading days
 DEFAULT_TRAIN_SPLIT = 0.70
-MAX_DAYS_DEFAULT = 180
-
-RTH_START_UTC = "T14:30"  # 9:30 AM ET
-RTH_END_UTC = "T21:00"    # 4:00 PM ET
-
+MAX_DAYS_DEFAULT = 10000    # ~40 years — allow full history
 
 def log(msg):
     print(f"[ML-Predictor] {msg}", file=sys.stderr, flush=True)
 
 
-def last_trading_day():
-    d = datetime.utcnow() - timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d.strftime("%Y-%m-%d")
+# ── Feature Engineering ──────────────────────────────────────────────────
 
-
-def generate_session_ranges(start_date, end_date):
-    """Generate (session_start, session_end, date_label) for each weekday in range."""
+def build_technical_features(df, forward_days=20):
+    """
+    Build technical features from EOD price data.
+    Expects columns: date, open, high, low, close, volume (lowercase).
+    Returns DataFrame with features + forward return target.
+    """
     _ensure_imports()
-    sd = datetime.strptime(start_date, "%Y-%m-%d")
-    ed = datetime.strptime(end_date, "%Y-%m-%d")
-    sessions = []
-    d = sd
-    while d <= ed:
-        if d.weekday() < 5:  # Mon-Fri
-            ds = d.strftime("%Y-%m-%d")
-            sessions.append((f"{ds}{RTH_START_UTC}", f"{ds}{RTH_END_UTC}", ds))
-        d += timedelta(days=1)
-    return sessions
 
+    df = df.copy()
 
-# ── Data Fetching ────────────────────────────────────────────────────────
+    # Ensure we have the basics
+    close_col = _find_col(df, ["adj close", "adjclose", "adj_close", "close"])
+    vol_col = _find_col(df, ["volume", "vol"])
+    high_col = _find_col(df, ["high"])
+    low_col = _find_col(df, ["low"])
+    open_col = _find_col(df, ["open"])
 
-def fetch_mbp10_data(api_key, product, start, end):
-    _ensure_imports()
-    import databento as db
+    if not close_col:
+        raise ValueError(f"No close price column found. Available: {list(df.columns)}")
 
-    meta = PRODUCTS.get(product.upper())
-    if not meta:
-        raise ValueError(f"Unknown product: {product}. Supported: {', '.join(PRODUCTS.keys())}")
+    close = df[close_col]
+    ret_1d = close.pct_change()
 
-    client = db.Historical(api_key)
-    symbol = f"{product.upper()}.n.0"
-    log(f"Fetching MBP-10 for {symbol} from {start} to {end}")
+    # ── Target: forward N-day return ──
+    df["fwd_return"] = close.shift(-forward_days) / close - 1.0
 
-    data = client.timeseries.get_range(
-        dataset=meta["dataset"],
-        schema="mbp-10",
-        symbols=[symbol],
-        stype_in="continuous",
-        start=start,
-        end=end,
-    )
+    # ── Momentum features ──
+    for period in [5, 20, 60, 252]:
+        df[f"mom_{period}d"] = close / close.shift(period) - 1.0
 
-    df = data.to_df()
-    log(f"Received {len(df):,} raw MBP-10 records")
+    # ── Volatility ──
+    df["vol_20d"] = ret_1d.rolling(20).std()
+    df["vol_60d"] = ret_1d.rolling(60).std()
+
+    # ── Relative volume ──
+    if vol_col:
+        vol = df[vol_col].replace(0, np.nan)
+        df["rel_vol_20d"] = vol / vol.rolling(20).mean()
+
+    # ── RSI (14-day) ──
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+
+    # ── Bollinger Band %B (20-day) ──
+    sma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    df["bb_pctb"] = (close - (sma20 - 2 * std20)) / (4 * std20).replace(0, np.nan)
+
+    # ── 52-week high/low distance ──
+    if high_col and low_col:
+        high_252 = df[high_col].rolling(252).max()
+        low_252 = df[low_col].rolling(252).min()
+        rng = (high_252 - low_252).replace(0, np.nan)
+        df["dist_52w_high"] = (close - high_252) / rng
+        df["dist_52w_low"] = (close - low_252) / rng
+
+    # ── SMA crossovers ──
+    sma50 = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    df["sma_20_50"] = (sma20 / sma50 - 1.0) if sma50 is not None else 0
+    df["sma_50_200"] = (sma50 / sma200 - 1.0) if sma200 is not None else 0
+
+    # ── Mean reversion ──
+    df["mean_rev_20d"] = close / sma20 - 1.0
+
     return df
 
 
-def fetch_range_data(api_key, product, sessions):
-    """Fetch data for multiple sessions. Returns list of (date_label, DataFrame)."""
-    results = []
-    for sess_start, sess_end, date_label in sessions:
-        try:
-            df = fetch_mbp10_data(api_key, product, sess_start, sess_end)
-            if len(df) > 0:
-                results.append((date_label, df))
-                log(f"  {date_label}: {len(df):,} records")
-            else:
-                log(f"  {date_label}: no data (market holiday?)")
-        except Exception as e:
-            log(f"  {date_label}: fetch failed — {e}")
-    return results
-
-
-# ── Feature Engineering ──────────────────────────────────────────────────
-
-def build_features(df, markout=300):
+def build_fundamental_features(fund_df):
+    """
+    Build fundamental features from financial statements.
+    Handles whatever columns are available — skips missing ones gracefully.
+    """
     _ensure_imports()
 
-    if "action" in df.columns:
-        df_trades = df[df.action == "T"].copy()
-    else:
-        df_trades = df.copy()
+    if fund_df is None or len(fund_df) == 0:
+        return None
 
-    if len(df_trades) < markout * 3:
-        return None, None, None  # signal caller to skip this day
+    df = fund_df.copy()
+    features_added = []
 
-    df_trades["mid"] = (df_trades["bid_px_00"] + df_trades["ask_px_00"]) / 2
-    target_col = f"ret_{markout}t"
-    df_trades[target_col] = df_trades["mid"].shift(-markout) - df_trades["mid"]
+    # Revenue growth (YoY) — look for revenue-like columns
+    rev_col = _find_col(df, ["revenue", "totalrevenue", "total_revenue"])
+    if rev_col:
+        df["revenue_growth"] = df[rev_col].pct_change(4)  # 4 periods ~ YoY for quarterly
+        features_added.append("revenue_growth")
 
-    bid_sz = df_trades["bid_sz_00"].clip(lower=1)
-    ask_sz = df_trades["ask_sz_00"].clip(lower=1)
-    df_trades["skew"] = np.log(bid_sz) - np.log(ask_sz)
+    # Net margin
+    ni_col = _find_col(df, ["netincome", "net_income", "netincomeapplicabletocommonshares"])
+    if ni_col and rev_col:
+        df["net_margin"] = df[ni_col] / df[rev_col].replace(0, np.nan)
+        features_added.append("net_margin")
 
-    bid_ct_cols = [f"bid_ct_{i:02d}" for i in range(10) if f"bid_ct_{i:02d}" in df_trades.columns]
-    ask_ct_cols = [f"ask_ct_{i:02d}" for i in range(10) if f"ask_ct_{i:02d}" in df_trades.columns]
-    if bid_ct_cols and ask_ct_cols:
-        bid_ct_sum = df_trades[bid_ct_cols].sum(axis=1).clip(lower=1)
-        ask_ct_sum = df_trades[ask_ct_cols].sum(axis=1).clip(lower=1)
-        df_trades["imbalance"] = np.log(bid_ct_sum) - np.log(ask_ct_sum)
-    else:
-        df_trades["imbalance"] = df_trades["skew"]
+    # Gross margin
+    gp_col = _find_col(df, ["grossprofit", "gross_profit"])
+    if gp_col and rev_col:
+        df["gross_margin"] = df[gp_col] / df[rev_col].replace(0, np.nan)
+        features_added.append("gross_margin")
 
-    bid_sz_cols = [f"bid_sz_{i:02d}" for i in range(10) if f"bid_sz_{i:02d}" in df_trades.columns]
-    ask_sz_cols = [f"ask_sz_{i:02d}" for i in range(10) if f"ask_sz_{i:02d}" in df_trades.columns]
-    if len(bid_sz_cols) >= 5 and len(ask_sz_cols) >= 5:
-        weights = np.array([1.0, 0.8, 0.6, 0.4, 0.3, 0.2, 0.15, 0.1, 0.08, 0.05])[:len(bid_sz_cols)]
-        weighted_bid = (df_trades[bid_sz_cols].values * weights).sum(axis=1)
-        weighted_ask = (df_trades[ask_sz_cols].values * weights).sum(axis=1)
-        total = np.clip(weighted_bid + weighted_ask, 1, None)
-        df_trades["depth_pressure"] = (weighted_bid - weighted_ask) / total
-    else:
-        df_trades["depth_pressure"] = df_trades["skew"] * 0.5
+    # ROE
+    eq_col = _find_col(df, ["totalstockholderequity", "total_stockholder_equity",
+                             "totalshareholdersequity", "total_equity", "stockholdersequity"])
+    if ni_col and eq_col:
+        df["roe"] = df[ni_col] / df[eq_col].replace(0, np.nan)
+        features_added.append("roe")
 
-    df_trades["spread"] = df_trades["ask_px_00"] - df_trades["bid_px_00"]
+    # ROA
+    ta_col = _find_col(df, ["totalassets", "total_assets"])
+    if ni_col and ta_col:
+        df["roa"] = df[ni_col] / df[ta_col].replace(0, np.nan)
+        features_added.append("roa")
 
-    total_top_sz = bid_sz + ask_sz
-    microprice = (df_trades["bid_px_00"] * ask_sz + df_trades["ask_px_00"] * bid_sz) / total_top_sz
-    df_trades["micro_dev"] = microprice - df_trades["mid"]
+    # Debt to equity
+    debt_col = _find_col(df, ["totaldebt", "total_debt", "longtermdebt", "long_term_debt",
+                               "totalliabilities", "total_liabilities"])
+    if debt_col and eq_col:
+        df["debt_to_equity"] = df[debt_col] / df[eq_col].replace(0, np.nan)
+        features_added.append("debt_to_equity")
 
-    feature_cols = ["skew", "imbalance", "depth_pressure", "spread", "micro_dev"]
-    keep_cols = feature_cols + [target_col, "mid"]
-    df_clean = df_trades[keep_cols].dropna()
+    # Current ratio
+    ca_col = _find_col(df, ["totalcurrentassets", "total_current_assets"])
+    cl_col = _find_col(df, ["totalcurrentliabilities", "total_current_liabilities"])
+    if ca_col and cl_col:
+        df["current_ratio"] = df[ca_col] / df[cl_col].replace(0, np.nan)
+        features_added.append("current_ratio")
 
-    return df_clean, feature_cols, target_col
+    # Free cash flow
+    ocf_col = _find_col(df, ["operatingcashflow", "totalcashfromoperatingactivities",
+                              "operating_cash_flow"])
+    capex_col = _find_col(df, ["capitalexpenditures", "capital_expenditures", "capex",
+                                "capitalexpenditure"])
+    if ocf_col and capex_col:
+        df["fcf"] = df[ocf_col] + df[capex_col]  # capex is usually negative
+        features_added.append("fcf")
+
+    log(f"  Fundamental features built: {features_added if features_added else 'none (columns not matched)'}")
+    return df, features_added
+
+
+def _find_col(df, candidates):
+    cols_lower = {c.lower().replace(" ", "").replace("_", ""): c for c in df.columns}
+    for c in candidates:
+        key = c.lower().replace(" ", "").replace("_", "")
+        if key in cols_lower:
+            return cols_lower[key]
+    return None
 
 
 # ── Walk-Forward Training ────────────────────────────────────────────────
 
-def run_walk_forward(all_features_df, feature_cols, target_col, train_split, model_type, markout):
+def run_walk_forward(df, feature_cols, target_col, train_split, model_type):
     """
-    Walk-forward chronological split across the full concatenated dataset.
-    First <train_split> fraction = train, remainder = test.
+    Walk-forward chronological split. First <train_split> fraction = train.
     No data leakage: strict chronological ordering.
     """
     _ensure_imports()
     from sklearn.linear_model import LinearRegression
     from sklearn.ensemble import HistGradientBoostingRegressor
 
-    n = len(all_features_df)
+    n = len(df)
     split_idx = int(train_split * n)
-    split_idx -= split_idx % 100
 
-    df_train = all_features_df.iloc[:split_idx]
-    df_test = all_features_df.iloc[split_idx:]
+    df_train = df.iloc[:split_idx]
+    df_test = df.iloc[split_idx:]
 
-    if len(df_train) < 200 or len(df_test) < 100:
+    if len(df_train) < 60 or len(df_test) < 20:
         raise ValueError(
-            f"Insufficient data for walk-forward split: "
-            f"{len(df_train):,} train, {len(df_test):,} test (need 200/100 minimum)"
+            f"Insufficient data: {len(df_train)} train, {len(df_test)} test "
+            f"(need at least 60/20). Try a longer date range."
         )
 
-    log(f"Walk-forward split: {len(df_train):,} train / {len(df_test):,} test (split at row {split_idx:,})")
+    log(f"Walk-forward split: {len(df_train):,} train / {len(df_test):,} test")
 
     X_train = df_train[feature_cols].values
     y_train = df_train[target_col].values
@@ -245,61 +265,34 @@ def run_walk_forward(all_features_df, feature_cols, target_col, train_split, mod
     for i, ci in enumerate(corr_cols):
         for j, cj in enumerate(corr_cols):
             if j >= i:
-                corr_data[f"{ci}__{cj}"] = round(corr_matrix.iloc[i, j], 6)
+                v = corr_matrix.iloc[i, j]
+                corr_data[f"{ci}__{cj}"] = round(float(v), 6) if not np.isnan(v) else 0.0
 
     models = {}
-    skew_idx = feature_cols.index("skew") if "skew" in feature_cols else 0
-    imb_idx = feature_cols.index("imbalance") if "imbalance" in feature_cols else 1
 
     if model_type in ("linear", "both"):
-        # Skew only
-        reg_skew = LinearRegression(fit_intercept=False)
-        reg_skew.fit(X_train[:, [skew_idx]], y_train)
-        pred_skew = reg_skew.predict(X_test[:, [skew_idx]])
-        models["skew"] = _build_model_result(
-            "Skew (top-of-book depth)", {"skew": float(reg_skew.coef_[0])},
-            pred_skew, y_test, "linear_regression", df_test
-        )
-
-        # Imbalance only
-        reg_imb = LinearRegression(fit_intercept=False)
-        reg_imb.fit(X_train[:, [imb_idx]], y_train)
-        pred_imb = reg_imb.predict(X_test[:, [imb_idx]])
-        models["imbalance"] = _build_model_result(
-            "Imbalance (10-level count)", {"imbalance": float(reg_imb.coef_[0])},
-            pred_imb, y_test, "linear_regression", df_test
-        )
-
-        # Combined linear
-        reg_combo = LinearRegression(fit_intercept=False)
-        reg_combo.fit(X_train[:, [skew_idx, imb_idx]], y_train)
-        pred_combo = reg_combo.predict(X_test[:, [skew_idx, imb_idx]])
-        models["combined_linear"] = _build_model_result(
-            "Combined Linear (skew+imb)", {n: float(c) for n, c in zip(["skew", "imbalance"], reg_combo.coef_)},
-            pred_combo, y_test, "linear_regression", df_test
-        )
-
-        # All features linear
-        reg_all = LinearRegression(fit_intercept=False)
-        reg_all.fit(X_train, y_train)
-        pred_all = reg_all.predict(X_test)
-        models["all_features_linear"] = _build_model_result(
-            "All Features Linear", {n: float(c) for n, c in zip(feature_cols, reg_all.coef_)},
-            pred_all, y_test, "linear_regression", df_test
+        reg = LinearRegression()
+        reg.fit(X_train, y_train)
+        pred = reg.predict(X_test)
+        models["linear_all"] = _build_model_result(
+            "Linear Regression (all features)",
+            {f: round(float(c), 6) for f, c in zip(feature_cols, reg.coef_)},
+            pred, y_test, "linear_regression", df_test,
         )
 
     if model_type in ("gradient_boost", "both"):
         log("Training HistGradientBoostingRegressor...")
         gbr = HistGradientBoostingRegressor(
-            max_iter=200, max_depth=4, learning_rate=0.05,
-            min_samples_leaf=50, random_state=42,
+            max_iter=300, max_depth=4, learning_rate=0.05,
+            min_samples_leaf=20, random_state=42,
         )
         gbr.fit(X_train, y_train)
         pred_gbr = gbr.predict(X_test)
-        importances = gbr.feature_importances_ if hasattr(gbr, "feature_importances_") else np.zeros(len(feature_cols))
+        imp = gbr.feature_importances_ if hasattr(gbr, "feature_importances_") else np.zeros(len(feature_cols))
         models["gradient_boost"] = _build_model_result(
-            "Gradient Boosted Trees", {n: float(v) for n, v in zip(feature_cols, importances)},
-            pred_gbr, y_test, "gradient_boost", df_test
+            "Gradient Boosted Trees",
+            {f: round(float(v), 6) for f, v in zip(feature_cols, imp)},
+            pred_gbr, y_test, "gradient_boost", df_test,
         )
 
     return {
@@ -312,33 +305,46 @@ def run_walk_forward(all_features_df, feature_cols, target_col, train_split, mod
 
 
 def _build_model_result(name, coefficients, predictions, actual, model_type, df_test):
-    """Build result dict with aggregated metrics including daily PnL breakdown."""
     _ensure_imports()
 
     n = len(predictions)
-    oos_corr = float(np.corrcoef(predictions, actual)[0, 1]) if n > 1 else 0.0
+    # Guard against constant predictions or actual
+    if np.std(predictions) < 1e-12 or np.std(actual) < 1e-12:
+        oos_corr = 0.0
+    else:
+        oos_corr = float(np.corrcoef(predictions, actual)[0, 1])
+        if np.isnan(oos_corr):
+            oos_corr = 0.0
+
     ss_res = float(np.sum((actual - predictions) ** 2))
     ss_tot = float(np.sum((actual - np.mean(actual)) ** 2))
     r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
-    # Cumulative markout PnL (sorted by predictor)
-    pnl_curve = _cumulative_markout_pnl(predictions, actual)
-    final_pnl = float(pnl_curve[-1]) if len(pnl_curve) > 0 else 0.0
+    # Direction accuracy
+    pred_dir = predictions > 0
+    actual_dir = actual > 0
+    hit_rate = float(np.mean(pred_dir == actual_dir)) if n > 0 else 0.0
 
-    # ── Daily PnL breakdown ──
-    # Assign a calendar date to each test row from the index
-    daily_pnls = _compute_daily_pnls(predictions, actual, df_test)
-    daily_vals = [d["pnl"] for d in daily_pnls]
+    # Signed return PnL (long if pred>0, short if pred<0)
+    signed_ret = actual.copy()
+    signed_ret[predictions < 0] *= -1
+    cumulative_pnl = float(np.sum(signed_ret))
 
-    avg_daily_pnl = float(np.mean(daily_vals)) if daily_vals else 0.0
-    std_daily_pnl = float(np.std(daily_vals, ddof=1)) if len(daily_vals) > 1 else 0.0
-    sharpe = (avg_daily_pnl / std_daily_pnl) if std_daily_pnl > 0 else 0.0
+    # Monthly PnL breakdown
+    monthly_pnls = _compute_monthly_pnls(predictions, actual, df_test)
+    monthly_vals = [m["pnl"] for m in monthly_pnls]
+    avg_monthly = float(np.mean(monthly_vals)) if monthly_vals else 0.0
+    std_monthly = float(np.std(monthly_vals, ddof=1)) if len(monthly_vals) > 1 else 0.0
+    sharpe = (avg_monthly / std_monthly) if std_monthly > 0 else 0.0
 
-    # Max drawdown on cumulative daily equity
-    cum_daily = np.cumsum(daily_vals)
-    peak = np.maximum.accumulate(cum_daily) if len(cum_daily) > 0 else np.array([0.0])
-    drawdowns = cum_daily - peak
-    max_dd = float(np.min(drawdowns)) if len(drawdowns) > 0 else 0.0
+    # Max drawdown
+    cum = np.cumsum(signed_ret)
+    peak = np.maximum.accumulate(cum) if len(cum) > 0 else np.array([0.0])
+    dd = cum - peak
+    max_dd = float(np.min(dd)) if len(dd) > 0 else 0.0
+
+    # PnL curve for chart
+    pnl_curve = list(np.cumsum(signed_ret))
 
     return {
         "name": name,
@@ -346,121 +352,105 @@ def _build_model_result(name, coefficients, predictions, actual, model_type, df_
         "coefficients": coefficients,
         "oos_correlation": round(oos_corr, 6),
         "r_squared": round(r_squared, 6),
-        "final_pnl": round(final_pnl, 4),
-        "avg_daily_pnl": round(avg_daily_pnl, 4),
-        "std_daily_pnl": round(std_daily_pnl, 4),
+        "hit_rate": round(hit_rate, 4),
+        "cumulative_pnl": round(cumulative_pnl, 6),
+        "avg_monthly_pnl": round(avg_monthly, 6),
+        "std_monthly_pnl": round(std_monthly, 6),
         "sharpe": round(sharpe, 4),
-        "max_drawdown": round(max_dd, 4),
-        "num_test_days": len(daily_pnls),
-        "daily_pnls": daily_pnls,
-        "pnl_curve": [round(float(x), 4) for x in pnl_curve],
+        "max_drawdown": round(max_dd, 6),
+        "num_test_periods": len(monthly_pnls),
+        "monthly_pnls": monthly_pnls,
+        "pnl_curve": [round(float(x), 6) for x in pnl_curve],
     }
 
 
-def _compute_daily_pnls(predictions, actual, df_test):
-    """Compute signed PnL per calendar date in the test set."""
+def _compute_monthly_pnls(predictions, actual, df_test):
     _ensure_imports()
 
-    # Build a date column from the DataFrame index
-    idx = df_test.index
-    if hasattr(idx, 'date'):
-        dates = pd.Series([d.date() for d in idx], index=df_test.index)
+    date_col = _find_col(df_test, ["date", "datetime"])
+    if date_col:
+        months = pd.Series(df_test[date_col].values).dt.to_period("M").astype(str).values
     else:
-        # Fallback: treat entire test as one "day"
-        dates = pd.Series(["all"] * len(df_test), index=df_test.index)
+        # Fallback: chunk into ~21-day blocks
+        months = [f"block_{i // 21}" for i in range(len(df_test))]
 
-    df_pnl = pd.DataFrame({
-        "pred": predictions,
-        "actual": actual,
-        "date": dates.values,
-    })
-    # Signed return: if pred < 0, flip sign (we'd be short)
+    df_pnl = pd.DataFrame({"pred": predictions, "actual": actual, "month": months})
     df_pnl["signed_ret"] = df_pnl["actual"].copy()
     df_pnl.loc[df_pnl["pred"] < 0, "signed_ret"] *= -1
 
-    daily = []
-    for date_val, grp in df_pnl.groupby("date", sort=True):
-        daily.append({
-            "date": str(date_val),
-            "trades": len(grp),
-            "pnl": round(float(grp["signed_ret"].sum()), 4),
-            "corr": round(float(np.corrcoef(grp["pred"], grp["actual"])[0, 1]), 4) if len(grp) > 2 else 0.0,
+    result = []
+    for month, grp in df_pnl.groupby("month", sort=True):
+        corr = 0.0
+        if len(grp) > 2 and np.std(grp["pred"]) > 1e-12 and np.std(grp["actual"]) > 1e-12:
+            c = np.corrcoef(grp["pred"], grp["actual"])[0, 1]
+            corr = float(c) if not np.isnan(c) else 0.0
+        result.append({
+            "period": str(month),
+            "samples": len(grp),
+            "pnl": round(float(grp["signed_ret"].sum()), 6),
+            "corr": round(corr, 4),
         })
-    return daily
+    return result
 
 
-def _cumulative_markout_pnl(predictions, actual):
-    _ensure_imports()
-    df_pnl = pd.DataFrame({"pred": predictions, "ret": actual.copy()})
-    df_pnl.loc[df_pnl["pred"] < 0, "ret"] *= -1
-    df_pnl = df_pnl.sort_values(by="pred")
-    return df_pnl["ret"].cumsum().values
+# ── Chart ────────────────────────────────────────────────────────────────
 
-
-# ── Chart Rendering ──────────────────────────────────────────────────────
-
-def render_chart(results, product, product_name, markout, start_date, end_date, chart_path):
+def render_chart(results, ticker, forward_days, start_date, end_date, chart_path):
     _ensure_imports()
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     models = results["models"]
-    num_models = len(models)
-    if num_models == 0:
+    if not models:
         return
 
-    # Two-panel chart: cumulative markout PnL (top) + daily equity (bottom)
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), facecolor="#1e1e2e",
                                     gridspec_kw={"height_ratios": [3, 2]})
 
-    colors = {
-        "skew": "#3b82f6", "imbalance": "#facc15", "combined_linear": "#22c55e",
-        "all_features_linear": "#a855f7", "gradient_boost": "#ef4444",
-    }
-    short_labels = {
-        "skew": "Skew", "imbalance": "Imbalance", "combined_linear": "Combined LR",
-        "all_features_linear": "All Features LR", "gradient_boost": "Gradient Boost",
-    }
+    colors = {"linear_all": "#3b82f6", "gradient_boost": "#ef4444"}
+    labels = {"linear_all": "Linear Regression", "gradient_boost": "Gradient Boost"}
 
-    # ── Top panel: cumulative markout PnL ──
+    # Top: cumulative return curve
     ax1.set_facecolor("#1e1e2e")
-    for key, mdata in models.items():
-        pnl = mdata.get("pnl_curve", [])
+    for key, m in models.items():
+        pnl = m.get("pnl_curve", [])
         if not pnl:
             continue
-        pct = np.linspace(0, 100, len(pnl))
         c = colors.get(key, "#888")
         lw = 2.5 if key == "gradient_boost" else 1.6
-        ax1.plot(pct, pnl, color=c, linewidth=lw, label=short_labels.get(key, key), alpha=0.9)
+        ax1.plot(range(len(pnl)), pnl, color=c, linewidth=lw,
+                 label=labels.get(key, key), alpha=0.9)
 
-    ax1.set_xlabel("Predictor value (percentile)", color="#a0a0a0", fontsize=10)
-    ax1.set_ylabel("Cumulative return (ticks)", color="#a0a0a0", fontsize=10)
-    ax1.set_title(
-        f"{product} ({product_name}) — Walk-Forward Backtest",
-        color="#e0e0e0", fontsize=13, fontweight="bold", pad=10,
-    )
-    ax1.text(0.5, 1.02, f"MBP-10 | {start_date} to {end_date} | {markout}s markout | {results['test_size']:,} OOS samples",
+    ax1.axhline(0, color="#555", linewidth=0.8, linestyle="--")
+    ax1.set_ylabel("Cumulative return", color="#a0a0a0", fontsize=10)
+    ax1.set_title(f"{ticker} — Walk-Forward Backtest ({forward_days}d forward return)",
+                  color="#e0e0e0", fontsize=13, fontweight="bold", pad=10)
+    ax1.text(0.5, 1.02, f"{start_date} to {end_date} | {results['test_size']:,} OOS samples",
              transform=ax1.transAxes, ha="center", color="#888", fontsize=8)
     _style_ax(ax1)
-    ax1.legend(loc="upper left", framealpha=0.8, facecolor="#2a2a3e", edgecolor="#444", fontsize=8, labelcolor="#c0c0c0")
+    ax1.legend(loc="upper left", framealpha=0.8, facecolor="#2a2a3e",
+               edgecolor="#444", fontsize=9, labelcolor="#c0c0c0")
 
-    # ── Bottom panel: daily cumulative equity ──
+    # Bottom: monthly PnL bars
     ax2.set_facecolor("#1e1e2e")
-    for key, mdata in models.items():
-        daily = mdata.get("daily_pnls", [])
-        if not daily:
-            continue
-        daily_vals = [d["pnl"] for d in daily]
-        cum_equity = np.cumsum(daily_vals)
-        dates = list(range(len(cum_equity)))
-        c = colors.get(key, "#888")
-        lw = 2.5 if key == "gradient_boost" else 1.4
-        ax2.plot(dates, cum_equity, color=c, linewidth=lw, label=short_labels.get(key, key), alpha=0.9)
+    best_key = max(models.keys(), key=lambda k: models[k].get("sharpe", 0))
+    monthly = models[best_key].get("monthly_pnls", [])
+    if monthly:
+        periods = [m["period"] for m in monthly]
+        vals = [m["pnl"] for m in monthly]
+        bar_colors = ["#22c55e" if v >= 0 else "#ef4444" for v in vals]
+        ax2.bar(range(len(vals)), vals, color=bar_colors, alpha=0.8)
+        # Label every Nth bar
+        step = max(1, len(periods) // 12)
+        ax2.set_xticks(range(0, len(periods), step))
+        ax2.set_xticklabels([periods[i] for i in range(0, len(periods), step)],
+                            rotation=45, fontsize=7, color="#a0a0a0")
 
-    ax2.set_xlabel("Test day #", color="#a0a0a0", fontsize=10)
-    ax2.set_ylabel("Cumulative daily PnL", color="#a0a0a0", fontsize=10)
-    ax2.set_title("Daily Equity Curve (OOS)", color="#c0c0c0", fontsize=11, pad=6)
+    ax2.axhline(0, color="#555", linewidth=0.8, linestyle="--")
+    ax2.set_ylabel("Monthly PnL", color="#a0a0a0", fontsize=10)
+    ax2.set_title(f"Monthly Returns (best model: {labels.get(best_key, best_key)})",
+                  color="#c0c0c0", fontsize=11, pad=6)
     _style_ax(ax2)
 
     plt.tight_layout()
@@ -480,104 +470,111 @@ def _style_ax(ax):
 
 # ── Main Pipeline ────────────────────────────────────────────────────────
 
-def run_prediction(api_key, product, start_date, end_date, markout=300,
-                   train_split=0.70, model_type="both", single_date=None):
-    """
-    Multi-day walk-forward backtesting pipeline.
-
-    If single_date is set, fetches only that day (backward-compat, deprecated).
-    Otherwise fetches [start_date .. end_date] range and concatenates sessions.
-    """
+def run_prediction(ticker, start_date=None, end_date=None, forward_days=20,
+                   train_split=0.70, model_type="both", data_dir=None):
     _ensure_imports()
+    from data_loader import ensure_data, load_prices, load_fundamentals
 
-    product = product.upper()
-    meta = PRODUCTS.get(product)
-    if not meta:
-        raise ValueError(f"Unknown product: {product}")
+    ticker = ticker.upper()
+    log(f"Running ML backtest for {ticker}")
 
-    # Determine sessions
-    if single_date:
-        sessions = [(f"{single_date}{RTH_START_UTC}", f"{single_date}{RTH_END_UTC}", single_date)]
-        effective_start = single_date
-        effective_end = single_date
-    else:
-        sessions = generate_session_ranges(start_date, end_date)
-        effective_start = start_date
-        effective_end = end_date
+    # Ensure data is downloaded
+    data_dir = ensure_data(data_dir)
 
-    if not sessions:
-        raise ValueError(f"No trading sessions in range {start_date} to {end_date}")
+    # Load EOD prices
+    prices = load_prices(data_dir, ticker=ticker)
+    if len(prices) == 0:
+        raise ValueError(f"No price data found for {ticker}")
 
-    log(f"Fetching {len(sessions)} session(s) for {product}: {effective_start} to {effective_end}")
+    # Filter date range
+    if "date" in prices.columns:
+        if start_date:
+            prices = prices[prices["date"] >= start_date]
+        if end_date:
+            prices = prices[prices["date"] <= end_date]
 
-    # Fetch all session data
-    day_data = fetch_range_data(api_key, product, sessions)
-    if not day_data:
-        raise ValueError("No data returned for any session in the range")
+    if len(prices) < 300:
+        raise ValueError(f"Only {len(prices)} rows for {ticker} in range. Need at least 300 for meaningful backtest.")
 
-    # Build features per day, then concatenate
-    all_features = []
-    per_day_stats = []
-    total_raw = 0
+    log(f"Price data: {len(prices):,} rows ({prices['date'].min()} to {prices['date'].max()})" if "date" in prices.columns else f"Price data: {len(prices):,} rows")
 
-    for date_label, df_raw in day_data:
-        total_raw += len(df_raw)
-        df_feat, fcols, tcol = build_features(df_raw, markout=markout)
-        if df_feat is None or len(df_feat) == 0:
-            log(f"  {date_label}: skipped (insufficient trades for markout={markout})")
-            per_day_stats.append({"date": date_label, "raw_records": len(df_raw), "trade_samples": 0, "status": "skipped"})
-            continue
-        per_day_stats.append({"date": date_label, "raw_records": len(df_raw), "trade_samples": len(df_feat), "status": "ok"})
-        all_features.append(df_feat)
+    effective_start = str(prices["date"].min().date()) if "date" in prices.columns else start_date or "?"
+    effective_end = str(prices["date"].max().date()) if "date" in prices.columns else end_date or "?"
 
-    if not all_features:
-        raise ValueError("No sessions had enough trade data for the given markout")
+    # Build technical features
+    df = build_technical_features(prices, forward_days=forward_days)
 
-    feature_cols = fcols
-    target_col = tcol
-    combined_df = pd.concat(all_features, axis=0)
-    # Keep chronological order (the index is ts_event from Databento)
-    combined_df = combined_df.sort_index()
+    # Try to merge fundamental features
+    fund_features = []
+    try:
+        fund_raw = load_fundamentals(data_dir, ticker=ticker)
+        if fund_raw is not None and len(fund_raw) > 0:
+            fund_df, fund_features = build_fundamental_features(fund_raw)
+            if fund_features and "date" in df.columns and "date" in fund_df.columns:
+                # Forward-fill fundamentals to daily frequency (no leakage — uses last known)
+                fund_cols_to_merge = ["date"] + fund_features
+                fund_daily = fund_df[fund_cols_to_merge].drop_duplicates("date").sort_values("date")
+                df = pd.merge_asof(df.sort_values("date"), fund_daily, on="date", direction="backward")
+                log(f"  Merged {len(fund_features)} fundamental features")
+    except Exception as e:
+        log(f"  Fundamental data merge failed (non-fatal): {e}")
 
-    log(f"Combined dataset: {len(combined_df):,} trade samples across {len(all_features)} session(s)")
+    # Identify available feature columns
+    technical_features = [c for c in [
+        "mom_5d", "mom_20d", "mom_60d", "mom_252d",
+        "vol_20d", "vol_60d", "rel_vol_20d",
+        "rsi_14", "bb_pctb", "dist_52w_high", "dist_52w_low",
+        "sma_20_50", "sma_50_200", "mean_rev_20d",
+    ] if c in df.columns]
+
+    feature_cols = technical_features + [f for f in fund_features if f in df.columns]
+    target_col = "fwd_return"
+
+    if not feature_cols:
+        raise ValueError("No features could be built from the data. Check column names.")
+
+    # Drop NaN rows (from rolling calcs + forward shift)
+    df_clean = df[feature_cols + [target_col] + (["date"] if "date" in df.columns else [])].dropna()
+    df_clean = df_clean.replace([np.inf, -np.inf], np.nan).dropna()
+
+    log(f"Clean dataset: {len(df_clean):,} rows, {len(feature_cols)} features")
+
+    if len(df_clean) < 100:
+        raise ValueError(f"Only {len(df_clean)} usable rows after feature computation. Need at least 100.")
 
     # Walk-forward training
-    results = run_walk_forward(combined_df, feature_cols, target_col, train_split, model_type, markout)
+    results = run_walk_forward(df_clean, feature_cols, target_col, train_split, model_type)
 
     # Chart
-    chart_path = os.path.join(tempfile.gettempdir(), f"ml-predict-{product}.png")
+    chart_path = os.path.join(tempfile.gettempdir(), f"ml-predict-{ticker}.png")
     try:
-        render_chart(results, product, meta["name"], markout, effective_start, effective_end, chart_path)
+        render_chart(results, ticker, forward_days, effective_start, effective_end, chart_path)
     except Exception as e:
         log(f"Chart rendering failed: {e}")
         chart_path = None
 
     # Build output
     output = {
-        "product": product,
-        "product_name": meta["name"],
-        "schema": "mbp-10",
+        "ticker": ticker,
         "start_date": effective_start,
         "end_date": effective_end,
-        "num_sessions": len(all_features),
-        "total_sessions_attempted": len(sessions),
-        "markout": markout,
+        "forward_days": forward_days,
         "train_split": train_split,
         "split_type": "walk-forward chronological",
         "feature_columns": feature_cols,
-        "total_raw_records": total_raw,
-        "total_trade_samples": len(combined_df),
+        "technical_features": technical_features,
+        "fundamental_features": [f for f in fund_features if f in df.columns],
+        "total_price_rows": len(prices),
+        "total_clean_samples": len(df_clean),
         "train_size": results["train_size"],
         "test_size": results["test_size"],
         "correlation": results["correlation"],
         "correlation_columns": results["correlation_columns"],
-        "per_day_stats": per_day_stats,
         "models": {},
         "chart_path": chart_path,
     }
 
-    # Serialize model results (strip pnl_curve to keep JSON small)
-    best_model_key = None
+    best_key = None
     best_score = -float("inf")
     for key, model in results["models"].items():
         m = {
@@ -586,28 +583,35 @@ def run_prediction(api_key, product, start_date, end_date, markout=300,
             "coefficients": model["coefficients"],
             "oos_correlation": model["oos_correlation"],
             "r_squared": model["r_squared"],
-            "final_pnl": model["final_pnl"],
-            "avg_daily_pnl": model["avg_daily_pnl"],
-            "std_daily_pnl": model["std_daily_pnl"],
+            "hit_rate": model["hit_rate"],
+            "cumulative_pnl": model["cumulative_pnl"],
+            "avg_monthly_pnl": model["avg_monthly_pnl"],
+            "std_monthly_pnl": model["std_monthly_pnl"],
             "sharpe": model["sharpe"],
             "max_drawdown": model["max_drawdown"],
-            "num_test_days": model["num_test_days"],
-            "daily_pnls": model["daily_pnls"],
+            "num_test_periods": model["num_test_periods"],
+            "monthly_pnls": model["monthly_pnls"],
         }
         output["models"][key] = m
-        # Best model: score = sharpe * 0.5 + (pnl > 0) * 0.5 — rewards stability AND profitability
-        score = model["sharpe"] * 0.5 + (1.0 if model["final_pnl"] > 0 else -0.5) * 0.3 + model["oos_correlation"] * 0.2
+        # Score: Sharpe dominant, with hit rate and correlation as tiebreakers
+        score = model["sharpe"] * 0.5 + model["hit_rate"] * 0.3 + model["oos_correlation"] * 0.2
         if score > best_score:
             best_score = score
-            best_model_key = key
+            best_key = key
 
-    output["best_model"] = best_model_key
-    output["best_model_name"] = results["models"][best_model_key]["name"] if best_model_key else None
-    output["best_pnl"] = round(results["models"][best_model_key]["final_pnl"], 4) if best_model_key else 0.0
-    output["best_sharpe"] = round(results["models"][best_model_key]["sharpe"], 4) if best_model_key else 0.0
-
-    if single_date:
-        output["_deprecated_single_date"] = True
+    if best_key:
+        bm = results["models"][best_key]
+        output["best_model"] = best_key
+        output["best_model_name"] = bm["name"]
+        output["best_pnl"] = bm["cumulative_pnl"]
+        output["best_sharpe"] = bm["sharpe"]
+        output["best_hit_rate"] = bm["hit_rate"]
+    else:
+        output["best_model"] = None
+        output["best_model_name"] = None
+        output["best_pnl"] = 0.0
+        output["best_sharpe"] = 0.0
+        output["best_hit_rate"] = 0.0
 
     return output
 
@@ -617,81 +621,62 @@ def run_prediction(api_key, product, start_date, end_date, markout=300,
 def main():
     max_days = int(os.environ.get("ML_MAX_DAYS", str(MAX_DAYS_DEFAULT)))
 
-    parser = argparse.ArgumentParser(description="ML Trading Predictor — Multi-Day Walk-Forward Backtest")
-    parser.add_argument("--product", required=True, help="Futures product (ES, NQ, CL, GC, etc.)")
+    parser = argparse.ArgumentParser(description="ML Trading Predictor — Stock Backtest on Parquet Data")
+    parser.add_argument("--ticker", required=True, help="Stock ticker (e.g. AAPL, MSFT, SPY)")
     parser.add_argument("--start-date", help="Backtest start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", help="Backtest end date (YYYY-MM-DD)")
-    parser.add_argument("--days", type=int, help=f"Number of calendar days back from end-date (default: {DEFAULT_DAYS})")
-    parser.add_argument("--date", help="[DEPRECATED] Single trading date (YYYY-MM-DD). Use --start-date/--end-date instead.")
-    parser.add_argument("--markout", type=int, default=DEFAULT_MARKOUT, help=f"Forward trade count for returns (default: {DEFAULT_MARKOUT})")
-    parser.add_argument("--train-split", type=float, default=DEFAULT_TRAIN_SPLIT, help=f"In-sample fraction (default: {DEFAULT_TRAIN_SPLIT})")
+    parser.add_argument("--days", type=int, help=f"Trading days of history (default: {DEFAULT_DAYS})")
+    parser.add_argument("--forward", type=int, default=DEFAULT_FORWARD,
+                        help=f"Forward return horizon in trading days (default: {DEFAULT_FORWARD})")
+    parser.add_argument("--train-split", type=float, default=DEFAULT_TRAIN_SPLIT)
     parser.add_argument("--model", choices=["linear", "gradient_boost", "both"], default="both")
-    parser.add_argument("--api-key", help="Databento API key (or set DATABENTO_API_KEY env var)")
+    parser.add_argument("--data-dir", help="Local directory with parquet files (or set ML_DATA_DIR)")
+    parser.add_argument("--inspect", action="store_true", help="Print parquet schemas and exit")
     args = parser.parse_args()
 
-    api_key = args.api_key or os.environ.get("DATABENTO_API_KEY", "")
-    if not api_key:
-        print(json.dumps({"error": "No Databento API key. Set DATABENTO_API_KEY or pass --api-key"}))
-        sys.exit(1)
+    # Schema inspection mode
+    if args.inspect:
+        from data_loader import ensure_data, inspect_schema
+        data_dir = ensure_data(args.data_dir)
+        schema = inspect_schema(data_dir)
+        print(json.dumps(schema, indent=2, default=str))
+        return
 
-    # ── Resolve date range ──
-    single_date = None
+    # Resolve date range
+    end_date = args.end_date
+    start_date = args.start_date
 
-    if args.date and not args.start_date and not args.end_date and not args.days:
-        # Deprecated single-day mode
-        single_date = args.date
-        start_date = args.date
-        end_date = args.date
-        log(f"WARNING: --date is deprecated. Use --start-date/--end-date for multi-day backtesting.")
-    else:
-        end_date = args.end_date
+    if args.days and not start_date:
+        if args.days > max_days:
+            print(json.dumps({"error": f"days={args.days} exceeds max {max_days}. Set ML_MAX_DAYS to override."}))
+            sys.exit(1)
         if not end_date:
-            end_date = last_trading_day()
-
-        if args.days:
-            days_back = args.days
-        elif args.start_date:
-            days_back = None  # explicit start
-        else:
-            days_back = DEFAULT_DAYS
-
-        if days_back is not None:
-            if days_back > max_days:
-                print(json.dumps({"error": f"days={days_back} exceeds maximum {max_days}. Set ML_MAX_DAYS env var to override."}))
-                sys.exit(1)
-            ed = datetime.strptime(end_date, "%Y-%m-%d")
-            sd = ed - timedelta(days=days_back)
-            start_date = sd.strftime("%Y-%m-%d")
-        else:
-            start_date = args.start_date
+            end_date = datetime.utcnow().strftime("%Y-%m-%d")
+        ed = datetime.strptime(end_date, "%Y-%m-%d")
+        sd = ed - timedelta(days=int(args.days * 1.5))  # 1.5x to account for weekends/holidays
+        start_date = sd.strftime("%Y-%m-%d")
 
     # Validate
-    try:
-        sd_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        ed_dt = datetime.strptime(end_date, "%Y-%m-%d")
-    except ValueError as e:
-        print(json.dumps({"error": f"Invalid date format: {e}. Use YYYY-MM-DD."}))
-        sys.exit(1)
-
-    if sd_dt > ed_dt:
-        print(json.dumps({"error": f"start_date ({start_date}) is after end_date ({end_date})"}))
-        sys.exit(1)
-
-    delta_days = (ed_dt - sd_dt).days
-    if delta_days > max_days:
-        print(json.dumps({"error": f"Date range spans {delta_days} days, exceeds max {max_days}. Set ML_MAX_DAYS to override."}))
-        sys.exit(1)
+    if start_date and end_date:
+        try:
+            sd_dt = datetime.strptime(start_date, "%Y-%m-%d")
+            ed_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError as e:
+            print(json.dumps({"error": f"Invalid date format: {e}. Use YYYY-MM-DD."}))
+            sys.exit(1)
+        if sd_dt > ed_dt:
+            print(json.dumps({"error": f"start_date ({start_date}) is after end_date ({end_date})"}))
+            sys.exit(1)
 
     try:
         result = run_prediction(
-            api_key=api_key,
-            product=args.product,
+            ticker=args.ticker,
             start_date=start_date,
             end_date=end_date,
-            markout=args.markout,
+            forward_days=args.forward,
             train_split=args.train_split,
             model_type=args.model,
-            single_date=single_date,
+            data_dir=args.data_dir,
         )
         print(json.dumps(result))
     except Exception as e:
