@@ -464,6 +464,165 @@ class DatabentoService {
     throw new Error('Databento does not provide equity quotes — configure Tradier for spot prices');
   }
 
+  // ── Order Flow Analysis (tick-level trade data) ─────────────────────
+
+  /**
+   * Analyze recent options order flow for a ticker.
+   * Uses tick-level trade data from OPRA to detect:
+   *   - Large block trades (institutional activity)
+   *   - Net premium flow (calls vs puts, buy vs sell side)
+   *   - Unusual volume spikes by strike
+   *
+   * This is institutional-grade order flow analysis — the kind of data
+   * that powers tools like Unusual Whales, FlowAlgo, etc.
+   *
+   * @param {string} ticker - e.g. 'SPY'
+   * @param {number} [lookbackMinutes=15] - minutes of trade data to analyze
+   * @returns {Promise<object>} Order flow summary
+   */
+  async getOrderFlow(ticker, lookbackMinutes = 15) {
+    const cacheKey = `flow_${ticker}_${lookbackMinutes}`;
+    const cached = _dataCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < 30000) return cached.data; // 30s cache
+
+    const now = new Date();
+    const start = new Date(now.getTime() - lookbackMinutes * 60 * 1000);
+    const startStr = start.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
+    const endStr = now.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
+
+    // Fetch trade data + definitions in parallel
+    const [trades, defs] = await Promise.all([
+      this._getRange({
+        symbols: `${ticker.toUpperCase()}.OPT`,
+        schema: 'trades',
+        stype_in: 'parent',
+        start: startStr,
+        end: endStr,
+        limit: '50000', // cap to avoid huge responses
+      }, 60000),
+      this.getInstrumentDefinitions(ticker),
+    ]);
+
+    if (trades.length === 0) {
+      const empty = { ticker, trades: 0, callFlow: 0, putFlow: 0, netFlow: 0, largeBlocks: [], topStrikes: [] };
+      _dataCache.set(cacheKey, { data: empty, ts: Date.now() });
+      return empty;
+    }
+
+    // Build instrument ID → definition lookup
+    const idToDef = new Map();
+    for (const def of defs.values()) {
+      idToDef.set(def.instrumentId, def);
+    }
+
+    // Analyze trades
+    let callPremium = 0, putPremium = 0;
+    let callVolume = 0, putVolume = 0;
+    const strikeVolume = new Map(); // strike → { calls, puts, premium }
+    const largeBlocks = []; // trades > $50K notional
+    const LARGE_BLOCK_THRESHOLD = 50000; // $50K
+
+    for (const trade of trades) {
+      const instrId = trade.hd?.instrument_id ?? trade.instrument_id ?? 0;
+      const def = idToDef.get(instrId);
+      if (!def) continue;
+
+      const price = trade.price != null ? trade.price / PRICE_SCALE : 0;
+      const size = trade.size || 0;
+      if (price <= 0 || size <= 0) continue;
+
+      const premium = price * size * (def.multiplier || 100);
+      const side = trade.side; // 'A' = ask (buy), 'B' = bid (sell)
+      const signedPremium = side === 'A' ? premium : side === 'B' ? -premium : 0;
+
+      if (def.type === 'call') {
+        callPremium += signedPremium;
+        callVolume += size;
+      } else if (def.type === 'put') {
+        putPremium += signedPremium;
+        putVolume += size;
+      }
+
+      // Track per-strike volume
+      const sv = strikeVolume.get(def.strike) || { calls: 0, puts: 0, premium: 0 };
+      if (def.type === 'call') sv.calls += size;
+      else sv.puts += size;
+      sv.premium += Math.abs(premium);
+      strikeVolume.set(def.strike, sv);
+
+      // Track large blocks
+      if (Math.abs(premium) >= LARGE_BLOCK_THRESHOLD) {
+        largeBlocks.push({
+          strike: def.strike,
+          type: def.type,
+          expiration: def.expiration,
+          size,
+          price,
+          premium: Math.round(premium),
+          side: side === 'A' ? 'buy' : side === 'B' ? 'sell' : 'unknown',
+        });
+      }
+    }
+
+    // Sort large blocks by premium (biggest first)
+    largeBlocks.sort((a, b) => Math.abs(b.premium) - Math.abs(a.premium));
+
+    // Top strikes by volume
+    const topStrikes = [...strikeVolume.entries()]
+      .sort((a, b) => (b[1].calls + b[1].puts) - (a[1].calls + a[1].puts))
+      .slice(0, 10)
+      .map(([strike, data]) => ({ strike, ...data }));
+
+    const result = {
+      ticker: ticker.toUpperCase(),
+      lookbackMinutes,
+      tradeCount: trades.length,
+      callVolume,
+      putVolume,
+      callPremium: Math.round(callPremium),
+      putPremium: Math.round(putPremium),
+      netFlow: Math.round(callPremium + putPremium),
+      flowDirection: (callPremium + putPremium) > 0 ? 'BULLISH' : 'BEARISH',
+      pcVolumeRatio: callVolume > 0 ? (putVolume / callVolume).toFixed(2) : 'N/A',
+      largeBlocks: largeBlocks.slice(0, 20), // top 20 blocks
+      topStrikes,
+    };
+
+    _dataCache.set(cacheKey, { data: result, ts: Date.now() });
+    console.log(`[Databento] ${ticker} order flow: ${trades.length} trades, net ${result.flowDirection} ($${Math.abs(result.netFlow).toLocaleString()})`);
+    return result;
+  }
+
+  /**
+   * Format order flow data as a summary string for AI prompts.
+   */
+  formatOrderFlow(flow) {
+    if (!flow || flow.tradeCount === 0) return '';
+
+    const fmtK = (v) => {
+      const a = Math.abs(v);
+      const s = v < 0 ? '-' : '+';
+      return a >= 1e6 ? `${s}$${(a/1e6).toFixed(1)}M` : a >= 1e3 ? `${s}$${(a/1e3).toFixed(0)}K` : `${s}$${a}`;
+    };
+
+    const lines = [
+      `=== OPTIONS ORDER FLOW (Databento OPRA — last ${flow.lookbackMinutes}min) ===`,
+      `${flow.tradeCount} trades | Net flow: ${fmtK(flow.netFlow)} → ${flow.flowDirection}`,
+      `Call premium: ${fmtK(flow.callPremium)} (${flow.callVolume} contracts)`,
+      `Put premium: ${fmtK(flow.putPremium)} (${flow.putVolume} contracts)`,
+      `P/C volume ratio: ${flow.pcVolumeRatio}`,
+    ];
+
+    if (flow.largeBlocks.length > 0) {
+      lines.push(`Large blocks (>$50K): ${flow.largeBlocks.length}`);
+      for (const b of flow.largeBlocks.slice(0, 5)) {
+        lines.push(`  ${b.side.toUpperCase()} ${b.size}x $${b.strike} ${b.type} @ $${b.price.toFixed(2)} (${fmtK(b.premium)})`);
+      }
+    }
+
+    return lines.join('\n');
+  }
+
   // ── Status / Info ──────────────────────────────────────────────────
 
   getStatus() {
@@ -475,6 +634,7 @@ class DatabentoService {
         'Trade prints (nanosecond)',
         'Open interest',
         'Instrument definitions',
+        'Order flow analysis (large blocks, net premium)',
       ],
       greeks: 'via Tradier/ORATS (Databento provides raw data only)',
       defCacheSize: _defCache.size,

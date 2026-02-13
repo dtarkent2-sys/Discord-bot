@@ -65,6 +65,16 @@ try {
   console.warn(`[PriceFetcher] AInvest client failed to load: ${err.message}`);
 }
 
+// Tradier client (used alongside Databento — provides real-time equity quotes)
+let tradierClient;
+try {
+  tradierClient = require('../services/tradier');
+  console.log(`[PriceFetcher] Tradier client loaded OK (enabled=${tradierClient.enabled})`);
+} catch (err) {
+  tradierClient = null;
+  console.warn(`[PriceFetcher] Tradier client failed to load: ${err.message}`);
+}
+
 // ── Cache: ticker → { data, fetchedAt } ────────────────────────────────
 const cache = new Map();
 const CACHE_TTL_MS = 60 * 1000; // 60 seconds
@@ -225,8 +235,44 @@ async function _tryAInvest(ticker) {
 }
 
 /**
+ * Try fetching a quote via Tradier (real-time, used with Databento).
+ * @returns {object|null} Normalized price data or null on failure.
+ */
+async function _tryTradier(ticker) {
+  if (!tradierClient || !tradierClient.enabled) return null;
+
+  // Tradier only supports stocks/ETFs — skip crypto tickers
+  if (ticker.includes('-') || /^[A-Z]{3,5}USD$/.test(ticker)) return null;
+
+  try {
+    const q = await tradierClient.getQuote(ticker);
+    if (!q || q.price == null) return null;
+
+    return {
+      ticker,
+      symbol: ticker,
+      price: q.price,
+      change: q.change ?? null,
+      changePercent: q.changePct ?? null,
+      volume: q.volume ?? null,
+      marketCap: null,
+      dayHigh: null,
+      dayLow: null,
+      previousClose: q.prevClose ?? null,
+      fiftyTwoWeekHigh: null,
+      fiftyTwoWeekLow: null,
+      lastUpdated: new Date().toISOString(),
+      source: 'tradier',
+    };
+  } catch (err) {
+    console.warn(`[PriceFetcher] Tradier failed for ${ticker}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Fetch current price data for a ticker.
- * Priority: AInvest → FMP → Alpaca → yahoo-finance2 → stale cache.
+ * Priority: Tradier → AInvest → FMP → Alpaca → yahoo-finance2 → stale cache.
  * @param {string} ticker — e.g. "TSLA", "AAPL", "BTC-USD", "ETH-USD"
  * @returns {{ ticker, price, changePercent, change, volume, marketCap, lastUpdated, source }} or { ticker, error, message }
  */
@@ -247,8 +293,13 @@ async function getCurrentPrice(ticker) {
 
   recordCall();
 
-  // PRIORITY: AInvest (paid API, most reliable, best data)
-  let data = await _tryAInvest(upper);
+  // PRIORITY: Tradier (real-time, used alongside Databento for institutional data)
+  let data = await _tryTradier(upper);
+
+  // AInvest (paid API, reliable, good data)
+  if (!data) {
+    data = await _tryAInvest(upper);
+  }
 
   // Fallback to FMP (API key, reliable from servers)
   if (!data) {
