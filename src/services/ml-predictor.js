@@ -1,618 +1,201 @@
 /**
- * ML Trading Predictor — Machine Learning Price Prediction
+ * ML Trading Predictor — MBP-10 Order Book Machine Learning Pipeline
  *
- * Uses Databento Historical OHLCV-1S (1-second bars) to build trading
- * signals and train linear regression models on CME Globex futures.
+ * Node.js bridge to the Python ML service (ml/predictor.py).
  *
- * Based on: https://databento.com/docs/examples/algo-trading/machine-learning
+ * Uses the official Databento Python client with scikit-learn to:
+ *   1. Fetch 10-level order book data (MBP-10 schema) via `databento` library
+ *   2. Extract features: skew, imbalance, depth pressure, spread, microprice
+ *   3. Train LinearRegression + HistGradientBoostingRegressor (scikit-learn)
+ *   4. Generate matplotlib PnL charts
+ *   5. Return JSON results to Discord bot
  *
- * Schema choice:
- *   MBP-10/TBBO produce massive responses via HTTP JSON encoding.
- *   OHLCV-1S gives pre-aggregated 1-second bars — ~23k records for a full
- *   session (6.5 hours) at ~5 MB total.  Fast, reliable, and still rich
- *   enough for meaningful ML signals.
+ * Based on: https://databento.com/blog/hft-sklearn-python
+ * Docs:     https://databento.com/docs/api-reference-historical/client
+ * Schema:   https://databento.com/docs/schemas-and-data-formats/mbp-10
  *
- * Features:
- *   - Signed tick: (close - open) direction and magnitude per bar
- *   - Volume surge: volume relative to trailing 60-bar average
- *   - Forward midprice return (markout in seconds/bars)
- *
- * Model: OLS linear regression with non-negative coefficient constraint
+ * Dependencies (Python): databento, scikit-learn, matplotlib, numpy, pandas
+ * Install: pip install -r ml/requirements.txt
  *
  * Supported products: ES, NQ, CL, GC, YM, RTY, ZB, ZN and other CME Globex futures
  * Dataset: GLBX.MDP3 (CME Globex MDP 3.0)
  */
 
+const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 const config = require('../config');
 
-const HIST_BASE = 'https://hist.databento.com';
-const API_VERSION = '0';
-const PRICE_SCALE = 1_000_000_000;
+const ML_SCRIPT = path.join(__dirname, '..', '..', 'ml', 'predictor.py');
 
-// Chart renderer (lazy-loaded)
-let chartRenderer = null;
-const FONT_FAMILY = 'Inter, "Segoe UI", Arial, sans-serif';
-
-try {
-  const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
-  const { registerFont } = require('canvas');
-
-  const FONT_DIR = path.join(__dirname, '..', '..', 'assets', 'fonts');
-  try {
-    registerFont(path.join(FONT_DIR, 'Inter-Regular.ttf'), { family: 'Inter' });
-    registerFont(path.join(FONT_DIR, 'Inter-Bold.ttf'), { family: 'Inter', weight: 'bold' });
-  } catch {
-    // Fonts may already be registered by gamma.js
-  }
-
-  chartRenderer = new ChartJSNodeCanvas({
-    width: 800,
-    height: 480,
-    backgroundColour: '#1e1e2e',
-    chartCallback: (ChartJS) => {
-      ChartJS.defaults.font.family = FONT_FAMILY;
-    },
-  });
-  console.log('[ML-Predictor] Chart renderer loaded');
-} catch (err) {
-  console.warn('[ML-Predictor] Canvas module failed to load — chart rendering disabled:', err.message);
-}
-
-// Result cache to avoid re-running expensive predictions
+// Result cache
 const _resultCache = new Map();
 const RESULT_CACHE_TTL = 5 * 60 * 1000; // 5 min
 
-// Product metadata
+// Product metadata (mirrors ml/predictor.py for validation before spawning Python)
 const PRODUCTS = {
-  ES:  { dataset: 'GLBX.MDP3', name: 'E-mini S&P 500' },
-  NQ:  { dataset: 'GLBX.MDP3', name: 'E-mini Nasdaq-100' },
-  YM:  { dataset: 'GLBX.MDP3', name: 'E-mini Dow' },
-  RTY: { dataset: 'GLBX.MDP3', name: 'E-mini Russell 2000' },
-  CL:  { dataset: 'GLBX.MDP3', name: 'Crude Oil' },
-  GC:  { dataset: 'GLBX.MDP3', name: 'Gold' },
-  SI:  { dataset: 'GLBX.MDP3', name: 'Silver' },
-  ZB:  { dataset: 'GLBX.MDP3', name: '30-Year Treasury Bond' },
-  ZN:  { dataset: 'GLBX.MDP3', name: '10-Year Treasury Note' },
-  ZF:  { dataset: 'GLBX.MDP3', name: '5-Year Treasury Note' },
-  HG:  { dataset: 'GLBX.MDP3', name: 'Copper' },
-  NG:  { dataset: 'GLBX.MDP3', name: 'Natural Gas' },
+  ES:  { name: 'E-mini S&P 500' },
+  NQ:  { name: 'E-mini Nasdaq-100' },
+  YM:  { name: 'E-mini Dow' },
+  RTY: { name: 'E-mini Russell 2000' },
+  CL:  { name: 'Crude Oil' },
+  GC:  { name: 'Gold' },
+  SI:  { name: 'Silver' },
+  ZB:  { name: '30-Year Treasury Bond' },
+  ZN:  { name: '10-Year Treasury Note' },
+  ZF:  { name: '5-Year Treasury Note' },
+  HG:  { name: 'Copper' },
+  NG:  { name: 'Natural Gas' },
 };
 
 class MLPredictor {
-  constructor() {
-    this._authHeader = null;
-  }
-
   get enabled() {
     return !!config.databentoApiKey;
   }
 
-  _getAuthHeader() {
-    if (!this._authHeader) {
-      const encoded = Buffer.from(config.databentoApiKey + ':').toString('base64');
-      this._authHeader = `Basic ${encoded}`;
-    }
-    return this._authHeader;
-  }
-
-  // ── Databento Historical API ─────────────────────────────────────────
-
   /**
-   * Fetch 1-second OHLCV bars from Databento Historical API.
-   *
-   * OHLCV-1S is pre-aggregated — one bar per second of trading activity.
-   * For a full ES session (6.5 hours) that's ~23k records at ~5 MB of JSON.
-   * This is orders of magnitude smaller than tick-level schemas (MBP-10,
-   * TBBO, trades) which can produce millions of records.
-   *
-   * @param {string} product - Futures product symbol
-   * @param {string} start - Start timestamp (ISO 8601)
-   * @param {string} end - End timestamp (ISO 8601)
-   * @param {number} [timeoutMs=120000] - HTTP timeout
-   */
-  async _fetchBars(product, start, end, timeoutMs = 120000) {
-    if (!this.enabled) throw new Error('Databento API key not configured');
-
-    const meta = PRODUCTS[product.toUpperCase()];
-    if (!meta) throw new Error(`Unknown product: ${product}. Supported: ${Object.keys(PRODUCTS).join(', ')}`);
-
-    start = _ensureNanoTimestamp(start);
-    end = _ensureNanoTimestamp(end);
-
-    const url = `${HIST_BASE}/v${API_VERSION}/timeseries.get_range`;
-    const params = {
-      dataset: meta.dataset,
-      schema: 'ohlcv-1s',
-      symbols: `${product.toUpperCase()}.v.0`,
-      stype_in: 'continuous',
-      encoding: 'json',
-      compression: 'none',
-      start,
-      end,
-    };
-
-    const body = new URLSearchParams(params);
-    console.log(`[ML-Predictor] Fetching OHLCV-1S for ${product} from ${start} to ${end}`);
-    const t0 = Date.now();
-
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': this._getAuthHeader(),
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: body.toString(),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-
-    console.log(`[ML-Predictor] Response status ${res.status} in ${Date.now() - t0}ms`);
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Databento API ${res.status}: ${text.slice(0, 500)}`);
-    }
-
-    // Stream line-by-line (even though OHLCV-1S is small, streaming is safer)
-    const records = [];
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          records.push(JSON.parse(trimmed));
-        } catch {
-          // Skip malformed lines
-        }
-      }
-    }
-
-    if (buffer.trim()) {
-      try { records.push(JSON.parse(buffer.trim())); } catch { /* skip */ }
-    }
-
-    console.log(`[ML-Predictor] Received ${records.length} OHLCV-1S bars for ${product} in ${Date.now() - t0}ms`);
-    return records;
-  }
-
-  // ── Feature Extraction ────────────────────────────────────────────────
-
-  /**
-   * Extract OHLCV values from a bar record.
-   * Handles Databento's fixed-point price encoding.
-   */
-  _getBar(rec) {
-    return {
-      open: (rec.open || 0) / PRICE_SCALE,
-      high: (rec.high || 0) / PRICE_SCALE,
-      low: (rec.low || 0) / PRICE_SCALE,
-      close: (rec.close || 0) / PRICE_SCALE,
-      volume: rec.volume || 0,
-    };
-  }
-
-  /**
-   * Process OHLCV-1S bars into ML features.
-   *
-   * Features computed per bar:
-   *   - signed_tick: (close - open) — directional bar movement
-   *   - volume_surge: volume / trailing_60bar_avg — relative activity
-   *
-   * Target: forward return = close(t + markout) - close(t)
-   *
-   * @param {object[]} records - Raw OHLCV-1S JSON records
-   * @param {number} markout - Forward bar count for return (default 300 = 5 min)
-   * @returns {object} { data, stats }
-   */
-  buildFeatures(records, markout = 300) {
-    // Parse bars and filter out zero-price/zero-volume bars
-    const bars = [];
-    for (const rec of records) {
-      const bar = this._getBar(rec);
-      if (bar.close <= 0 || bar.open <= 0 || bar.volume <= 0) continue;
-      bars.push(bar);
-    }
-
-    if (bars.length < markout * 2 + 60) {
-      throw new Error(`Insufficient bar data: ${bars.length} bars (need at least ${markout * 2 + 60} for markout=${markout})`);
-    }
-
-    // Compute rolling volume average (60-bar lookback)
-    const LOOKBACK = 60;
-    const rows = [];
-
-    for (let i = LOOKBACK; i < bars.length; i++) {
-      const bar = bars[i];
-
-      // Signed tick: bar direction and magnitude
-      const signedTick = bar.close - bar.open;
-
-      // Volume surge: current volume relative to trailing average
-      let volSum = 0;
-      for (let j = i - LOOKBACK; j < i; j++) {
-        volSum += bars[j].volume;
-      }
-      const avgVol = volSum / LOOKBACK;
-      const volumeSurge = avgVol > 0 ? Math.log(bar.volume / avgVol) : 0;
-
-      rows.push({
-        close: bar.close,
-        signedTick,
-        volumeSurge,
-      });
-    }
-
-    if (rows.length < markout * 2) {
-      throw new Error(`Insufficient valid bars after feature computation: ${rows.length} (need ${markout * 2})`);
-    }
-
-    // Calculate forward returns (markout bars ahead)
-    const data = [];
-    for (let i = 0; i < rows.length - markout; i++) {
-      data.push({
-        signedTick: rows[i].signedTick,
-        volumeSurge: rows[i].volumeSurge,
-        ret: rows[i + markout].close - rows[i].close,
-      });
-    }
-
-    return {
-      data,
-      stats: {
-        totalRecords: records.length,
-        validBars: bars.length,
-        validRows: data.length,
-        markout,
-        markoutMinutes: (markout / 60).toFixed(1),
-      },
-    };
-  }
-
-  // ── Linear Regression (OLS) ───────────────────────────────────────────
-
-  /**
-   * Fit OLS linear regression: y = X * beta (no intercept, non-negative coefficients).
-   */
-  fitLinearRegression(X, y) {
-    const n = X.length;
-    const p = X[0].length;
-
-    const XtX = Array.from({ length: p }, () => new Array(p).fill(0));
-    for (let i = 0; i < n; i++) {
-      for (let j = 0; j < p; j++) {
-        for (let k = 0; k < p; k++) {
-          XtX[j][k] += X[i][j] * X[i][k];
-        }
-      }
-    }
-
-    const Xty = new Array(p).fill(0);
-    for (let i = 0; i < n; i++) {
-      for (let j = 0; j < p; j++) {
-        Xty[j] += X[i][j] * y[i];
-      }
-    }
-
-    let beta;
-    if (p === 1) {
-      beta = [XtX[0][0] > 0 ? Xty[0] / XtX[0][0] : 0];
-    } else if (p === 2) {
-      const det = XtX[0][0] * XtX[1][1] - XtX[0][1] * XtX[1][0];
-      if (Math.abs(det) < 1e-12) {
-        beta = [0, 0];
-      } else {
-        beta = [
-          (XtX[1][1] * Xty[0] - XtX[0][1] * Xty[1]) / det,
-          (XtX[0][0] * Xty[1] - XtX[1][0] * Xty[0]) / det,
-        ];
-      }
-    } else {
-      beta = this._solveGaussian(XtX, Xty);
-    }
-
-    return beta.map(b => Math.max(0, b));
-  }
-
-  _solveGaussian(A, b) {
-    const n = A.length;
-    const aug = A.map((row, i) => [...row, b[i]]);
-    for (let col = 0; col < n; col++) {
-      let maxRow = col;
-      for (let row = col + 1; row < n; row++) {
-        if (Math.abs(aug[row][col]) > Math.abs(aug[maxRow][col])) maxRow = row;
-      }
-      [aug[col], aug[maxRow]] = [aug[maxRow], aug[col]];
-      if (Math.abs(aug[col][col]) < 1e-12) continue;
-      for (let row = col + 1; row < n; row++) {
-        const factor = aug[row][col] / aug[col][col];
-        for (let j = col; j <= n; j++) aug[row][j] -= factor * aug[col][j];
-      }
-    }
-    const x = new Array(n).fill(0);
-    for (let i = n - 1; i >= 0; i--) {
-      if (Math.abs(aug[i][i]) < 1e-12) continue;
-      x[i] = aug[i][n];
-      for (let j = i + 1; j < n; j++) x[i] -= aug[i][j] * x[j];
-      x[i] /= aug[i][i];
-    }
-    return x;
-  }
-
-  predict(X, beta) {
-    return X.map(row => row.reduce((sum, x, j) => sum + x * beta[j], 0));
-  }
-
-  // ── Correlation Matrix ────────────────────────────────────────────────
-
-  correlationMatrix(data, columns) {
-    const n = data.length;
-    const vals = columns.map(col => data.map(d => d[col]));
-    const means = vals.map(v => v.reduce((s, x) => s + x, 0) / n);
-    const stds = vals.map((v, i) => {
-      const m = means[i];
-      return Math.sqrt(v.reduce((s, x) => s + (x - m) ** 2, 0) / n);
-    });
-    const corr = Array.from({ length: columns.length }, () => new Array(columns.length).fill(0));
-    for (let i = 0; i < columns.length; i++) {
-      for (let j = 0; j < columns.length; j++) {
-        if (stds[i] === 0 || stds[j] === 0) { corr[i][j] = 0; continue; }
-        let cov = 0;
-        for (let k = 0; k < n; k++) cov += (vals[i][k] - means[i]) * (vals[j][k] - means[j]);
-        corr[i][j] = cov / (n * stds[i] * stds[j]);
-      }
-    }
-    return { columns, matrix: corr };
-  }
-
-  // ── Cumulative Markout PnL ────────────────────────────────────────────
-
-  getCumulativeMarkoutPnL(predictions, actualReturns) {
-    const pairs = predictions.map((pred, i) => ({
-      pred,
-      ret: pred < 0 ? -actualReturns[i] : actualReturns[i],
-    }));
-    pairs.sort((a, b) => a.pred - b.pred);
-    let cumSum = 0;
-    return pairs.map(p => { cumSum += p.ret; return cumSum; });
-  }
-
-  // ── Main Prediction Pipeline ──────────────────────────────────────────
-
-  /**
-   * Run the full ML prediction pipeline for a futures product.
+   * Run the full ML prediction pipeline via Python subprocess.
    *
    * @param {string} product - Futures product (e.g. 'ES', 'NQ')
    * @param {object} [options]
-   * @param {string} [options.start] - Start time ISO 8601
-   * @param {string} [options.end] - End time ISO 8601
-   * @param {number} [options.markout=300] - Forward bar count for returns (1 bar = 1 sec; 300 = 5 min)
+   * @param {string} [options.start] - Start time
+   * @param {string} [options.end] - End time
+   * @param {string} [options.date] - Trading date (YYYY-MM-DD)
+   * @param {number} [options.markout=500] - Forward trade count for returns
    * @param {number} [options.trainSplit=0.66] - In-sample fraction
-   * @returns {Promise<object>} Full prediction results
+   * @param {string} [options.model='both'] - Model type: 'linear', 'gradient_boost', or 'both'
+   * @returns {Promise<object>} Full prediction results from Python
    */
   async runPrediction(product, options = {}) {
     product = product.toUpperCase();
     const meta = PRODUCTS[product];
     if (!meta) throw new Error(`Unknown product: ${product}. Supported: ${Object.keys(PRODUCTS).join(', ')}`);
+    if (!this.enabled) throw new Error('Databento API key not configured (DATABENTO_API_KEY)');
 
-    const markout = options.markout || 300; // 300 bars = 5 minutes
-    const trainSplit = options.trainSplit || 0.66;
+    const markout = options.markout || 500;
+    const model = options.model || 'both';
 
-    // Default: full regular-hours session on last trading day
-    let { start, end } = options;
-    if (!start || !end) {
-      const d = _lastTradingDay();
-      start = `${d}T14:30:00.000000000Z`;  // 9:30 AM ET
-      end = `${d}T21:00:00.000000000Z`;    // 4:00 PM ET
-    }
+    // Default: last trading day regular hours
+    let start = options.start;
+    let end = options.end;
+    const date = options.date;
 
     // Check cache
-    const cacheKey = `${product}_${start}_${end}_${markout}`;
+    const cacheKey = `${product}_${date || start}_${end}_${markout}_${model}`;
     const cached = _resultCache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL) return cached.data;
-
-    // Step 1: Fetch OHLCV-1S bars
-    const records = await this._fetchBars(product, start, end);
-
-    // Step 2: Build features
-    const { data, stats: featureStats } = this.buildFeatures(records, markout);
-
-    // Step 3: Train/test split
-    let splitIdx = Math.floor(trainSplit * data.length);
-    splitIdx -= splitIdx % 100;
-    const trainData = data.slice(0, splitIdx);
-    const testData = data.slice(splitIdx);
-
-    if (trainData.length < 100 || testData.length < 100) {
-      throw new Error(`Insufficient data for train/test split: ${trainData.length} train, ${testData.length} test`);
+    if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL) {
+      console.log(`[ML-Predictor] Cache hit for ${cacheKey}`);
+      return cached.data;
     }
 
-    // Step 4: Correlation analysis (in-sample)
-    const corr = this.correlationMatrix(trainData, ['signedTick', 'volumeSurge', 'ret']);
+    // Build Python CLI args
+    const args = [ML_SCRIPT, '--product', product, '--markout', String(markout), '--model', model];
 
-    // Step 5: Train models
-    const trainY = trainData.map(d => d.ret);
-    const testY = testData.map(d => d.ret);
+    if (date) {
+      args.push('--date', date);
+    } else if (start && end) {
+      args.push('--start', start, '--end', end);
+    }
+    // If neither date nor start/end, Python will default to last trading day
 
-    // Model 1: Signed tick only (price momentum)
-    const trainX_tick = trainData.map(d => [d.signedTick]);
-    const testX_tick = testData.map(d => [d.signedTick]);
-    const beta_tick = this.fitLinearRegression(trainX_tick, trainY);
-    const pred_tick = this.predict(testX_tick, beta_tick);
+    args.push('--train-split', String(options.trainSplit || 0.66));
 
-    // Model 2: Volume surge only
-    const trainX_vol = trainData.map(d => [d.volumeSurge]);
-    const testX_vol = testData.map(d => [d.volumeSurge]);
-    const beta_vol = this.fitLinearRegression(trainX_vol, trainY);
-    const pred_vol = this.predict(testX_vol, beta_vol);
+    console.log(`[ML-Predictor] Spawning Python ML pipeline for ${product} (markout=${markout}, model=${model})`);
+    const t0 = Date.now();
 
-    // Model 3: Combined (tick + volume)
-    const trainX_combo = trainData.map(d => [d.signedTick, d.volumeSurge]);
-    const testX_combo = testData.map(d => [d.signedTick, d.volumeSurge]);
-    const beta_combo = this.fitLinearRegression(trainX_combo, trainY);
-    const pred_combo = this.predict(testX_combo, beta_combo);
+    const result = await this._spawnPython(args);
+    const elapsed = Date.now() - t0;
+    console.log(`[ML-Predictor] Python pipeline completed in ${(elapsed / 1000).toFixed(1)}s`);
 
-    // Step 6: Cumulative markout PnL
-    const pnl_tick = this.getCumulativeMarkoutPnL(pred_tick, testY);
-    const pnl_vol = this.getCumulativeMarkoutPnL(pred_vol, testY);
-    const pnl_combo = this.getCumulativeMarkoutPnL(pred_combo, testY);
+    if (result.error) {
+      throw new Error(result.error);
+    }
 
-    // Step 7: Out-of-sample correlations
-    const oosCorr_tick = _pearson(pred_tick, testY);
-    const oosCorr_vol = _pearson(pred_vol, testY);
-    const oosCorr_combo = _pearson(pred_combo, testY);
-
-    const result = {
-      product,
-      productName: meta.name,
-      schema: 'ohlcv-1s',
-      start,
-      end,
-      markout,
-      trainSplit,
-      featureStats,
-      trainSize: trainData.length,
-      testSize: testData.length,
-      correlation: corr,
-      models: {
-        signedTick: {
-          name: 'Signed Tick (momentum)',
-          coefficients: { signedTick: beta_tick[0] },
-          oosCorrelation: oosCorr_tick,
-          finalPnL: pnl_tick[pnl_tick.length - 1],
-        },
-        volumeSurge: {
-          name: 'Volume Surge',
-          coefficients: { volumeSurge: beta_vol[0] },
-          oosCorrelation: oosCorr_vol,
-          finalPnL: pnl_vol[pnl_vol.length - 1],
-        },
-        combined: {
-          name: 'Combined (Tick + Volume)',
-          coefficients: { signedTick: beta_combo[0], volumeSurge: beta_combo[1] },
-          oosCorrelation: oosCorr_combo,
-          finalPnL: pnl_combo[pnl_combo.length - 1],
-        },
-      },
-      pnlCurves: { signedTick: pnl_tick, volumeSurge: pnl_vol, combined: pnl_combo },
-    };
-
+    // Cache result
     _resultCache.set(cacheKey, { data: result, ts: Date.now() });
     return result;
   }
 
-  // ── Chart Generation ──────────────────────────────────────────────────
+  /**
+   * Spawn Python process and capture JSON output.
+   */
+  _spawnPython(args) {
+    return new Promise((resolve, reject) => {
+      const env = { ...process.env, DATABENTO_API_KEY: config.databentoApiKey };
 
-  async renderPnLChart(result) {
-    if (!chartRenderer) throw new Error('Chart renderer not available');
+      const proc = spawn('python3', args, {
+        env,
+        cwd: path.join(__dirname, '..', '..'),
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 300_000, // 5 min max
+      });
 
-    const { pnlCurves, product, productName, testSize } = result;
-    const maxPoints = 500;
-    const step = Math.max(1, Math.floor(testSize / maxPoints));
+      let stdout = '';
+      let stderr = '';
 
-    const labels = [];
-    const tickData = [];
-    const volData = [];
-    const comboData = [];
+      proc.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+      proc.stderr.on('data', (chunk) => {
+        const line = chunk.toString();
+        stderr += line;
+        // Forward Python logs to Node console
+        if (line.trim()) console.log(line.trimEnd());
+      });
 
-    for (let i = 0; i < testSize; i += step) {
-      labels.push(Math.round((i / testSize) * 100));
-      tickData.push(pnlCurves.signedTick[i]);
-      volData.push(pnlCurves.volumeSurge[i]);
-      comboData.push(pnlCurves.combined[i]);
+      proc.on('error', (err) => {
+        reject(new Error(`Failed to spawn Python: ${err.message}. Ensure python3 and ml/requirements.txt dependencies are installed.`));
+      });
+
+      proc.on('close', (code) => {
+        if (code !== 0 && !stdout.trim()) {
+          const errMsg = stderr.trim().split('\n').slice(-3).join(' ') || `Python exited with code ${code}`;
+          reject(new Error(errMsg));
+          return;
+        }
+
+        try {
+          const result = JSON.parse(stdout.trim());
+          resolve(result);
+        } catch (parseErr) {
+          reject(new Error(`Failed to parse Python output: ${parseErr.message}\nstdout: ${stdout.slice(0, 500)}`));
+        }
+      });
+    });
+  }
+
+  /**
+   * Get the chart image buffer from the path returned by Python.
+   * @param {object} result - Result from runPrediction
+   * @returns {Promise<Buffer>} PNG image buffer
+   */
+  async getChartBuffer(result) {
+    if (!result.chart_path) throw new Error('No chart generated');
+    try {
+      const buf = fs.readFileSync(result.chart_path);
+      // Clean up temp file
+      fs.unlink(result.chart_path, () => {});
+      return buf;
+    } catch (err) {
+      throw new Error(`Failed to read chart: ${err.message}`);
     }
-
-    const chartConfig = {
-      type: 'line',
-      data: {
-        labels,
-        datasets: [
-          {
-            label: 'Signed Tick (momentum)',
-            data: tickData,
-            borderColor: 'rgba(59, 130, 246, 1)',
-            borderWidth: 2,
-            pointRadius: 0,
-            fill: false,
-          },
-          {
-            label: 'Volume Surge',
-            data: volData,
-            borderColor: 'rgba(250, 204, 21, 1)',
-            borderWidth: 2,
-            pointRadius: 0,
-            fill: false,
-          },
-          {
-            label: 'Combined',
-            data: comboData,
-            borderColor: 'rgba(34, 197, 94, 1)',
-            borderWidth: 2.5,
-            pointRadius: 0,
-            fill: false,
-          },
-        ],
-      },
-      options: {
-        responsive: false,
-        plugins: {
-          title: {
-            display: true,
-            text: `${product} (${productName}) — ML Forecast: Momentum vs. Volume`,
-            color: '#e0e0e0',
-            font: { family: FONT_FAMILY, size: 15, weight: 'bold' },
-          },
-          legend: {
-            display: true,
-            position: 'top',
-            labels: { color: '#c0c0c0', font: { family: FONT_FAMILY, size: 12 }, usePointStyle: true, pointStyle: 'line' },
-          },
-          subtitle: {
-            display: true,
-            text: `Out-of-sample cumulative markout return (${result.featureStats.markoutMinutes}min forward)`,
-            color: '#888',
-            font: { family: FONT_FAMILY, size: 11 },
-          },
-        },
-        scales: {
-          x: {
-            title: { display: true, text: 'Predictor value (percentile)', color: '#a0a0a0', font: { family: FONT_FAMILY } },
-            ticks: { color: '#a0a0a0', font: { family: FONT_FAMILY }, maxTicksLimit: 10 },
-            grid: { color: 'rgba(255,255,255,0.05)' },
-          },
-          y: {
-            title: { display: true, text: 'Cumulative return (ticks)', color: '#a0a0a0', font: { family: FONT_FAMILY } },
-            ticks: { color: '#a0a0a0', font: { family: FONT_FAMILY }, callback: (v) => v.toFixed(2) },
-            grid: { color: 'rgba(255,255,255,0.1)' },
-          },
-        },
-      },
-    };
-
-    return chartRenderer.renderToBuffer(chartConfig);
   }
 
   // ── Discord Formatting ────────────────────────────────────────────────
 
-  formatCorrelationMatrix(corr) {
-    const { columns, matrix } = corr;
-    const colWidth = 14;
+  formatCorrelationMatrix(result) {
+    const { correlation, correlation_columns: columns } = result;
+    if (!correlation || !columns) return '*(correlation data unavailable)*';
+
+    const colWidth = 16;
     let out = '```\n';
-    out += ''.padEnd(colWidth) + columns.map(c => c.padStart(colWidth)).join('') + '\n';
+    out += ''.padEnd(colWidth) + columns.map(c => c.slice(0, 14).padStart(colWidth)).join('') + '\n';
+
     for (let i = 0; i < columns.length; i++) {
-      let row = columns[i].padEnd(colWidth);
+      let row = columns[i].slice(0, 14).padEnd(colWidth);
       for (let j = 0; j < columns.length; j++) {
-        row += (j >= i ? matrix[i][j].toFixed(6) : '').padStart(colWidth);
+        const key = `${columns[i]}__${columns[j]}`;
+        const altKey = `${columns[j]}__${columns[i]}`;
+        const val = correlation[key] ?? correlation[altKey] ?? '';
+        row += (j >= i && val !== '' ? Number(val).toFixed(4) : '').padStart(colWidth);
       }
       out += row + '\n';
     }
@@ -621,32 +204,44 @@ class MLPredictor {
   }
 
   formatResults(result) {
-    const { product, productName, start, end, featureStats, trainSize, testSize, models, correlation } = result;
+    const { product, product_name, start, end, total_raw_records, total_trade_samples,
+            train_size, test_size, markout, models, best_model, best_model_name, best_pnl } = result;
 
-    const startDate = start.replace(/T.*/, '');
+    const startDate = (start || '').replace(/T.*/, '');
     const lines = [
-      `**ML Price Predictor — ${product} (${productName})**`,
+      `**ML Order Book Predictor — ${product} (${product_name})**`,
       '',
-      `**Data:** ${featureStats.validBars.toLocaleString()} bars (1-sec OHLCV) | Date: ${startDate}`,
-      `**Markout:** ${featureStats.markoutMinutes} min forward | **Split:** ${trainSize.toLocaleString()} train / ${testSize.toLocaleString()} test`,
+      `**Schema:** MBP-10 (10-level order book) | **Date:** ${startDate}`,
+      `**Data:** ${(total_raw_records || 0).toLocaleString()} raw records -> ${(total_trade_samples || 0).toLocaleString()} trade samples`,
+      `**Markout:** ${markout} trades forward | **Split:** ${(train_size || 0).toLocaleString()} train / ${(test_size || 0).toLocaleString()} test`,
+      '',
+      `**Features:** skew, imbalance, depth_pressure, spread, micro_dev`,
       '',
       `**In-Sample Correlation Matrix:**`,
-      this.formatCorrelationMatrix(correlation),
+      this.formatCorrelationMatrix(result),
       '',
       '**Out-of-Sample Model Performance:**',
     ];
 
-    for (const [, model] of Object.entries(models)) {
-      const coeffStr = Object.entries(model.coefficients)
-        .map(([k, v]) => `${k}=${v.toFixed(6)}`)
-        .join(', ');
-      const pnlSign = model.finalPnL >= 0 ? '+' : '';
-      lines.push(`  **${model.name}** | corr=${model.oosCorrelation.toFixed(4)} | PnL=${pnlSign}${model.finalPnL.toFixed(2)} | coeff: ${coeffStr}`);
+    if (models) {
+      for (const [key, model] of Object.entries(models)) {
+        const coeffStr = model.coefficients
+          ? Object.entries(model.coefficients).map(([k, v]) => `${k}=${Number(v).toFixed(4)}`).join(', ')
+          : '';
+        const pnlSign = model.final_pnl >= 0 ? '+' : '';
+        const r2 = model.r_squared != null ? ` | R²=${Number(model.r_squared).toFixed(4)}` : '';
+        const type = model.type === 'gradient_boost' ? ' [GBT]' : ' [LR]';
+        lines.push(`  **${model.name}**${type}`);
+        lines.push(`    corr=${Number(model.oos_correlation).toFixed(4)}${r2} | PnL=${pnlSign}${Number(model.final_pnl).toFixed(2)}`);
+        if (coeffStr) lines.push(`    ${model.type === 'gradient_boost' ? 'importance' : 'coeff'}: ${coeffStr}`);
+      }
     }
 
-    const best = Object.entries(models).reduce((a, b) => b[1].finalPnL > a[1].finalPnL ? b : a);
     lines.push('');
-    lines.push(`**Best model:** ${best[1].name} (${best[1].finalPnL >= 0 ? '+' : ''}${best[1].finalPnL.toFixed(2)} ticks cumulative return)`);
+    if (best_model_name) {
+      const sign = best_pnl >= 0 ? '+' : '';
+      lines.push(`**Best model:** ${best_model_name} (${sign}${Number(best_pnl).toFixed(2)} ticks cumulative return)`);
+    }
 
     return lines.join('\n');
   }
@@ -658,49 +253,12 @@ class MLPredictor {
   getStatus() {
     return {
       enabled: this.enabled,
-      chartRendererReady: !!chartRenderer,
+      schema: 'mbp-10',
+      engine: 'python (databento + scikit-learn + matplotlib)',
       supportedProducts: Object.keys(PRODUCTS),
       cacheSize: _resultCache.size,
     };
   }
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-function _lastTradingDay() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  const day = d.getDay();
-  if (day === 0) d.setDate(d.getDate() - 2);
-  if (day === 6) d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0, 10);
-}
-
-function _ensureNanoTimestamp(ts) {
-  if (!ts) return ts;
-  if (/\.\d{9}Z$/.test(ts)) return ts;
-  if (/\.\d+Z?$/.test(ts)) {
-    const base = ts.replace(/Z$/, '').replace(/\.(\d+)$/, (_, frac) => '.' + frac.padEnd(9, '0'));
-    return base + 'Z';
-  }
-  return ts.replace(/Z$/, '') + '.000000000Z';
-}
-
-function _pearson(a, b) {
-  const n = a.length;
-  if (n === 0) return 0;
-  const meanA = a.reduce((s, x) => s + x, 0) / n;
-  const meanB = b.reduce((s, x) => s + x, 0) / n;
-  let cov = 0, varA = 0, varB = 0;
-  for (let i = 0; i < n; i++) {
-    const da = a[i] - meanA;
-    const db = b[i] - meanB;
-    cov += da * db;
-    varA += da * da;
-    varB += db * db;
-  }
-  const denom = Math.sqrt(varA * varB);
-  return denom > 0 ? cov / denom : 0;
 }
 
 module.exports = new MLPredictor();

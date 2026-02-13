@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "build": "pip install --break-system-packages -r ml/requirements.txt 2>/dev/null || pip install -r ml/requirements.txt 2>/dev/null || echo 'Python ML deps: install manually with pip install -r ml/requirements.txt'",
     "dev": "node --watch index.js",
     "test": "node --test tests/",
     "backtest": "node src/backtest/run-backtest.js"

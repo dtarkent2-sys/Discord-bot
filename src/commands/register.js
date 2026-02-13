@@ -453,7 +453,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('mlpredict')
-    .setDescription('ML Price Predictor — train momentum & volume models on futures OHLCV data')
+    .setDescription('ML Order Book Predictor — MBP-10 depth + scikit-learn on CME futures')
     .addStringOption(opt =>
       opt.setName('product')
         .setDescription('Futures product to analyze')
@@ -471,15 +471,25 @@ const commands = [
     )
     .addIntegerOption(opt =>
       opt.setName('markout')
-        .setDescription('Forward lookback in seconds/bars (default: 300 = 5 min)')
+        .setDescription('Forward trade count for returns (default: 500 trades)')
         .setRequired(false)
-        .setMinValue(60)
-        .setMaxValue(3600)
+        .setMinValue(100)
+        .setMaxValue(5000)
     )
     .addStringOption(opt =>
       opt.setName('date')
         .setDescription('Trading date to analyze (YYYY-MM-DD, default: last trading day)')
         .setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('model')
+        .setDescription('Model type to train (default: both)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'Both — Linear Regression + Gradient Boost', value: 'both' },
+          { name: 'Linear — LinearRegression only (fast)', value: 'linear' },
+          { name: 'Gradient Boost — HistGradientBoosting only', value: 'gradient_boost' },
+        )
     ),
 ];
 
