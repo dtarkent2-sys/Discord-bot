@@ -490,9 +490,16 @@ async function fetchOptionsContext(ticker = 'SPY') {
       `Contracts: ${contracts.length} (0DTE)`,
     ];
 
-    // Add order flow data if available (large block detection)
+    // Add order flow data if available (prefer live stream, fall back to historical API)
     try {
-      const flow = await databento.getOrderFlow(ticker, 15);
+      let flow = null;
+      try {
+        const live = require('./databento-live');
+        flow = live.getFlow(ticker);
+      } catch { /* live not available */ }
+      if (!flow || flow.tradeCount === 0) {
+        flow = await databento.getOrderFlow(ticker, 15);
+      }
       if (flow && flow.tradeCount > 0) {
         ctxLines.push(`--- Order Flow (last 15min) ---`);
         ctxLines.push(`${flow.tradeCount} trades | Net: ${fmtGEX(flow.netFlow)} → ${flow.flowDirection}`);

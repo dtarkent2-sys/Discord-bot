@@ -62,6 +62,7 @@ module.exports = {
 
   // Databento OPRA (institutional-grade real-time options data — top-tier source)
   databentoApiKey: process.env.DATABENTO_API_KEY || '',
+  databentoLive: (process.env.DATABENTO_LIVE || '').toLowerCase() === 'true', // Enable live TCP streaming ($199/mo OPRA subscription required)
 
   // Tradier API (options chain with ORATS real greeks — used for greeks alongside Databento)
   tradierApiKey: process.env.TRADIER_API_KEY || '',
