@@ -52,7 +52,7 @@ const DEFAULT_CONFIG = {
 
   // AI overlay limits
   aiMaxConvictionAdjust: 2,
-  aiMinConviction: 5,               // if AI reduces below this → NO_TRADE
+  aiMinConviction: 7,               // raised — quality over quantity, stop overtrading
 };
 
 // ── Correlated symbols set ───────────────────────────────────────────────

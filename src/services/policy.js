@@ -71,7 +71,7 @@ const DEFAULT_CONFIG = {
   options_max_positions: 3,             // max concurrent options positions
   options_scalp_take_profit_pct: 0.20,  // 20% profit target for scalps (quick in/out)
   options_scalp_stop_loss_pct: 0.10,    // 10% stop loss for scalps ("tight stops, 5-10% max on the premium")
-  options_min_conviction: 5,            // min AI conviction (1-10) to enter a trade
+  options_min_conviction: 7,            // min AI conviction (1-10) to enter — quality over quantity
   options_close_before_minutes: 30,     // close 0DTE positions X min before market close
   options_min_delta: 0.15,              // min option delta for contract selection (widened for 0DTE)
   options_max_delta: 0.75,              // max option delta for contract selection (widened for late-day 0DTE)

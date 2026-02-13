@@ -61,7 +61,7 @@ const CORRELATED_GROUPS = [
 // Hard limits that dangerous mode CANNOT override
 const HARD_LIMITS = {
   maxTradesPerSymbolPerHour: 3,   // max 3 round trips per underlying per hour
-  maxTradesPerDay: 10,            // max 10 total options trades per day (user: "2-10 trades a day MAX")
+  maxTradesPerDay: 6,             // max 6 total options trades per day — quality over quantity
   maxCorrelatedPositions: 2,      // max 2 simultaneous positions in correlated underlyings
   consecutiveLossCooldownMin: 30, // 30 min pause after 2 consecutive losses ("stop trading after 2 losses in a row")
   consecutiveLossThreshold: 2,    // how many losses trigger the cooldown
@@ -213,7 +213,7 @@ class OptionsEngine {
     // "review losers within 24hrs. figure out if it was a bad read or bad timing"
     const tracked = [...this._activeTrades.values()].find(t => t.underlying === underlying);
     const journal = this._storage.get('tradeJournal', []);
-    journal.push({
+    const entry = {
       date: new Date().toISOString(),
       underlying,
       symbol: tracked?.symbol || underlying,
@@ -228,7 +228,67 @@ class OptionsEngine {
       exitReason: exitReason || 'unknown',
       pnl: Number(pnl.toFixed(2)),
       won,
-    });
+      // ── Technical context at entry (for "why it worked/didn't" analysis) ──
+      entryContext: tracked?.entryContext || null,
+    };
+
+    // ── Post-mortem: "why it worked" or "why it didn't" ──
+    if (tracked?.entryContext) {
+      const ctx = tracked.entryContext;
+      const postMortem = [];
+
+      if (!won) {
+        // Diagnose the loss
+        const directionWrong = (
+          (tracked.optionType === 'call' && ctx.momentum < -0.05) ||
+          (tracked.optionType === 'put' && ctx.momentum > 0.05)
+        );
+        if (directionWrong) {
+          postMortem.push(`BAD DIRECTION: entered ${tracked.optionType} while momentum was ${ctx.momentum > 0 ? 'bullish' : 'bearish'} (${ctx.momentum.toFixed(2)}%)`);
+        }
+
+        if (ctx.choppiness > 2.5) {
+          postMortem.push(`CHOPPY MARKET: choppiness ${ctx.choppiness.toFixed(1)} at entry — momentum scalps fail in chop`);
+        }
+
+        if (ctx.todayMoveSigma < 1.0) {
+          postMortem.push(`LOW VOLATILITY: only ${ctx.todayMoveSigma.toFixed(1)}σ move — not enough momentum for 0DTE`);
+        }
+
+        if (exitReason === 'scalp_bail_5min') {
+          postMortem.push('ENTRY TIMING: bailed in 5min — likely entered on a pullback/false breakout');
+        }
+
+        if (ctx.volumeTrend < 1.0) {
+          postMortem.push(`WEAK VOLUME: volume ${ctx.volumeTrend.toFixed(1)}x average — no confirmation`);
+        }
+
+        const vwapConflict = (tracked.optionType === 'call' && !ctx.priceAboveVWAP) ||
+                             (tracked.optionType === 'put' && ctx.priceAboveVWAP);
+        if (vwapConflict) {
+          postMortem.push(`VWAP CONFLICT: ${tracked.optionType} entry while price was ${ctx.priceAboveVWAP ? 'above' : 'below'} VWAP`);
+        }
+      } else {
+        // Analyze the win
+        const directionRight = (
+          (tracked.optionType === 'call' && ctx.momentum > 0.05) ||
+          (tracked.optionType === 'put' && ctx.momentum < -0.05)
+        );
+        if (directionRight) {
+          postMortem.push(`MOMENTUM ALIGNED: ${tracked.optionType} with ${ctx.momentum.toFixed(2)}% momentum`);
+        }
+        if (ctx.todayMoveSigma >= 1.5) {
+          postMortem.push(`STRONG MOVE DAY: ${ctx.todayMoveSigma.toFixed(1)}σ — good environment for scalps`);
+        }
+        if (ctx.choppiness < 1.5) {
+          postMortem.push(`CLEAN TREND: choppiness ${ctx.choppiness.toFixed(1)} — trending market`);
+        }
+      }
+
+      entry.postMortem = postMortem.length > 0 ? postMortem : ['No clear pattern identified'];
+    }
+
+    journal.push(entry);
     // Keep last 200 journal entries
     while (journal.length > 200) journal.shift();
     this._storage.set('tradeJournal', journal);
@@ -462,11 +522,18 @@ class OptionsEngine {
             if (this._postToChannel) {
               const emoji = pnl >= 0 ? '🟢' : '🔴';
               const parsed = alpaca._parseOccSymbol(exit.symbol);
+              // Get the latest journal entry for post-mortem
+              const latestJournal = this._storage.get('tradeJournal', []);
+              const lastEntry = latestJournal[latestJournal.length - 1];
+              const postMortemLine = (pnl < 0 && lastEntry?.postMortem?.length > 0)
+                ? `\n📋 **Post-mortem:** ${lastEntry.postMortem.join(' | ')}`
+                : '';
               await this._postToChannel(
                 `${emoji} **0DTE Exit: ${parsed.underlying} ${parsed.strike} ${parsed.type.toUpperCase()}**\n` +
                 `${exit.message}\n` +
                 `P/L: \`$${pnl.toFixed(2)}\` | Strategy: \`${strategy}\`\n` +
-                `_${alpaca.isPaper ? 'Paper' : 'LIVE'} | Autonomous exit_`
+                `_${alpaca.isPaper ? 'Paper' : 'LIVE'} | Autonomous exit_` +
+                postMortemLine
               );
             }
           } catch (err) {
@@ -588,7 +655,20 @@ class OptionsEngine {
       return null;
     }
 
-    // 2b. Volatility regime gate (thetagang-inspired)
+    // 2b. Theta decay timing gate
+    // 0DTE theta is non-linear — accelerates hard after 2pm.
+    // Entry at 9:45am vs 2pm is a completely different risk profile.
+    const thetaConvictionFloor = et.minutesToClose > 240 ? cfg.options_min_conviction       // before noon: normal
+      : et.minutesToClose > 120 ? cfg.options_min_conviction + 1  // noon-2pm: +1 conviction
+      : et.minutesToClose > 60  ? cfg.options_min_conviction + 2  // 2-3pm: +2 conviction (theta accelerating)
+      : 10;                                                        // last hour: effectively blocked
+    if (thetaConvictionFloor > 10) {
+      this._log('scan', `${underlying}: last hour — theta decay too brutal for new entries`);
+      this._markScanned(cooldownKey);
+      return null;
+    }
+
+    // 2c. Volatility regime gate (thetagang-inspired)
     // Skip flat days where 0DTE scalps get killed by theta decay
     if (intradayTech.todayMoveSigma < 0.5 && intradayTech.dailySigma > 0) {
       this._log('scan', `${underlying}: flat day — move ${intradayTech.todayMoveSigma.toFixed(2)}σ < 0.5σ threshold — skipping`);
@@ -664,12 +744,49 @@ class OptionsEngine {
       return null;
     }
 
-    this._log('scan', `${underlying}: AI says ${aiDecision.action} — conviction ${aiDecision.conviction}/10, strategy: ${aiDecision.strategy || directionSignals.strategy} — PROCEEDING TO EXECUTE`);
-
     // Map AI action to direction — bare 'BUY' falls back to the technical assessment
     const aiDirection = aiDecision.action === 'BUY_CALL' ? 'bullish'
       : aiDecision.action === 'BUY_PUT' ? 'bearish'
       : directionSignals.direction; // bare 'BUY' keeps technical direction
+
+    // ── HARD RULE: Conviction/direction alignment check ──
+    // "9/10 conviction calls on bearish momentum is a logic error"
+    // If AI direction contradicts strong momentum, CAP conviction or REJECT.
+    const momentumConflict = (
+      (aiDirection === 'bullish' && intradayTech.momentum < -0.10 && intradayTech.rsi > 55) ||
+      (aiDirection === 'bearish' && intradayTech.momentum > 0.10 && intradayTech.rsi < 45)
+    );
+    const gexConflict = (
+      (aiDirection === 'bullish' && gexRegime.label === 'Short Gamma' && intradayTech.momentum < -0.15) ||
+      (aiDirection === 'bearish' && gexRegime.label === 'Short Gamma' && intradayTech.momentum > 0.15)
+    );
+    const technicalConflict = aiDirection !== directionSignals.direction;
+
+    if (momentumConflict || gexConflict) {
+      if (aiDecision.conviction >= 7) {
+        this._log('scan', `${underlying}: DIRECTION CONFLICT — AI says ${aiDecision.action} (conviction ${aiDecision.conviction}) but momentum is ${intradayTech.momentum > 0 ? 'bullish' : 'bearish'} (${intradayTech.momentum.toFixed(2)}%), RSI=${intradayTech.rsi.toFixed(0)}. HIGH CONVICTION ON WRONG SIDE — REJECTING.`);
+        return null;
+      } else {
+        this._log('scan', `${underlying}: Direction conflict — AI ${aiDecision.action} vs momentum ${intradayTech.momentum.toFixed(2)}% — capping conviction at 5`);
+        aiDecision.conviction = Math.min(aiDecision.conviction, 5);
+      }
+    }
+    if (technicalConflict && aiDecision.conviction >= 8) {
+      this._log('scan', `${underlying}: AI direction ${aiDirection} conflicts with technical assessment ${directionSignals.direction} — capping conviction to 6`);
+      aiDecision.conviction = Math.min(aiDecision.conviction, 6);
+    }
+
+    // Re-check conviction after alignment caps (uses time-adjusted floor)
+    const effectiveMinConviction = Math.max(cfg.options_min_conviction, thetaConvictionFloor);
+    if (aiDecision.conviction < effectiveMinConviction) {
+      const reason = effectiveMinConviction > cfg.options_min_conviction
+        ? `conviction ${aiDecision.conviction}/10 below time-adjusted threshold ${effectiveMinConviction} (${et.minutesToClose} min to close, theta accelerating)`
+        : `conviction dropped to ${aiDecision.conviction}/10 after alignment check (min ${cfg.options_min_conviction})`;
+      this._log('scan', `${underlying}: ${reason} — skipping`);
+      return null;
+    }
+
+    this._log('scan', `${underlying}: AI says ${aiDecision.action} — conviction ${aiDecision.conviction}/10, strategy: ${aiDecision.strategy || directionSignals.strategy} — PROCEEDING TO EXECUTE`);
 
     return {
       underlying,
@@ -958,8 +1075,8 @@ class OptionsEngine {
 
   async _askOptionsAI(underlying, spot, tech, gexSummary, macroRegime, directionSignals, et) {
     const prompt = [
-      `You are a confident 0DTE options trader who TAKES TRADES when the setup is there. Evaluate this intraday setup and decide: BUY_CALL, BUY_PUT, or SKIP.`,
-      `You WANT to trade. Your job is to find the trade, not to find reasons to skip. If the directional signals agree and risk/reward is defined, TAKE THE TRADE. Only SKIP when signals genuinely conflict or there is no clear edge.`,
+      `You are a disciplined 0DTE options scalper. Evaluate this intraday setup and decide: BUY_CALL, BUY_PUT, or SKIP.`,
+      `QUALITY OVER QUANTITY. Only take A+ setups where direction, momentum, and technicals ALIGN. Your conviction score MUST reflect reality — if momentum is bearish, DO NOT give high conviction to a call. If you aren't sure, SKIP. Overtrading kills accounts.`,
       ``,
       `═══ CONTEXT ═══`,
       `Ticker: ${underlying} | Spot: $${spot} | Time: ${et.hour}:${String(et.minute).padStart(2, '0')} ET (${et.minutesToClose} min to close)`,
@@ -1004,17 +1121,20 @@ class OptionsEngine {
       `Factors:`,
       ...directionSignals.reasons.map(r => `  - ${r}`),
       ``,
-      `═══ RULES ═══`,
-      `1. 0DTE theta decay is real — but that's why we trade MOMENTUM. If the move is happening NOW, get in.`,
-      `2. Use a real level for stop/target: GEX wall, VWAP, Bollinger band, support/resistance. Don't need perfection — just a defined risk.`,
-      `3. In Long Gamma: trade mean-reversion (buy dips, sell rips). In Short Gamma: trade trends.`,
-      `4. Don't fight the GEX regime. If short gamma and tanking, don't buy calls.`,
-      `5. Volume confirms — but absence of volume alone is NOT a reason to skip if other signals align.`,
-      `6. Last 45 min: tighter stops, quicker scalps. Last 15 min: probably skip.`,
-      `7. If pre-conviction is 5+ and signals agree, you should be giving conviction 6-8. Give 9-10 for perfect setups. Only give below 5 when signals genuinely CONFLICT.`,
-      `8. Multi-timeframe EMA alignment is a strong confirmation. If most timeframes agree, be MORE confident, not less.`,
-      `9. During an active gamma squeeze, ride the structural edge aggressively. During unwind, exit.`,
-      `10. YOU WANT TO TRADE. The system already filtered weak setups before asking you. If you're being asked, there's likely something here. Find the trade.`,
+      `═══ RECENT TRADE HISTORY (learn from this) ═══`,
+      ...this._buildJournalContext(underlying),
+      ``,
+      `═══ RULES (NON-NEGOTIABLE) ═══`,
+      `1. DIRECTION MUST MATCH MOMENTUM. If momentum is bearish, DO NOT call BUY_CALL with high conviction. If momentum is bullish, DO NOT call BUY_PUT with high conviction. This is the #1 rule. Violating this is a logic error.`,
+      `2. CONVICTION MUST REFLECT REALITY. 7-8 = good setup with confluence. 9-10 = PERFECT textbook setup (rare, maybe 1 in 20). Give 1-5 when signals conflict or are weak. Do NOT inflate conviction to force a trade.`,
+      `3. 0DTE theta decay is real. Only trade MOMENTUM — if the move is happening NOW, get in. But if you're guessing, SKIP.`,
+      `4. Use a real level for stop/target: GEX wall, VWAP, Bollinger, support/resistance. No defined risk = SKIP.`,
+      `5. Don't fight the GEX regime. Short gamma + tanking = don't buy calls. Long gamma + at resistance = don't buy calls.`,
+      `6. Volume confirms direction. Low volume + no momentum = SKIP.`,
+      `7. Late day (< 2hrs to close): theta accelerates hard. Only enter on STRONG moves with high conviction. Default is SKIP.`,
+      `8. LEARN FROM HISTORY: check the recent trade history above. If there's a pattern of losses (wrong direction, choppy entries), adjust your behavior. Don't repeat the same mistakes.`,
+      `9. During an active gamma squeeze, ride the edge. During unwind, exit.`,
+      `10. Quality over quantity. SKIP is the correct answer for most setups. Only trade when you have CLEAR edge with ALIGNED signals.`,
       ``,
       `Respond with ONLY valid JSON:`,
       `{"action": "BUY_CALL" | "BUY_PUT" | "SKIP", "conviction": 1-10, "strategy": "scalp", "target": "$X.XX", "stopLevel": "$X.XX", "reason": "1-2 sentences"}`,
@@ -1050,6 +1170,62 @@ class OptionsEngine {
       this._log('error', `AI decision error for ${underlying}: ${err.message}`);
       return null;
     }
+  }
+
+  // ── Journal Context for AI ─────────────────────────────────────────
+
+  /**
+   * Build recent trade journal context for the AI prompt.
+   * Shows last 5 trades so AI can learn from patterns.
+   */
+  _buildJournalContext(underlying) {
+    const journal = this._storage.get('tradeJournal', []);
+    if (journal.length === 0) return ['No recent trade history.'];
+
+    // Get last 5 trades (prefer same underlying, fall back to all)
+    const sameUnderlying = journal.filter(j => j.underlying === underlying).slice(-3);
+    const allRecent = journal.slice(-5);
+    const trades = sameUnderlying.length >= 2 ? sameUnderlying : allRecent;
+
+    const lines = [];
+
+    // Summary stats
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayTrades = journal.filter(j => j.date.startsWith(todayStr));
+    const todayWins = todayTrades.filter(j => j.won).length;
+    const todayLosses = todayTrades.length - todayWins;
+    const todayPnL = todayTrades.reduce((s, j) => s + j.pnl, 0);
+    if (todayTrades.length > 0) {
+      lines.push(`Today: ${todayTrades.length} trades (${todayWins}W/${todayLosses}L), net P&L: $${todayPnL.toFixed(0)}`);
+    }
+
+    // Recent loss patterns
+    const recentLosses = journal.filter(j => !j.won).slice(-5);
+    if (recentLosses.length >= 2) {
+      const patterns = [];
+      const directionWrong = recentLosses.filter(j =>
+        j.postMortem?.some(p => p.startsWith('BAD DIRECTION'))
+      ).length;
+      if (directionWrong >= 2) patterns.push(`${directionWrong} of last ${recentLosses.length} losses were WRONG DIRECTION`);
+
+      const choppyLosses = recentLosses.filter(j =>
+        j.postMortem?.some(p => p.startsWith('CHOPPY'))
+      ).length;
+      if (choppyLosses >= 2) patterns.push(`${choppyLosses} losses in CHOPPY markets`);
+
+      if (patterns.length > 0) {
+        lines.push(`LOSS PATTERNS: ${patterns.join('; ')}`);
+      }
+    }
+
+    // Individual trade entries
+    for (const t of trades) {
+      const emoji = t.won ? 'W' : 'L';
+      const pm = t.postMortem?.join('; ') || '';
+      lines.push(`[${emoji}] ${t.underlying} ${t.direction} conv=${t.conviction} pnl=$${t.pnl} hold=${t.holdMinutes}min — ${t.exitReason}${pm ? ' | ' + pm : ''}`);
+    }
+
+    return lines.length > 0 ? lines : ['No recent trade history.'];
   }
 
   // ── Contract Selection ────────────────────────────────────────────
@@ -1266,7 +1442,7 @@ class OptionsEngine {
         time_in_force: 'day',
       });
 
-      // Track the trade
+      // Track the trade (with full technical context for post-mortem)
       const trade = {
         symbol: contract.symbol,
         underlying: signal.underlying,
@@ -1279,6 +1455,19 @@ class OptionsEngine {
         conviction: signal.conviction,
         reason: signal.reason,
         orderId: order?.id,
+        // ── Technical snapshot at entry (for journal post-mortem) ──
+        entryContext: {
+          spot: signal.spot,
+          momentum: signal.technicals?.momentum || 0,
+          rsi: signal.technicals?.rsi || 0,
+          vwap: signal.technicals?.vwap || 0,
+          priceAboveVWAP: signal.technicals?.priceAboveVWAP || false,
+          choppiness: signal.technicals?.choppiness || 0,
+          todayMoveSigma: signal.technicals?.todayMoveSigma || 0,
+          gexRegime: signal.gex?.regime?.label || 'unknown',
+          volumeTrend: signal.technicals?.volumeTrend || 1,
+          macdHist: signal.technicals?.macd?.histogram || 0,
+        },
       };
       this._activeTrades.set(contract.symbol, trade);
       this._persistTrades();

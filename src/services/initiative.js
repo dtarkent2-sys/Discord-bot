@@ -50,7 +50,7 @@ const ACTION_COOLDOWNS = {
 const TUNING_BOUNDS = {
   options_scalp_take_profit_pct:  { min: 0.15, max: 0.60 },
   options_scalp_stop_loss_pct:    { min: 0.10, max: 0.40 },
-  options_min_conviction:         { min: 4, max: 8 },
+  options_min_conviction:         { min: 6, max: 9 },
   options_max_premium_per_trade:  { min: 200, max: 2000 },
   options_cooldown_minutes:       { min: 2, max: 15 },
   scan_interval_minutes:          { min: 2, max: 15 },
