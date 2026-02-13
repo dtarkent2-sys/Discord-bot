@@ -13,6 +13,7 @@
 
 const gamma = require('../services/gamma');
 const alpaca = require('../services/alpaca');
+const publicService = require('../services/public');
 const priceFetcher = require('../tools/price-fetcher');
 
 // Active SSE connections per ticker for cleanup
@@ -104,26 +105,57 @@ function registerGEXHeatmapRoutes(app) {
 // ── Data fetching ─────────────────────────────────────────────────────
 
 async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
+  // ── Primary: Public.com (real greeks) / Fallback: Yahoo (Black-Scholes) ──
+  const usePublic = publicService.enabled;
+  let source = 'Yahoo';
+
   // 1. Get available expirations
-  const availableExps = await gamma.fetchAvailableExpirations(ticker);
-  if (availableExps.length === 0) throw new Error(`No expirations for ${ticker}`);
-
-  const now = Date.now() / 1000;
-  const futureExps = availableExps.filter(e => e.epoch >= now - 86400);
-
-  // Pick target expirations
-  let targetExps;
-  if (requestedExps && requestedExps.length > 0) {
-    targetExps = availableExps.filter(e => requestedExps.includes(e.date));
-  } else {
-    targetExps = futureExps.slice(0, 6);
+  let allExpDates;
+  if (usePublic) {
+    try {
+      allExpDates = await publicService.getOptionExpirations(ticker);
+      source = 'Public.com';
+    } catch (err) {
+      console.warn(`[GEXHeatmap] Public.com expirations failed, falling back to Yahoo: ${err.message}`);
+      allExpDates = null;
+    }
+  }
+  // Yahoo fallback
+  let yahooExps = null;
+  if (!allExpDates) {
+    yahooExps = await gamma.fetchAvailableExpirations(ticker);
+    if (yahooExps.length === 0) throw new Error(`No expirations for ${ticker}`);
+    allExpDates = yahooExps.map(e => e.date);
+    source = 'Yahoo';
   }
 
-  if (targetExps.length === 0) throw new Error('No valid expirations found');
+  const today = new Date().toISOString().slice(0, 10);
+  const futureExpDates = allExpDates.filter(d => d >= today).sort();
+
+  // Pick target expirations
+  let targetExpDates;
+  if (requestedExps && requestedExps.length > 0) {
+    targetExpDates = allExpDates.filter(d => requestedExps.includes(d));
+  } else {
+    targetExpDates = futureExpDates.slice(0, 6);
+  }
+  if (targetExpDates.length === 0) throw new Error('No valid expirations found');
 
   // 2. Get spot price
   let spotPrice = null;
-  if (alpaca.enabled) {
+  if (usePublic && source === 'Public.com') {
+    try {
+      // Public.com spot via quotes endpoint
+      const accountId = require('../config').publicAccountId;
+      const quoteData = await publicService._post(
+        `/userapigateway/marketdata/${accountId}/quotes`,
+        { instruments: [{ symbol: ticker, type: 'EQUITY' }] }
+      );
+      const q = quoteData.quotes?.[0];
+      if (q) spotPrice = parseFloat(q.last) || 0;
+    } catch { /* fallback */ }
+  }
+  if (!spotPrice && alpaca.enabled) {
     try {
       const snap = await alpaca.getSnapshot(ticker);
       spotPrice = snap.price;
@@ -139,46 +171,80 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
   const expirationResults = [];
   const allStrikes = new Set();
 
-  for (const exp of targetExps) {
+  for (const expDate of targetExpDates) {
     try {
-      const result = await gamma._yahooFetch(ticker, exp.epoch);
-      const options = result.options?.[0];
-      if (!options) continue;
+      let strikeGEXMap;
+      let totalGEX;
 
-      const chain = [];
-      for (const c of (options.calls || [])) {
-        chain.push({
-          strike: c.strike, expiration: exp.date, expirationEpoch: exp.epoch,
-          type: 'call', openInterest: c.openInterest || 0, impliedVolatility: c.impliedVolatility || 0,
-        });
-      }
-      for (const p of (options.puts || [])) {
-        chain.push({
-          strike: p.strike, expiration: exp.date, expirationEpoch: exp.epoch,
-          type: 'put', openInterest: p.openInterest || 0, impliedVolatility: p.impliedVolatility || 0,
-        });
+      if (source === 'Public.com') {
+        // ── Public.com: real greeks (gamma from broker, not Black-Scholes) ──
+        const contracts = await publicService.getOptionsWithGreeks(ticker, expDate);
+        if (contracts.length === 0) continue;
+
+        // Compute GEX per strike using real gamma
+        // GEX = OI × Gamma × 100 × Spot (calls positive, puts negative for dealer)
+        const strikeMap = new Map();
+        for (const c of contracts) {
+          if (!c.strike || !c.openInterest || !c.gamma) continue;
+          const gex = c.openInterest * c.gamma * 100 * spotPrice;
+          const sign = c.type === 'call' ? 1 : -1;
+
+          const entry = strikeMap.get(c.strike) || { net: 0, call: 0, put: 0, callOI: 0, putOI: 0 };
+          if (c.type === 'call') {
+            entry.call += gex;
+            entry.callOI += c.openInterest;
+          } else {
+            entry.put -= gex; // negative for dealer short puts
+            entry.putOI += c.openInterest;
+          }
+          entry.net = entry.call + entry.put;
+          strikeMap.set(c.strike, entry);
+        }
+
+        strikeGEXMap = {};
+        totalGEX = 0;
+        for (const [strike, data] of strikeMap) {
+          strikeGEXMap[strike] = data;
+          allStrikes.add(strike);
+          totalGEX += data.net;
+        }
+      } else {
+        // ── Yahoo fallback: Black-Scholes estimated gamma ──
+        const expObj = yahooExps?.find(e => e.date === expDate);
+        if (!expObj) continue;
+        const result = await gamma._yahooFetch(ticker, expObj.epoch);
+        const options = result.options?.[0];
+        if (!options) continue;
+
+        const chain = [];
+        for (const c of (options.calls || [])) {
+          chain.push({
+            strike: c.strike, expiration: expDate, expirationEpoch: expObj.epoch,
+            type: 'call', openInterest: c.openInterest || 0, impliedVolatility: c.impliedVolatility || 0,
+          });
+        }
+        for (const p of (options.puts || [])) {
+          chain.push({
+            strike: p.strike, expiration: expDate, expirationEpoch: expObj.epoch,
+            type: 'put', openInterest: p.openInterest || 0, impliedVolatility: p.impliedVolatility || 0,
+          });
+        }
+
+        const detailed = gamma.calculateDetailedGEX(chain, spotPrice);
+        strikeGEXMap = {};
+        for (const s of detailed.strikes) {
+          strikeGEXMap[s.strike] = {
+            net: s['netGEX$'], call: s['callGEX$'], put: s['putGEX$'],
+            callOI: s.callOI, putOI: s.putOI,
+          };
+          allStrikes.add(s.strike);
+        }
+        totalGEX = detailed['totalNetGEX$'];
       }
 
-      const detailed = gamma.calculateDetailedGEX(chain, spotPrice);
-      const strikeGEX = {};
-      for (const s of detailed.strikes) {
-        strikeGEX[s.strike] = {
-          net: s['netGEX$'],
-          call: s['callGEX$'],
-          put: s['putGEX$'],
-          callOI: s.callOI,
-          putOI: s.putOI,
-        };
-        allStrikes.add(s.strike);
-      }
-
-      expirationResults.push({
-        date: exp.date,
-        strikeGEX,
-        totalGEX: detailed['totalNetGEX$'],
-      });
+      expirationResults.push({ date: expDate, strikeGEX: strikeGEXMap, totalGEX });
     } catch (err) {
-      console.warn(`[GEXHeatmap API] Skipping ${exp.date}: ${err.message}`);
+      console.warn(`[GEXHeatmap API] Skipping ${expDate}: ${err.message}`);
     }
   }
 
@@ -217,16 +283,48 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
     return { strike, net: totalNet, call: totalCall, put: totalPut };
   });
 
+  // 7. Compute key levels: call wall, put wall, gamma flip (from friend's algo)
+  let callWall = null, putWall = null, gammaFlip = null;
+  if (profile.length > 0) {
+    // Call wall = strike with highest positive net GEX
+    const posStrikes = profile.filter(p => p.net > 0);
+    if (posStrikes.length > 0) {
+      callWall = posStrikes.reduce((best, p) => p.net > best.net ? p : best);
+    }
+    // Put wall = strike with most negative net GEX
+    const negStrikes = profile.filter(p => p.net < 0);
+    if (negStrikes.length > 0) {
+      putWall = negStrikes.reduce((best, p) => p.net < best.net ? p : best);
+    }
+    // Gamma flip = where cumulative GEX crosses zero (interpolated)
+    let cumulative = 0;
+    for (let i = 0; i < profile.length; i++) {
+      const prev = cumulative;
+      cumulative += profile[i].net;
+      if (i > 0 && prev !== 0 && Math.sign(prev) !== Math.sign(cumulative)) {
+        const ratio = Math.abs(prev) / (Math.abs(prev) + Math.abs(profile[i].net));
+        gammaFlip = profile[i - 1].strike + ratio * (profile[i].strike - profile[i - 1].strike);
+        gammaFlip = Math.round(gammaFlip * 100) / 100;
+        break;
+      }
+    }
+  }
+
   return {
     ticker,
     spotPrice,
+    source,
     timestamp: new Date().toISOString(),
     expirations: expirationResults.map(e => ({ date: e.date, totalGEX: e.totalGEX })),
-    availableExpirations: futureExps.map(e => e.date),
+    availableExpirations: futureExpDates,
     strikes: selectedStrikes,
     grid,
     profile,
     maxAbsGEX,
+    // Key levels (from friend's algo)
+    callWall: callWall ? { strike: callWall.strike, gex: callWall.net } : null,
+    putWall: putWall ? { strike: putWall.strike, gex: putWall.net } : null,
+    gammaFlip,
   };
 }
 
@@ -342,6 +440,21 @@ function _dashboardHTML() {
   @keyframes spin { to { transform: rotate(360deg); } }
   .error-msg { color: var(--red); background: var(--red-dim); padding: 12px 20px; border-radius: 8px; margin: 20px; font-size: 13px; }
 
+  /* ── Key Levels Badges ── */
+  .key-levels { display: flex; gap: 6px; font-size: 11px; font-weight: 600; }
+  .kl-badge { padding: 3px 8px; border-radius: 10px; white-space: nowrap; }
+  .kl-call { background: rgba(57,210,192,0.15); color: var(--cyan); }
+  .kl-put { background: var(--red-dim); color: var(--red); }
+  .kl-flip { background: rgba(210,168,57,0.15); color: #d2a839; }
+
+  /* ── Profile Annotations ── */
+  .profile-annotation { position: absolute; right: 4px; font-size: 9px; font-weight: 700; padding: 1px 4px; border-radius: 3px; }
+  .profile-row { position: relative; }
+  .profile-row.wall-call { border-right: 3px solid var(--cyan); }
+  .profile-row.wall-put { border-right: 3px solid var(--red); }
+  .profile-row.flip-row { border-right: 3px solid #d2a839; }
+  .profile-agg-line { position: absolute; top: 0; width: 2px; height: 100%; background: #d2a839; z-index: 2; pointer-events: none; }
+
   /* ── Footer ── */
   .footer { padding: 6px 20px; font-size: 10px; color: var(--text-muted); background: var(--bg2); border-top: 1px solid var(--border); display: flex; justify-content: space-between; }
 </style>
@@ -379,6 +492,7 @@ function _dashboardHTML() {
 
   <div style="margin-left:auto;display:flex;align-items:center;gap:10px">
     <span class="spot-badge" id="spotBadge">—</span>
+    <span class="key-levels" id="keyLevels"></span>
     <button class="btn live" id="liveBtn" onclick="toggleLive()">
       <span class="status-dot off" id="liveDot"></span> LIVE
     </button>
@@ -574,6 +688,11 @@ function renderProfile() {
   const spotStrikeIdx = data.strikes.reduce((best, s, i) =>
     Math.abs(s - data.spotPrice) < Math.abs(data.strikes[best] - data.spotPrice) ? i : best, 0);
 
+  // Find wall/flip rows for annotation
+  const cwStrike = data.callWall?.strike;
+  const pwStrike = data.putWall?.strike;
+  const flipStrike = data.gammaFlip;
+
   let html = '';
   for (let i = 0; i < profile.length; i++) {
     const p = profile[i];
@@ -581,7 +700,17 @@ function renderProfile() {
     const pct = (Math.abs(p.net) / maxAbs * 50).toFixed(1);
     const isPos = p.net >= 0;
 
-    html += '<div class="profile-row' + (isSpot ? ' spot' : '') + '">';
+    // Determine row annotations
+    const isCallWall = cwStrike && p.strike === cwStrike;
+    const isPutWall = pwStrike && p.strike === pwStrike;
+    const isFlipRow = flipStrike && i > 0 && profile[i-1].strike <= flipStrike && p.strike >= flipStrike;
+    let rowClass = 'profile-row';
+    if (isSpot) rowClass += ' spot';
+    if (isCallWall) rowClass += ' wall-call';
+    if (isPutWall) rowClass += ' wall-put';
+    if (isFlipRow) rowClass += ' flip-row';
+
+    html += '<div class="' + rowClass + '">';
     html += '<span class="profile-strike" style="' + (isSpot ? 'color:var(--accent);font-weight:700' : '') + '">' + p.strike + '</span>';
     html += '<div class="profile-bar-wrap"><div class="profile-center"></div>';
 
@@ -593,6 +722,12 @@ function renderProfile() {
 
     html += '</div>';
     html += '<span class="profile-val" style="color:' + (isPos ? 'var(--cyan)' : 'var(--red)') + '">' + fmtGEX(p.net) + '</span>';
+
+    // Annotation labels
+    if (isCallWall) html += '<span class="profile-annotation" style="background:var(--cyan-dim);color:var(--cyan);top:2px">CALL WALL</span>';
+    if (isPutWall) html += '<span class="profile-annotation" style="background:var(--red-dim);color:var(--red);top:2px">PUT WALL</span>';
+    if (isFlipRow) html += '<span class="profile-annotation" style="background:rgba(210,168,57,0.15);color:#d2a839;bottom:2px">FLIP</span>';
+
     html += '</div>';
   }
 
@@ -820,10 +955,22 @@ function hideTip() {
 function updateSpotBadge() {
   if (!state.data) return;
   document.getElementById('spotBadge').textContent = state.data.ticker + ' $' + state.data.spotPrice.toFixed(2);
+
+  // Key levels badges
+  const kl = document.getElementById('keyLevels');
+  let html = '';
+  if (state.data.callWall) html += '<span class="kl-badge kl-call">Call Wall $' + state.data.callWall.strike + '</span>';
+  if (state.data.putWall) html += '<span class="kl-badge kl-put">Put Wall $' + state.data.putWall.strike + '</span>';
+  if (state.data.gammaFlip) html += '<span class="kl-badge kl-flip">Flip $' + state.data.gammaFlip + '</span>';
+  kl.innerHTML = html;
 }
 
 function updateFooter() {
   if (!state.data) return;
+  const src = state.data.source || 'Yahoo';
+  document.getElementById('footerLeft').textContent =
+    'GEX = OI \\u00d7 Gamma \\u00d7 100 \\u00d7 Spot | Data: ' + src
+    + (src === 'Public.com' ? ' (real greeks)' : ' (Black-Scholes est.)');
   document.getElementById('footerRight').textContent =
     'Updated: ' + new Date(state.data.timestamp).toLocaleTimeString() + ' | '
     + state.data.expirations.length + ' expirations | '
