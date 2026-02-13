@@ -60,6 +60,10 @@ module.exports = {
   alertMinConviction: parseInt(process.env.ALERT_MIN_CONVICTION, 10) || 4, // Only post alerts with conviction >= this (1-10, default 4 = show most signals)
   webhookSecret: process.env.WEBHOOK_SECRET || '', // Optional auth for TradingView webhook
 
+  // Tradier API (options chain with ORATS real greeks — preferred source)
+  tradierApiKey: process.env.TRADIER_API_KEY || '',
+  tradierSandbox: (process.env.TRADIER_SANDBOX || 'true').toLowerCase() === 'true',
+
   // Public.com API (real-time options chain + greeks)
   publicApiKey: process.env.PUBLIC_API_KEY || '',
   publicAccountId: process.env.PUBLIC_ACCOUNT_ID || '',

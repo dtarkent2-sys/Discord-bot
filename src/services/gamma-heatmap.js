@@ -16,6 +16,8 @@
 
 const path = require('path');
 const gamma = require('./gamma');
+const tradier = require('./tradier');
+const publicService = require('./public');
 const priceFetcher = require('../tools/price-fetcher');
 const alpaca = require('./alpaca');
 
@@ -86,37 +88,64 @@ class GammaHeatmapService {
     const upper = ticker.toUpperCase();
     const strikeRange = opts.strikeRange || 20;
 
-    // 1. Get available expirations
-    const availableExps = await gamma.fetchAvailableExpirations(upper);
-    if (availableExps.length === 0) {
-      throw new Error(`No options expirations found for ${upper}`);
+    // ── Data source priority: Tradier (ORATS) > Public.com > Yahoo (Black-Scholes) ──
+    let source = 'Yahoo';
+    let allExpDates = null;
+    let yahooExps = null;
+
+    // 1. Get available expirations — try sources in order
+    if (tradier.enabled) {
+      try {
+        const dates = await tradier.getOptionExpirations(upper);
+        if (dates.length > 0) { allExpDates = dates; source = 'Tradier'; }
+      } catch (err) {
+        console.warn(`[GammaHeatmap] Tradier expirations failed: ${err.message}`);
+      }
+    }
+    if (!allExpDates && publicService.enabled) {
+      try {
+        const dates = await publicService.getOptionExpirations(upper);
+        if (dates && dates.length > 0) { allExpDates = dates; source = 'Public.com'; }
+      } catch (err) {
+        console.warn(`[GammaHeatmap] Public.com expirations failed: ${err.message}`);
+      }
+    }
+    if (!allExpDates) {
+      yahooExps = await gamma.fetchAvailableExpirations(upper);
+      if (yahooExps.length === 0) throw new Error(`No options expirations found for ${upper}`);
+      allExpDates = yahooExps.map(e => e.date);
+      source = 'Yahoo';
     }
 
-    // Pick up to 6 nearest expirations (to keep the image readable)
-    const now = Date.now() / 1000;
-    const futureExps = availableExps
-      .filter(e => e.epoch >= now - 86400) // include today
-      .slice(0, 6);
+    // Pick up to 6 nearest future expirations
+    const today = new Date().toISOString().slice(0, 10);
+    const futureExpDates = allExpDates.filter(d => d >= today).sort().slice(0, 6);
 
-    if (futureExps.length === 0) {
+    if (futureExpDates.length === 0) {
       throw new Error(`No upcoming expirations for ${upper}`);
     }
 
-    const targetExps = opts.expirations
-      ? availableExps.filter(e => opts.expirations.includes(e.date))
-      : futureExps;
+    const targetExpDates = opts.expirations
+      ? allExpDates.filter(d => opts.expirations.includes(d))
+      : futureExpDates;
 
-    if (targetExps.length === 0) {
+    if (targetExpDates.length === 0) {
       throw new Error('None of the specified expiration dates are available.');
     }
 
     // 2. Get spot price
     let spotPrice = null;
-    if (alpaca.enabled) {
+    if (source === 'Tradier') {
+      try {
+        const q = await tradier.getQuote(upper);
+        spotPrice = q.price;
+      } catch { /* fallback */ }
+    }
+    if (!spotPrice && alpaca.enabled) {
       try {
         const snap = await alpaca.getSnapshot(upper);
         spotPrice = snap.price;
-      } catch { /* fallback below */ }
+      } catch { /* fallback */ }
     }
     if (!spotPrice) {
       const pf = await priceFetcher.getCurrentPrice(upper);
@@ -128,49 +157,66 @@ class GammaHeatmapService {
     const expirationData = [];
     let allStrikes = new Set();
 
-    for (const exp of targetExps) {
+    for (const expDate of targetExpDates) {
       try {
-        const result = await gamma._yahooFetch(upper, exp.epoch);
-        const options = result.options?.[0];
-        if (!options) continue;
+        let strikeGEX;
+        let totalGEX;
 
-        const chain = [];
-        for (const c of (options.calls || [])) {
-          chain.push({
-            strike: c.strike,
-            expiration: exp.date,
-            expirationEpoch: exp.epoch,
-            type: 'call',
-            openInterest: c.openInterest || 0,
-            impliedVolatility: c.impliedVolatility || 0,
-          });
-        }
-        for (const p of (options.puts || [])) {
-          chain.push({
-            strike: p.strike,
-            expiration: exp.date,
-            expirationEpoch: exp.epoch,
-            type: 'put',
-            openInterest: p.openInterest || 0,
-            impliedVolatility: p.impliedVolatility || 0,
-          });
+        if (source === 'Tradier' || source === 'Public.com') {
+          // ── Real greeks path: Tradier (ORATS) or Public.com ──
+          let contracts;
+          if (source === 'Tradier') {
+            contracts = await tradier.getOptionsWithGreeks(upper, expDate);
+          } else {
+            contracts = await publicService.getOptionsWithGreeks(upper, expDate);
+          }
+          if (!contracts || contracts.length === 0) continue;
+
+          strikeGEX = new Map();
+          totalGEX = 0;
+          for (const c of contracts) {
+            if (!c.strike || !c.openInterest || !c.gamma) continue;
+            const gex = c.openInterest * c.gamma * 100 * spotPrice;
+            const prev = strikeGEX.get(c.strike) || 0;
+            const contribution = c.type === 'call' ? gex : -gex;
+            strikeGEX.set(c.strike, prev + contribution);
+            allStrikes.add(c.strike);
+            totalGEX += contribution;
+          }
+        } else {
+          // ── Yahoo fallback: Black-Scholes estimated gamma ──
+          const expObj = yahooExps?.find(e => e.date === expDate);
+          if (!expObj) continue;
+          const result = await gamma._yahooFetch(upper, expObj.epoch);
+          const options = result.options?.[0];
+          if (!options) continue;
+
+          const chain = [];
+          for (const c of (options.calls || [])) {
+            chain.push({
+              strike: c.strike, expiration: expDate, expirationEpoch: expObj.epoch,
+              type: 'call', openInterest: c.openInterest || 0, impliedVolatility: c.impliedVolatility || 0,
+            });
+          }
+          for (const p of (options.puts || [])) {
+            chain.push({
+              strike: p.strike, expiration: expDate, expirationEpoch: expObj.epoch,
+              type: 'put', openInterest: p.openInterest || 0, impliedVolatility: p.impliedVolatility || 0,
+            });
+          }
+
+          const detailed = gamma.calculateDetailedGEX(chain, spotPrice);
+          strikeGEX = new Map();
+          for (const s of detailed.strikes) {
+            strikeGEX.set(s.strike, s['netGEX$']);
+            allStrikes.add(s.strike);
+          }
+          totalGEX = detailed['totalNetGEX$'];
         }
 
-        // Calculate per-strike GEX for this expiration
-        const detailed = gamma.calculateDetailedGEX(chain, spotPrice);
-        const strikeGEX = new Map();
-        for (const s of detailed.strikes) {
-          strikeGEX.set(s.strike, s['netGEX$']);
-          allStrikes.add(s.strike);
-        }
-
-        expirationData.push({
-          date: exp.date,
-          strikeGEX,
-          totalGEX: detailed['totalNetGEX$'],
-        });
+        expirationData.push({ date: expDate, strikeGEX, totalGEX });
       } catch (err) {
-        console.warn(`[GammaHeatmap] Skipping ${exp.date}: ${err.message}`);
+        console.warn(`[GammaHeatmap] Skipping ${expDate}: ${err.message}`);
       }
     }
 
@@ -219,7 +265,7 @@ class GammaHeatmapService {
     return {
       buffer,
       spotPrice,
-      source: 'Yahoo',
+      source,
       expirations: expirationData.map(e => e.date),
     };
   }
@@ -393,7 +439,7 @@ class GammaHeatmapService {
     );
     ctx.textAlign = 'right';
     ctx.fillText(
-      `Yahoo Finance  |  ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`,
+      `${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`,
       canvasWidth - PADDING - 4,
       footerY
     );
@@ -421,7 +467,10 @@ class GammaHeatmapService {
   /**
    * Format Discord text summary to accompany the heat map image.
    */
-  formatForDiscord(ticker, spotPrice, expirations) {
+  formatForDiscord(ticker, spotPrice, expirations, source) {
+    const sourceLabel = source === 'Tradier' ? 'Tradier (ORATS real greeks)'
+      : source === 'Public.com' ? 'Public.com (real greeks)'
+      : 'Yahoo Finance (Black-Scholes est.)';
     return [
       `**${ticker} — Gamma Heat Map**`,
       `Spot: \`$${spotPrice.toFixed(2)}\` | ${expirations.length} expirations`,
@@ -430,7 +479,7 @@ class GammaHeatmapService {
       `🟥 **Red** = negative GEX (put-dominant, dealers short gamma)`,
       `Brighter intensity = higher magnitude`,
       ``,
-      `_Data: Yahoo Finance | Values in $ notional GEX_`,
+      `_Data: ${sourceLabel} | Values in $ notional GEX_`,
     ].join('\n');
   }
 }
