@@ -2109,24 +2109,22 @@ async function handleButtonInteraction(interaction) {
 
 async function handleMLPredict(interaction) {
   if (!mlPredictor.enabled) {
-    return interaction.reply({ content: 'ML Predictor requires a Databento API key (`DATABENTO_API_KEY`) and Python dependencies (`pip install -r ml/requirements.txt`).', flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: 'ML Predictor requires Python dependencies (`pip install -r ml/requirements.txt`).', flags: MessageFlags.Ephemeral });
   }
 
   await interaction.deferReply();
 
-  const product = interaction.options.getString('product');
-  const markout = interaction.options.getInteger('markout') || 300;
+  const ticker = interaction.options.getString('ticker');
+  const forward = interaction.options.getInteger('forward') || 20;
   const modelType = interaction.options.getString('model') || 'both';
   const days = interaction.options.getInteger('days');
   const startDate = interaction.options.getString('start_date');
   const endDate = interaction.options.getString('end_date');
-  const dateStr = interaction.options.getString('date'); // deprecated
 
   const datePattern = /^\d{4}-\d{2}-\d{2}$/;
-  const maxDays = parseInt(process.env.ML_MAX_DAYS, 10) || 180;
 
   try {
-    const options = { markout, model: modelType };
+    const options = { forward, model: modelType };
 
     // Validate date formats
     if (startDate) {
@@ -2141,26 +2139,16 @@ async function handleMLPredict(interaction) {
       return interaction.editReply(`start_date (${startDate}) must be before end_date (${endDate}).`);
     }
     if (days) {
-      if (days > maxDays) return interaction.editReply(`days=${days} exceeds maximum (${maxDays}). Set ML_MAX_DAYS env var to override.`);
       options.days = days;
     }
-    if (dateStr && !startDate && !endDate && !days) {
-      if (!datePattern.test(dateStr)) return interaction.editReply('Invalid date format. Use YYYY-MM-DD.');
-      options.date = dateStr;
-    }
-    // Validate date range span
-    if (startDate && endDate) {
-      const span = (new Date(endDate) - new Date(startDate)) / 86400000;
-      if (span > maxDays) return interaction.editReply(`Date range spans ${Math.round(span)} days, exceeds max ${maxDays}.`);
-    }
 
-    const result = await mlPredictor.runPrediction(product, options);
+    const result = await mlPredictor.runPrediction(ticker, options);
     const summary = mlPredictor.formatResults(result);
 
     const replyPayload = { content: summary };
     try {
       const chartBuffer = await mlPredictor.getChartBuffer(result);
-      const attachment = new AttachmentBuilder(chartBuffer, { name: `ml-predict-${product}.png` });
+      const attachment = new AttachmentBuilder(chartBuffer, { name: `ml-predict-${ticker}.png` });
       replyPayload.files = [attachment];
     } catch (chartErr) {
       console.warn('[ML-Predict] Chart not available:', chartErr.message);
@@ -2169,9 +2157,9 @@ async function handleMLPredict(interaction) {
 
     await interaction.editReply(replyPayload);
   } catch (err) {
-    console.error(`[ML-Predict] Error for ${product}:`, err);
+    console.error(`[ML-Predict] Error for ${ticker}:`, err);
     const msg = err.message.length > 500 ? err.message.slice(0, 500) + '...' : err.message;
-    await interaction.editReply(`ML prediction failed for **${product}**: ${msg}`);
+    await interaction.editReply(`ML prediction failed for **${ticker}**: ${msg}`);
   }
 }
 

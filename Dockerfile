@@ -1,4 +1,4 @@
-# Node 22 + Python 3 for ML predictor (databento, scikit-learn, matplotlib)
+# Node 22 + Python 3 for ML predictor (scikit-learn, matplotlib, parquet data)
 FROM node:22-slim
 
 # System packages: canvas/chart rendering + Python 3

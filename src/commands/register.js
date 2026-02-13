@@ -453,28 +453,18 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('mlpredict')
-    .setDescription('ML walk-forward backtest — MBP-10 order book + scikit-learn on CME futures')
+    .setDescription('ML walk-forward backtest — stock price + fundamentals via scikit-learn')
     .addStringOption(opt =>
-      opt.setName('product')
-        .setDescription('Futures product to analyze')
+      opt.setName('ticker')
+        .setDescription('Stock ticker (e.g. AAPL, MSFT, SPY, TSLA)')
         .setRequired(true)
-        .addChoices(
-          { name: 'ES — E-mini S&P 500', value: 'ES' },
-          { name: 'NQ — E-mini Nasdaq-100', value: 'NQ' },
-          { name: 'YM — E-mini Dow', value: 'YM' },
-          { name: 'RTY — E-mini Russell 2000', value: 'RTY' },
-          { name: 'CL — Crude Oil', value: 'CL' },
-          { name: 'GC — Gold', value: 'GC' },
-          { name: 'ZB — 30-Year Treasury', value: 'ZB' },
-          { name: 'ZN — 10-Year Treasury', value: 'ZN' },
-        )
     )
     .addIntegerOption(opt =>
       opt.setName('days')
-        .setDescription('Calendar days to backtest (default: 60, max: 180)')
+        .setDescription('Trading days of history (default: 1260 ≈ 5 years)')
         .setRequired(false)
-        .setMinValue(5)
-        .setMaxValue(180)
+        .setMinValue(300)
+        .setMaxValue(10000)
     )
     .addStringOption(opt =>
       opt.setName('start_date')
@@ -483,15 +473,15 @@ const commands = [
     )
     .addStringOption(opt =>
       opt.setName('end_date')
-        .setDescription('Backtest end date (YYYY-MM-DD, default: last trading day)')
+        .setDescription('Backtest end date (YYYY-MM-DD, default: latest)')
         .setRequired(false)
     )
     .addIntegerOption(opt =>
-      opt.setName('markout')
-        .setDescription('Forward trade count for returns (default: 300)')
+      opt.setName('forward')
+        .setDescription('Forward return horizon in trading days (default: 20)')
         .setRequired(false)
-        .setMinValue(50)
-        .setMaxValue(5000)
+        .setMinValue(1)
+        .setMaxValue(252)
     )
     .addStringOption(opt =>
       opt.setName('model')
@@ -502,11 +492,6 @@ const commands = [
           { name: 'Linear — LinearRegression only (fast)', value: 'linear' },
           { name: 'Gradient Boost — HistGradientBoosting only', value: 'gradient_boost' },
         )
-    )
-    .addStringOption(opt =>
-      opt.setName('date')
-        .setDescription('[Deprecated] Single date — use start_date/end_date instead')
-        .setRequired(false)
     ),
 ];
 
