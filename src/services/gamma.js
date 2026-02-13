@@ -5,10 +5,11 @@
  * and generates bar-chart PNGs for Discord.
  *
  * Data source priority:
- *   1. Databento OPRA (institutional NBBO + OI) + Tradier ORATS greeks
- *   2. Tradier (ORATS real greeks, full chain)
- *   3. Alpaca (pre-calculated greeks, indicative feed)
- *   4. Yahoo Finance (free, Black-Scholes estimated gamma)
+ *   1. Databento Live TCP (real-time OPRA stream — zero API lag)
+ *   2. Databento Historical (institutional NBBO + OI) + Tradier ORATS greeks
+ *   3. Tradier (ORATS real greeks, full chain)
+ *   4. Alpaca (pre-calculated greeks + BS gamma fallback for indicative feed)
+ *   5. Yahoo Finance (free, Black-Scholes estimated gamma)
  * Spot price: Tradier → Alpaca → FMP → yahoo-finance2 fallback
  *
  * Key concepts:
@@ -44,7 +45,7 @@ const config = require('../config');
 const alpaca = require('./alpaca');
 const priceFetcher = require('../tools/price-fetcher');
 
-// Databento + Tradier — lazy-loaded to avoid circular deps and slow startup
+// Databento + Tradier + DatabentoLive — lazy-loaded to avoid circular deps and slow startup
 let _databento = null, _databentoLoaded = false;
 function getDatabento() {
   if (!_databentoLoaded) { _databentoLoaded = true; try { _databento = require('./databento'); } catch { _databento = null; } }
@@ -54,6 +55,11 @@ let _tradier = null, _tradierLoaded = false;
 function getTradier() {
   if (!_tradierLoaded) { _tradierLoaded = true; try { _tradier = require('./tradier'); } catch { _tradier = null; } }
   return _tradier;
+}
+let _databentoLive = null, _databentoLiveLoaded = false;
+function getDatabentoLive() {
+  if (!_databentoLiveLoaded) { _databentoLiveLoaded = true; try { _databentoLive = require('./databento-live'); } catch { _databentoLive = null; } }
+  return _databentoLive;
 }
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
@@ -390,6 +396,51 @@ class GammaService {
     if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
     const d1 = this._d1(S, K, RISK_FREE_RATE, sigma, T);
     return this._normalPDF(d1) / (S * sigma * Math.sqrt(T));
+  }
+
+  /** Abramowitz-Stegun CDF approximation */
+  _normalCDF(x) {
+    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+    const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+    const sign = x < 0 ? -1 : 1;
+    const t = 1 / (1 + p * Math.abs(x));
+    const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x / 2);
+    return 0.5 * (1 + sign * y);
+  }
+
+  /** Black-Scholes option price */
+  _bsPrice(S, K, r, sigma, T, isCall) {
+    const d1v = this._d1(S, K, r, sigma, T);
+    const d2 = d1v - sigma * Math.sqrt(T);
+    const Nd1 = this._normalCDF(d1v);
+    const Nd2 = this._normalCDF(d2);
+    if (isCall) return S * Nd1 - K * Math.exp(-r * T) * Nd2;
+    return K * Math.exp(-r * T) * (1 - Nd2) - S * (1 - Nd1);
+  }
+
+  /** Black-Scholes vega */
+  _bsVega(S, K, r, sigma, T) {
+    const d1v = this._d1(S, K, r, sigma, T);
+    return S * this._normalPDF(d1v) * Math.sqrt(T);
+  }
+
+  /**
+   * Estimate IV from option mid-price using Brenner-Subrahmanyam + Newton-Raphson.
+   * Falls back to 25% default if estimation fails.
+   */
+  _estimateIV(midPrice, spotPrice, strike, T, isCall) {
+    if (midPrice <= 0 || T <= 0) return 0.25;
+    let sigma = Math.sqrt(2 * Math.PI / T) * midPrice / spotPrice;
+    if (sigma <= 0.01 || sigma > 5) sigma = 0.25;
+    for (let i = 0; i < 3; i++) {
+      const bsP = this._bsPrice(spotPrice, strike, RISK_FREE_RATE, sigma, T, isCall);
+      const vega = this._bsVega(spotPrice, strike, RISK_FREE_RATE, sigma, T);
+      if (vega < 1e-10) break;
+      sigma -= (bsP - midPrice) / vega;
+      if (sigma <= 0.01) { sigma = 0.25; break; }
+      if (sigma > 5) { sigma = 0.25; break; }
+    }
+    return Math.max(0.01, Math.min(sigma, 5));
   }
 
   // ── GEX calculation ──────────────────────────────────────────────────
@@ -988,9 +1039,69 @@ class GammaService {
   async analyze(ticker, expirationPref = '0dte') {
     const upper = ticker.toUpperCase();
 
-    // ── Try Databento first (institutional OPRA data + ORATS greeks) ──
-    const databento = getDatabento();
+    // ── Try DatabentoLive TCP first (real-time OPRA — zero API lag) ──
+    const live = getDatabentoLive();
     const tradier = getTradier();
+    if (live && live.hasDataFor(upper)) {
+      try {
+        console.log(`[Gamma] Trying DatabentoLive TCP for ${upper} (pref: ${expirationPref})...`);
+        const targetExp = this._computeTargetDate(expirationPref);
+        const liveExps = live.getExpirations(upper);
+
+        let expDate = liveExps.find(d => d === targetExp);
+        if (!expDate) {
+          const today = this._todayString();
+          const future = liveExps.filter(d => d >= today);
+          expDate = future[0] || liveExps[0];
+        }
+
+        if (expDate) {
+          const contracts = live.getOptionsChain(upper, expDate);
+
+          // Get spot price (OPRA is options-only)
+          let spotPrice = null;
+          if (tradier && tradier.enabled) {
+            try { spotPrice = (await tradier.getQuote(upper)).price; } catch { /* fallback */ }
+          }
+          if (!spotPrice && alpaca.enabled) {
+            try { spotPrice = (await alpaca.getSnapshot(upper)).price; } catch { /* fallback */ }
+          }
+          if (!spotPrice) {
+            const pf = await priceFetcher.getCurrentPrice(upper);
+            if (!pf.error) spotPrice = pf.price;
+          }
+
+          if (contracts.length > 0 && spotPrice) {
+            // Estimate gamma via BS for contracts without greeks
+            const T = Math.max((new Date(expDate).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+            for (const c of contracts) {
+              if (!c.gamma || c.gamma === 0) {
+                const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+                if (mid > 0) {
+                  const iv = this._estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+                  c.gamma = this._bsGamma(spotPrice, c.strike, iv, T);
+                  c.impliedVolatility = iv;
+                }
+              }
+            }
+
+            const gexData = this.calculateGEXFromAlpaca(contracts, spotPrice, expDate);
+            if (gexData.strikes.length > 0) {
+              const flip = this.findGammaFlip(gexData, spotPrice);
+              const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
+              console.log(`[Gamma] ${upper}: DatabentoLive TCP OK — ${contracts.length} contracts, exp ${expDate}`);
+              return { ticker: upper, spotPrice, expiration: expDate, gexData, flip, chartBuffer, source: 'DatabentoLive' };
+            }
+          }
+        }
+        console.log(`[Gamma] DatabentoLive returned insufficient data for ${upper}, falling back`);
+      } catch (err) {
+        console.warn(`[Gamma] DatabentoLive failed for ${upper}: ${err.message}, falling back`);
+      }
+    }
+
+    // ── Try Databento Historical (institutional OPRA data + ORATS greeks) ──
+    const databento = getDatabento();
     if (databento && databento.enabled) {
       try {
         console.log(`[Gamma] Trying Databento OPRA for ${upper} (pref: ${expirationPref})...`);
@@ -1098,6 +1209,24 @@ class GammaService {
           // Use the actual expiration from returned data (may differ slightly)
           const expiration = this._pickAlpacaExpiration(options, expirationPref) || targetExp;
 
+          // If all gammas are 0 (indicative feed with no greeks), estimate via BS
+          const hasGreeks = options.some(o => o.gamma > 0 && o.expiration === expiration);
+          if (!hasGreeks) {
+            console.log(`[Gamma] Alpaca ${upper}: no greeks (indicative feed), estimating gamma via BS...`);
+            const T = Math.max((new Date(expiration).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+            for (const o of options) {
+              if (o.expiration !== expiration) continue;
+              if (!o.gamma || o.gamma === 0) {
+                const mid = o.lastPrice || (o.bid > 0 && o.ask > 0 ? (o.bid + o.ask) / 2 : 0);
+                if (mid > 0) {
+                  const iv = this._estimateIV(mid, spotPrice, o.strike, T, o.type === 'call');
+                  o.gamma = this._bsGamma(spotPrice, o.strike, iv, T);
+                  o.impliedVolatility = iv;
+                }
+              }
+            }
+          }
+
           const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
           if (gexData.strikes.length > 0) {
             const flip = this.findGammaFlip(gexData, spotPrice);
@@ -1164,7 +1293,7 @@ class GammaService {
       `🔴 **Put Wall (min GEX):** \`$${minGEX.strike}\` (${fmt(minGEX.value)})`,
       ``,
       `_Call wall = magnet/resistance | Put wall = support | Flip = regime boundary_`,
-      `_Data: ${result.source === 'Databento' ? 'Databento OPRA + ORATS greeks' : result.source === 'Tradier' ? 'Tradier (ORATS real greeks)' : result.source || 'Yahoo'}_`,
+      `_Data: ${result.source === 'DatabentoLive' ? 'Databento OPRA Live TCP + BS greeks' : result.source === 'Databento' ? 'Databento OPRA + ORATS greeks' : result.source === 'Tradier' ? 'Tradier (ORATS real greeks)' : result.source || 'Yahoo'}_`,
     ];
 
     return lines.join('\n');

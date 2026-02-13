@@ -44,6 +44,11 @@ const DEF_CACHE_TTL = 30 * 60 * 1000; // 30 min
 const _dataCache = new Map();
 const DATA_CACHE_TTL = 60 * 1000; // 60s default (overridable via config)
 
+// Databento historical pipeline lag — data is typically available ~25-30 min after real-time.
+// Use 35 min buffer to avoid 422 "end after available_end" errors.
+// Observed lag: OPRA.PILLAR data available up to 14:50 at 15:18 UTC = 28 min gap.
+const HIST_LAG_MS = 35 * 60 * 1000;
+
 class DatabentoService {
   constructor() {
     this._authHeader = null;
@@ -264,10 +269,10 @@ class DatabentoService {
    * @returns {Promise<Map<number, object>>} instrumentId → { bid, ask, bidSize, askSize }
    */
   async getLatestQuotes(ticker, start, end) {
-    // Use 30s buffer to stay within Databento's available data range
-    const now = new Date(Date.now() - 30_000);
-    const e = end || now.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
-    const s = start || new Date(now.getTime() - 5 * 60 * 1000).toISOString().replace(/\.\d{3}Z/, '.000000000Z');
+    // Use HIST_LAG_MS buffer to stay within Databento's available data range (~10 min pipeline lag)
+    const safeNow = new Date(Date.now() - HIST_LAG_MS);
+    const e = end || safeNow.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
+    const s = start || new Date(safeNow.getTime() - 5 * 60 * 1000).toISOString().replace(/\.\d{3}Z/, '.000000000Z');
 
     const records = await this._getRange({
       symbols: `${ticker.toUpperCase()}.OPT`,
@@ -486,11 +491,11 @@ class DatabentoService {
     const cached = _dataCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < 30000) return cached.data; // 30s cache
 
-    // Use 30s buffer to stay within Databento's available data range
-    const now = new Date(Date.now() - 30_000);
-    const start = new Date(now.getTime() - lookbackMinutes * 60 * 1000);
+    // Use HIST_LAG_MS buffer to stay within Databento's available data range (~10 min pipeline lag)
+    const safeNow = new Date(Date.now() - HIST_LAG_MS);
+    const start = new Date(safeNow.getTime() - lookbackMinutes * 60 * 1000);
     const startStr = start.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
-    const endStr = now.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
+    const endStr = safeNow.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
 
     // Fetch trade data + definitions in parallel
     const [trades, defs] = await Promise.all([
@@ -654,15 +659,15 @@ function _today() {
 /**
  * Safe end-of-day timestamp for Databento queries.
  * Databento's historical API rejects `end` values after the latest available data.
- * For today's date, cap to "now minus 30s" so we never request future data.
+ * OPRA.PILLAR has a ~10 min pipeline lag, so for today cap to "now minus 15 min".
  * For past dates, use end-of-day as usual.
  */
 function _safeEnd(dateStr) {
   const today = _today();
   if (dateStr === today) {
-    // Cap to ~30s ago to avoid racing the ingest pipeline
-    const now = new Date(Date.now() - 30_000);
-    return now.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
+    // Cap to 15 min ago — Databento's ingest pipeline has ~10 min lag
+    const safeNow = new Date(Date.now() - HIST_LAG_MS);
+    return safeNow.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
   }
   return `${dateStr}T23:59:59.999999999Z`;
 }

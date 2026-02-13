@@ -18,6 +18,71 @@ const tradier = require('../services/tradier');
 const publicService = require('../services/public');
 const priceFetcher = require('../tools/price-fetcher');
 
+// ── Black-Scholes gamma estimation (for live stream data without greeks) ──
+const RISK_FREE_RATE = 0.045; // ~4.5% Fed rate
+const SQRT_2PI = Math.sqrt(2 * Math.PI);
+
+function _normalPDF(x) {
+  return Math.exp(-0.5 * x * x) / SQRT_2PI;
+}
+
+function _bsGamma(S, K, sigma, T) {
+  if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
+  const d1 = (Math.log(S / K) + (RISK_FREE_RATE + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  return _normalPDF(d1) / (S * sigma * Math.sqrt(T));
+}
+
+/**
+ * Estimate IV from option mid-price using Brenner-Subrahmanyam approximation
+ * + Newton-Raphson refinement. Falls back to 25% default if estimation fails.
+ */
+function _estimateIV(midPrice, spotPrice, strike, T, isCall) {
+  if (midPrice <= 0 || T <= 0) return 0.25; // default 25% IV
+
+  // Brenner-Subrahmanyam approximation (good for near-ATM)
+  let sigma = Math.sqrt(2 * Math.PI / T) * midPrice / spotPrice;
+  if (sigma <= 0.01 || sigma > 5) sigma = 0.25;
+
+  // Simple Newton-Raphson refinement (3 iterations)
+  for (let i = 0; i < 3; i++) {
+    const bsPrice = _bsPrice(spotPrice, strike, RISK_FREE_RATE, sigma, T, isCall);
+    const vega = _bsVega(spotPrice, strike, RISK_FREE_RATE, sigma, T);
+    if (vega < 1e-10) break;
+    sigma = sigma - (bsPrice - midPrice) / vega;
+    if (sigma <= 0.01) { sigma = 0.25; break; }
+    if (sigma > 5) { sigma = 0.25; break; }
+  }
+
+  return Math.max(0.01, Math.min(sigma, 5));
+}
+
+function _bsPrice(S, K, r, sigma, T, isCall) {
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  const d2 = d1 - sigma * Math.sqrt(T);
+  const Nd1 = _normalCDF(d1);
+  const Nd2 = _normalCDF(d2);
+  if (isCall) {
+    return S * Nd1 - K * Math.exp(-r * T) * Nd2;
+  } else {
+    return K * Math.exp(-r * T) * (1 - Nd2) - S * (1 - Nd1);
+  }
+}
+
+function _bsVega(S, K, r, sigma, T) {
+  const d1 = (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
+  return S * _normalPDF(d1) * Math.sqrt(T);
+}
+
+function _normalCDF(x) {
+  // Abramowitz-Stegun approximation
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+  const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  const t = 1 / (1 + p * Math.abs(x));
+  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x / 2);
+  return 0.5 * (1 + sign * y);
+}
+
 // Active SSE connections per ticker for cleanup
 const _sseClients = new Map(); // ticker → Set<res>
 
@@ -232,20 +297,43 @@ function _rebuildHeatmapFromCache(cache) {
 /**
  * Populate the live GEX cache for a ticker after a full data fetch.
  * Stores all contracts with their gamma values for incremental updates.
+ * When no real greeks are available, estimates gamma via Black-Scholes.
  */
 function _populateLiveCache(ticker, data, source) {
-  // Only populate if we have a real data source with greeks
-  if (source === 'Yahoo') return;
-
   let live;
   try { live = require('../services/databento-live'); } catch { return; }
   if (!live.client.connected) return;
 
-  // Build contract map from the last full fetch
+  // Build contract map — either from live stream or from the last full fetch
   const contractMap = new Map();
-  const fetchContracts = async () => {
+  const spotPrice = data.spotPrice;
+
+  const buildFromLive = () => {
+    for (const exp of data.expirations) {
+      const T = Math.max((new Date(exp.date).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+      const contracts = live.getOptionsChain(ticker, exp.date);
+      for (const c of contracts) {
+        if (!c.strike || !c.openInterest) continue;
+        let g = c.gamma;
+        if (!g || g === 0) {
+          const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+          const iv = _estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+          g = _bsGamma(spotPrice, c.strike, iv, T);
+        }
+        if (!g) continue;
+        const key = `${c.strike}_${c.type}_${exp.date}`;
+        contractMap.set(key, {
+          strike: c.strike, type: c.type, expiration: exp.date,
+          gamma: g, openInterest: c.openInterest, volume: c.volume || 0,
+        });
+      }
+    }
+  };
+
+  const buildFromApi = async () => {
     try {
       for (const exp of data.expirations) {
+        const T = Math.max((new Date(exp.date).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
         let contracts;
         if (source === 'Databento') {
           contracts = await databento.getOptionsWithGreeks(ticker, exp.date);
@@ -257,36 +345,42 @@ function _populateLiveCache(ticker, data, source) {
         if (!contracts) continue;
 
         for (const c of contracts) {
-          if (!c.strike || !c.gamma) continue;
+          if (!c.strike || !c.openInterest) continue;
+          let g = c.gamma;
+          if (!g || g === 0) {
+            const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+            const iv = _estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+            g = _bsGamma(spotPrice, c.strike, iv, T);
+          }
+          if (!g) continue;
           const key = `${c.strike}_${c.type}_${exp.date}`;
           contractMap.set(key, {
-            strike: c.strike,
-            type: c.type,
-            expiration: exp.date,
-            gamma: c.gamma,
-            openInterest: c.openInterest || 0,
-            volume: c.volume || 0,
+            strike: c.strike, type: c.type, expiration: exp.date,
+            gamma: g, openInterest: c.openInterest, volume: c.volume || 0,
           });
         }
       }
-
-      _liveGexCache.set(ticker, {
-        data,
-        contracts: contractMap,
-        spotPrice: data.spotPrice,
-        lastFullFetch: Date.now(),
-        lastLiveUpdate: null,
-        dirty: false,
-      });
-
-      console.log(`[GEXHeatmap] Live cache populated: ${ticker} (${contractMap.size} contracts)`);
     } catch (err) {
       console.warn(`[GEXHeatmap] Live cache populate failed: ${err.message}`);
+      return;
     }
   };
 
-  // Populate asynchronously (don't block the response)
-  fetchContracts();
+  const finalize = () => {
+    if (contractMap.size === 0) return;
+    _liveGexCache.set(ticker, {
+      data, contracts: contractMap, spotPrice,
+      lastFullFetch: Date.now(), lastLiveUpdate: null, dirty: false,
+    });
+    console.log(`[GEXHeatmap] Live cache populated: ${ticker} (${contractMap.size} contracts, source=${source})`);
+  };
+
+  if (source === 'DatabentoLive') {
+    buildFromLive();
+    finalize();
+  } else if (source !== 'Yahoo') {
+    buildFromApi().then(finalize);
+  }
 }
 
 /**
@@ -385,15 +479,33 @@ function registerGEXHeatmapRoutes(app) {
 // ── Data fetching ─────────────────────────────────────────────────────
 
 async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
-  // ── Data source priority: Databento (OPRA) > Tradier (ORATS) > Public.com > Yahoo ──
+  // ── Data source priority: Databento Live TCP > Databento Hist > Tradier > Public.com > Yahoo ──
   let source = 'Yahoo';
 
   // 1. Get available expirations — try sources in order
   let allExpDates = null;
   let yahooExps = null;
 
-  // Try Databento first (institutional OPRA feed, all 17 exchanges)
-  if (databento.enabled) {
+  // Try Databento Live TCP first (real-time OPRA stream — zero API lag)
+  let live;
+  try { live = require('../services/databento-live'); } catch { live = null; }
+  if (live && live.hasDataFor(ticker)) {
+    try {
+      allExpDates = live.getExpirations(ticker);
+      if (allExpDates.length > 0) {
+        source = 'DatabentoLive';
+        console.log(`[GEXHeatmap] Using LIVE stream for ${ticker} (${allExpDates.length} expirations)`);
+      } else {
+        allExpDates = null;
+      }
+    } catch (err) {
+      console.warn(`[GEXHeatmap] Databento Live expirations failed: ${err.message}`);
+      allExpDates = null;
+    }
+  }
+
+  // Try Databento historical API (institutional OPRA feed, ~15 min lag)
+  if (!allExpDates && databento.enabled) {
     try {
       allExpDates = await databento.getOptionExpirations(ticker);
       if (allExpDates.length > 0) {
@@ -459,12 +571,14 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
 
   // 2. Get spot price — try sources in order
   let spotPrice = null;
-  if (source === 'Databento' || source === 'Tradier') {
-    try {
-      // Databento OPRA is options-only — use Tradier for equity quotes
-      const q = await tradier.getQuote(ticker);
-      spotPrice = q.price;
-    } catch { /* fallback */ }
+  if (source === 'Databento' || source === 'DatabentoLive' || source === 'Tradier') {
+    // Databento OPRA is options-only — try Tradier for equity quotes first
+    if (tradier.enabled) {
+      try {
+        const q = await tradier.getQuote(ticker);
+        spotPrice = q.price;
+      } catch { /* fallback */ }
+    }
   }
   if (!spotPrice && publicService.enabled) {
     try {
@@ -498,10 +612,12 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
       let strikeGEXMap;
       let totalGEX;
 
-      if (source === 'Databento' || source === 'Tradier' || source === 'Public.com') {
-        // ── Real data path: Databento (OPRA+ORATS), Tradier (ORATS), or Public.com ──
+      if (source === 'DatabentoLive' || source === 'Databento' || source === 'Tradier' || source === 'Public.com') {
+        // ── Real data path: Live TCP > Databento Hist > Tradier > Public.com ──
         let contracts;
-        if (source === 'Databento') {
+        if (source === 'DatabentoLive') {
+          contracts = live.getOptionsChain(ticker, expDate);
+        } else if (source === 'Databento') {
           contracts = await databento.getOptionsWithGreeks(ticker, expDate);
         } else if (source === 'Tradier') {
           contracts = await tradier.getOptionsWithGreeks(ticker, expDate);
@@ -510,12 +626,27 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
         }
         if (!contracts || contracts.length === 0) continue;
 
-        // Compute GEX per strike using real gamma
+        // Time to expiry for BS gamma estimation
+        const T = Math.max((new Date(expDate).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+
+        // Compute GEX per strike
         // GEX = OI × Gamma × 100 × Spot (calls positive, puts negative for dealer)
         const strikeMap = new Map();
         for (const c of contracts) {
-          if (!c.strike || !c.openInterest || !c.gamma) continue;
-          const gex = c.openInterest * c.gamma * 100 * spotPrice;
+          if (!c.strike || !c.openInterest) continue;
+
+          let contractGamma = c.gamma;
+
+          // If no gamma provided (Databento/DatabentoLive without Tradier), estimate via BS
+          if (!contractGamma || contractGamma === 0) {
+            const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+            const iv = _estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+            contractGamma = _bsGamma(spotPrice, c.strike, iv, T);
+          }
+
+          if (!contractGamma) continue;
+
+          const gex = c.openInterest * contractGamma * 100 * spotPrice;
 
           const entry = strikeMap.get(c.strike) || { net: 0, call: 0, put: 0, callOI: 0, putOI: 0 };
           if (c.type === 'call') {

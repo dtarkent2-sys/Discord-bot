@@ -326,6 +326,10 @@ class DatabentoLive extends EventEmitter {
     // Instrument lookup (instrumentId → definition)
     this._instruments = new Map();
 
+    // Live OI + quotes per instrument (for building live options chains)
+    this._oi = new Map();           // instrumentId → OI number
+    this._quotes = new Map();       // instrumentId → { bid, ask, bidSz, askSz }
+
     // Stats tracking
     this._stats = {
       connected: false,
@@ -352,9 +356,13 @@ class DatabentoLive extends EventEmitter {
   /**
    * Add a subscription. Call before connect().
    * Symbols are auto-batched in chunks of 500 per the LSG protocol.
+   * @param {string} schema - e.g. 'trades', 'definition', 'statistics'
+   * @param {string} stypeIn - e.g. 'parent'
+   * @param {string[]} symbols - e.g. ['SPY.OPT']
+   * @param {number} [start] - 0 = replay from session start (gets all accumulated data)
    */
-  subscribe(schema, stypeIn, symbols) {
-    this._subscriptions.push({ schema, stypeIn, symbols });
+  subscribe(schema, stypeIn, symbols, start) {
+    this._subscriptions.push({ schema, stypeIn, symbols, start });
     return this;
   }
 
@@ -549,12 +557,15 @@ class DatabentoLive extends EventEmitter {
 
   _sendSubscriptions() {
     if (this._subscriptions.length === 0) {
-      // Default: subscribe to everything Billy needs for SPY + QQQ options
+      // Default: subscribe to everything Billy needs for SPY + QQQ + IWM options
+      // start=0 for definitions + statistics replays all data from session start
+      // (gets full instrument universe + OI published pre-market before 9:30 ET)
+      const syms = ['SPY.OPT', 'QQQ.OPT', 'IWM.OPT'];
       this._subscriptions = [
-        { schema: 'trades', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'cbbo-1s', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'statistics', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'definition', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
+        { schema: 'trades', stypeIn: 'parent', symbols: syms },
+        { schema: 'cbbo-1s', stypeIn: 'parent', symbols: syms },
+        { schema: 'statistics', stypeIn: 'parent', symbols: syms, start: 0 },
+        { schema: 'definition', stypeIn: 'parent', symbols: syms, start: 0 },
       ];
     }
 
@@ -565,7 +576,10 @@ class DatabentoLive extends EventEmitter {
       for (let i = 0; i < allSymbols.length; i += SYMBOL_BATCH_SIZE) {
         const chunk = allSymbols.slice(i, i + SYMBOL_BATCH_SIZE);
         const isLast = (i + SYMBOL_BATCH_SIZE >= allSymbols.length) ? 1 : 0;
-        const msg = `schema=${sub.schema}|stype_in=${sub.stypeIn}|symbols=${chunk.join(',')}|is_last=${isLast}\n`;
+        let msg = `schema=${sub.schema}|stype_in=${sub.stypeIn}|symbols=${chunk.join(',')}`;
+        // start=0 replays all data from the current session (definitions + OI history)
+        if (sub.start !== undefined) msg += `|start=${sub.start}`;
+        msg += `|is_last=${isLast}\n`;
         this._socket.write(msg);
       }
       console.log(`[DatabentoLive] Subscribed: ${sub.schema} → ${allSymbols.join(',')}`);
@@ -658,12 +672,24 @@ class DatabentoLive extends EventEmitter {
       case RTYPE.CBBO_1M: case RTYPE.TCBBO: case RTYPE.BBO_1S: case RTYPE.BBO_1M: {
         const quote = parseQuote(buf, off);
         this._stats.quotesReceived++;
+        // Track latest BBO per instrument for live chain building
+        if (quote.level) {
+          const { bidPx, askPx, bidSz, askSz } = quote.level;
+          if (bidPx > 0 || askPx > 0) {
+            this._quotes.set(quote.instrumentId, { bid: bidPx, ask: askPx, bidSz, askSz });
+          }
+        }
         this.emit('quote', this._enrichWithInstrument(quote));
         break;
       }
       case RTYPE.STATISTICS: {
         const stat = parseStat(buf, off);
         this._stats.statsReceived++;
+        // Track OI per instrument for live chain building
+        if (stat.statType === STAT_OPEN_INTEREST) {
+          const oi = Number(stat.quantity);
+          if (oi > 0) this._oi.set(stat.instrumentId, oi);
+        }
         this.emit('statistic', this._enrichWithInstrument(stat));
         break;
       }
@@ -713,6 +739,98 @@ class DatabentoLive extends EventEmitter {
       record.multiplier = def.contractMultiplier;
     }
     return record;
+  }
+
+  // ── Live Options Chain Builder ─────────────────────────────────────────
+  // Build a complete options chain from accumulated live stream data.
+  // Uses definitions, OI, and quotes collected during the session.
+
+  /**
+   * Get available expiration dates for a ticker from live instrument definitions.
+   * @param {string} ticker
+   * @returns {string[]} Sorted YYYY-MM-DD dates
+   */
+  getExpirations(ticker) {
+    const upper = ticker.toUpperCase();
+    const today = new Date().toISOString().slice(0, 10);
+    const exps = new Set();
+    for (const def of this._instruments.values()) {
+      if (def.underlying === upper && def.expirationDate && def.expirationDate >= today) {
+        exps.add(def.expirationDate);
+      }
+    }
+    return [...exps].sort();
+  }
+
+  /**
+   * Build a normalized options chain from live stream data.
+   * Includes OI from stat events and mid-price from quotes.
+   *
+   * @param {string} ticker
+   * @param {string} expirationDate - YYYY-MM-DD
+   * @returns {object[]} Contracts with strike, type, OI, bid, ask, midPrice
+   */
+  getOptionsChain(ticker, expirationDate) {
+    const upper = ticker.toUpperCase();
+    const contracts = [];
+
+    for (const [instrId, def] of this._instruments) {
+      if (def.underlying !== upper) continue;
+      if (def.expirationDate !== expirationDate) continue;
+      if (!def.optionType || !def.strikePrice) continue;
+
+      const oi = this._oi.get(instrId) || 0;
+      const quote = this._quotes.get(instrId) || { bid: 0, ask: 0, bidSz: 0, askSz: 0 };
+      const mid = quote.bid > 0 && quote.ask > 0 ? (quote.bid + quote.ask) / 2 : 0;
+
+      contracts.push({
+        symbol: def.rawSymbol,
+        ticker: upper,
+        strike: def.strikePrice,
+        expiration: expirationDate,
+        type: def.optionType,
+        openInterest: oi,
+        volume: 0,
+        lastPrice: mid,
+        bid: quote.bid,
+        ask: quote.ask,
+        bidSize: quote.bidSz,
+        askSize: quote.askSz,
+        // No greeks from OPRA — caller must compute via BS
+        delta: 0, gamma: 0, theta: 0, vega: 0,
+        impliedVolatility: 0,
+        _source: 'databento-live',
+      });
+    }
+
+    contracts.sort((a, b) => a.strike - b.strike);
+    return contracts;
+  }
+
+  /**
+   * Check if we have enough live data to build a meaningful chain.
+   * With start=0 subscription, definitions + OI replay from session start,
+   * so data accumulates quickly after connection.
+   */
+  hasDataFor(ticker) {
+    if (!this.connected) return false;
+    // Allow at least 10 seconds for the session replay to arrive
+    const connectedAt = this._stats.connectedAt;
+    if (connectedAt && (Date.now() - connectedAt.getTime()) < 10000) return false;
+
+    const upper = ticker.toUpperCase();
+    let defCount = 0;
+    let oiCount = 0;
+    for (const [instrId, def] of this._instruments) {
+      if (def.underlying === upper) {
+        defCount++;
+        if (this._oi.has(instrId)) oiCount++;
+      }
+    }
+    // With start=0 replay we get the full instrument universe quickly.
+    // Need at least 20 definitions (some OI may be sparse during off-hours).
+    // If we have definitions but no OI, still allow it — gamma can be estimated from quotes alone.
+    return defCount >= 20 && (oiCount >= 5 || defCount >= 100);
   }
 }
 
@@ -1127,9 +1245,13 @@ module.exports = {
   flow: flowTracker,
   connect: () => liveClient.connect(),
   disconnect: () => liveClient.disconnect(),
-  subscribe: (schema, stypeIn, symbols) => liveClient.subscribe(schema, stypeIn, symbols),
+  subscribe: (schema, stypeIn, symbols, start) => liveClient.subscribe(schema, stypeIn, symbols, start),
   getStatus: () => liveClient.getStatus(),
   getFlow: (ticker) => flowTracker.getFlow(ticker),
   getSignal: (ticker) => signalEngine.getSignal(ticker),
   getSweeps: (limit) => flowTracker.getRecentSweeps(limit),
+  // Live options chain builder
+  getExpirations: (ticker) => liveClient.getExpirations(ticker),
+  getOptionsChain: (ticker, exp) => liveClient.getOptionsChain(ticker, exp),
+  hasDataFor: (ticker) => liveClient.hasDataFor(ticker),
 };
