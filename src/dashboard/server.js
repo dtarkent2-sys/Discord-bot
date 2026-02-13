@@ -121,12 +121,15 @@ function startDashboard() {
   app.get('/api/safety', (req, res) => {
     let databentoStatus = null;
     try { const db = require('../services/databento'); databentoStatus = db.getStatus(); } catch { /* skip */ }
+    let liveStatus = null;
+    try { const live = require('../services/databento-live'); liveStatus = live.getStatus(); } catch { /* skip */ }
 
     res.json({
       circuitBreaker: circuitBreaker.getStatus(),
       mood: mood.getSummary(),
       auditLog: auditLog.getStats(),
       databento: databentoStatus,
+      databentoLive: liveStatus,
     });
   });
 
@@ -144,11 +147,23 @@ function startDashboard() {
   });
 
   // Options order flow (Databento OPRA tick-level trade data)
+  // Prefers live streaming data when available, falls back to historical API
   app.get('/api/flow/:ticker', async (req, res) => {
     try {
+      const ticker = req.params.ticker.toUpperCase().replace(/[^A-Z0-9.]/g, '');
+
+      // Try live data first (real-time, zero API cost)
+      try {
+        const live = require('../services/databento-live');
+        const liveFlow = live.getFlow(ticker);
+        if (liveFlow && liveFlow.tradeCount > 0) {
+          return res.json(liveFlow);
+        }
+      } catch { /* live not available */ }
+
+      // Fall back to historical API
       const db = require('../services/databento');
       if (!db.enabled) return res.json({ enabled: false, error: 'Databento not configured' });
-      const ticker = req.params.ticker.toUpperCase().replace(/[^A-Z0-9.]/g, '');
       const minutes = Math.min(Math.max(parseInt(req.query.minutes) || 15, 1), 60);
       const flow = await db.getOrderFlow(ticker, minutes);
       res.json(flow);

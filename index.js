@@ -143,6 +143,19 @@ client.once(Events.ClientReady, async (c) => {
   if (spyAlerts) {
     spyAlerts.prewarmOllama().catch(() => {});
   }
+
+  // Start Databento Live OPRA streaming if enabled ($199/mo subscription required)
+  try {
+    const dbnLive = require('./src/services/databento-live');
+    if (dbnLive.client.enabled) {
+      dbnLive.connect();
+      log.info('Databento Live: STREAMING (real-time OPRA via TCP)');
+    } else {
+      log.info('Databento Live: DISABLED (set DATABENTO_LIVE=true + OPRA subscription to enable)');
+    }
+  } catch (err) {
+    console.warn('[Bot] Databento Live module failed to load (non-critical):', err.message);
+  }
 });
 
 // ── Slash Command Handler ────────────────────────────────────────────
