@@ -388,7 +388,7 @@ function formatForPrompt(prices) {
  * Check if any price source is available.
  */
 function isAvailable() {
-  return !!yahooFinance || !!(fmpClient && fmpClient.enabled) || !!(alpacaClient && alpacaClient.enabled) || !!(ainvestClient && ainvestClient.enabled);
+  return !!(tradierClient && tradierClient.enabled) || !!(ainvestClient && ainvestClient.enabled) || !!(fmpClient && fmpClient.enabled) || !!(alpacaClient && alpacaClient.enabled) || !!yahooFinance;
 }
 
 module.exports = {
