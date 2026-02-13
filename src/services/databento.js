@@ -163,7 +163,7 @@ class DatabentoService {
       schema: 'definition',
       stype_in: 'parent',
       start: `${d}T00:00:00.000000000Z`,
-      end: `${d}T23:59:59.999999999Z`,
+      end: _safeEnd(d),
     }, 45000);
 
     const defs = new Map();
@@ -236,7 +236,7 @@ class DatabentoService {
       schema: 'statistics',
       stype_in: 'parent',
       start: `${d}T00:00:00.000000000Z`,
-      end: `${d}T23:59:59.999999999Z`,
+      end: _safeEnd(d),
     }, 45000);
 
     const oiMap = new Map();
@@ -264,7 +264,8 @@ class DatabentoService {
    * @returns {Promise<Map<number, object>>} instrumentId → { bid, ask, bidSize, askSize }
    */
   async getLatestQuotes(ticker, start, end) {
-    const now = new Date();
+    // Use 30s buffer to stay within Databento's available data range
+    const now = new Date(Date.now() - 30_000);
     const e = end || now.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
     const s = start || new Date(now.getTime() - 5 * 60 * 1000).toISOString().replace(/\.\d{3}Z/, '.000000000Z');
 
@@ -485,7 +486,8 @@ class DatabentoService {
     const cached = _dataCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < 30000) return cached.data; // 30s cache
 
-    const now = new Date();
+    // Use 30s buffer to stay within Databento's available data range
+    const now = new Date(Date.now() - 30_000);
     const start = new Date(now.getTime() - lookbackMinutes * 60 * 1000);
     const startStr = start.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
     const endStr = now.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
@@ -647,6 +649,22 @@ class DatabentoService {
 
 function _today() {
   return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Safe end-of-day timestamp for Databento queries.
+ * Databento's historical API rejects `end` values after the latest available data.
+ * For today's date, cap to "now minus 30s" so we never request future data.
+ * For past dates, use end-of-day as usual.
+ */
+function _safeEnd(dateStr) {
+  const today = _today();
+  if (dateStr === today) {
+    // Cap to ~30s ago to avoid racing the ingest pipeline
+    const now = new Date(Date.now() - 30_000);
+    return now.toISOString().replace(/\.\d{3}Z/, '.000000000Z');
+  }
+  return `${dateStr}T23:59:59.999999999Z`;
 }
 
 function _yesterday() {
