@@ -78,9 +78,33 @@ try {
 }
 
 log.info('Health server started, all modules loaded');
-log.info(`Data directory: ${config.dataDir} (${process.env.DATA_DIR ? 'volume-backed' : 'ephemeral — set DATA_DIR for persistence'})`);
-if (process.env.RAILWAY_ENVIRONMENT && !process.env.DATA_DIR) {
-  log.warn('⚠ DATA_DIR not set on Railway — memory, reactions, trade journal will be LOST on every deploy. Create a Railway volume and set DATA_DIR to the mount path.');
+
+// ── Data directory validation ────────────────────────────────────────
+{
+  const dir = config.dataDir;
+  const isVolume = !!process.env.DATA_DIR;
+  const onRailway = !!process.env.RAILWAY_ENVIRONMENT;
+  const fs = require('fs');
+
+  // Ensure the directory exists
+  if (!fs.existsSync(dir)) {
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  }
+
+  // Check if writable
+  let writable = false;
+  const probe = require('path').join(dir, '.write-test');
+  try { fs.writeFileSync(probe, 'ok'); fs.unlinkSync(probe); writable = true; } catch {}
+
+  if (isVolume && writable) {
+    log.info(`Data directory: ${dir} (volume-backed ✓)`);
+  } else if (isVolume && !writable) {
+    log.warn(`⚠ DATA_DIR=${dir} is set but NOT WRITABLE. Check that your Railway volume is mounted at exactly this path.`);
+  } else if (onRailway) {
+    log.warn('⚠ DATA_DIR not set on Railway — memory, reactions, trade journal will be LOST on every deploy. Create a Railway volume and set DATA_DIR to the mount path.');
+  } else {
+    log.info(`Data directory: ${dir} (local${writable ? '' : ' — NOT WRITABLE'})`);
+  }
 }
 
 // ── Discord Client Setup ─────────────────────────────────────────────
