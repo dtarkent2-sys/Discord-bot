@@ -336,9 +336,7 @@ function _populateLiveCache(ticker, data, source) {
       for (const exp of data.expirations) {
         const T = Math.max((new Date(exp.date).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
         let contracts;
-        if (source === 'Databento') {
-          contracts = await databento.getOptionsWithGreeks(ticker, exp.date);
-        } else if (source === 'Tradier') {
+        if (source === 'Tradier') {
           contracts = await tradier.getOptionsWithGreeks(ticker, exp.date);
         } else if (source === 'Public.com') {
           contracts = await publicService.getOptionsWithGreeks(ticker, exp.date);
@@ -528,9 +526,6 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
       if (trySource === 'DatabentoLive') {
         const dates = live.getExpirations(ticker);
         if (dates.length > 0) allExpDates = dates;
-      } else if (trySource === 'Databento') {
-        const dates = await databento.getOptionExpirations(ticker);
-        if (dates.length > 0) allExpDates = dates;
       } else if (trySource === 'Tradier') {
         const dates = await tradier.getOptionExpirations(ticker);
         if (dates.length > 0) allExpDates = dates;
@@ -614,8 +609,6 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
           let contracts;
           if (trySource === 'DatabentoLive') {
             contracts = live.getOptionsChain(ticker, expDate);
-          } else if (trySource === 'Databento') {
-            contracts = await databento.getOptionsWithGreeks(ticker, expDate);
           } else if (trySource === 'Tradier') {
             contracts = await tradier.getOptionsWithGreeks(ticker, expDate);
           } else {
@@ -1013,6 +1006,13 @@ async function loadTicker() {
   input.value = ticker;
   state.ticker = ticker;
 
+  // If live is on, let SSE handle the initial fetch (avoids double-fetch)
+  if (state.live) {
+    showLoading('Connecting live stream...');
+    startSSE();
+    return;
+  }
+
   showLoading('Fetching gamma data...');
 
   try {
@@ -1031,11 +1031,8 @@ async function loadTicker() {
     updateSpotBadge();
     updateFooter();
 
-    // If live was on, reconnect SSE
-    if (state.live) startSSE();
-
     // Start auto-refresh
-    if (state.refreshInterval > 0 && !state.live) startAutoRefresh();
+    if (state.refreshInterval > 0) startAutoRefresh();
 
   } catch (err) {
     showError(err.message);
@@ -1273,7 +1270,12 @@ function setInterval_(sec) {
   });
 
   clearAutoRefresh();
-  if (sec > 0 && !state.live) startAutoRefresh();
+  if (state.live) {
+    // Reconnect SSE with updated interval so the change takes effect immediately
+    startSSE();
+  } else if (sec > 0) {
+    startAutoRefresh();
+  }
 }
 
 function startAutoRefresh() {
@@ -1324,11 +1326,13 @@ function toggleLive() {
     btn.classList.add('active');
     dot.classList.replace('off', 'live');
     clearAutoRefresh();
-    startSSE();
+    refreshData();  // Immediate update so heatmap refreshes NOW
+    startSSE();     // Then SSE takes over for subsequent live updates
   } else {
     btn.classList.remove('active');
     dot.classList.replace('live', 'off');
     stopSSE();
+    refreshData();  // Immediate update so user doesn't wait for next poll
     if (state.refreshInterval > 0) startAutoRefresh();
   }
 }
@@ -1426,7 +1430,7 @@ function updateFooter() {
   const src = state.data.source || 'Yahoo';
   document.getElementById('footerLeft').textContent =
     'GEX = OI \\u00d7 Gamma \\u00d7 100 \\u00d7 Spot | Data: ' + src
-    + (src === 'Databento' ? ' (OPRA + ORATS greeks)' : src === 'Tradier' ? ' (ORATS real greeks)' : src === 'Public.com' ? ' (real greeks)' : ' (Black-Scholes est.)');
+    + (src === 'Tradier' ? ' (ORATS real greeks)' : src === 'Public.com' ? ' (real greeks)' : src.includes('LIVE') ? ' (OPRA live)' : ' (Black-Scholes est.)');
   document.getElementById('footerRight').textContent =
     'Updated: ' + new Date(state.data.timestamp).toLocaleTimeString() + ' | '
     + state.data.expirations.length + ' expirations | '
