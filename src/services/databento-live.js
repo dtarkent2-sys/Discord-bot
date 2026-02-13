@@ -1239,10 +1239,22 @@ const liveClient = new DatabentoLive();
 const signalEngine = new HftSignalEngine(liveClient);
 const flowTracker = new LiveFlowTracker(liveClient, signalEngine);
 
+// Wire Algo Trading Engine (full Databento algo suite)
+let algoEngine = null;
+try {
+  const algoTrading = require('./algo-trading');
+  algoEngine = algoTrading.engine;
+  algoTrading.connectLive(liveClient);
+  console.log('[DatabentoLive] Algo Trading Engine connected');
+} catch (err) {
+  console.warn('[DatabentoLive] Algo Trading Engine not available:', err.message);
+}
+
 module.exports = {
   client: liveClient,
   signals: signalEngine,
   flow: flowTracker,
+  algo: algoEngine,
   connect: () => liveClient.connect(),
   disconnect: () => liveClient.disconnect(),
   subscribe: (schema, stypeIn, symbols, start) => liveClient.subscribe(schema, stypeIn, symbols, start),
@@ -1254,4 +1266,8 @@ module.exports = {
   getExpirations: (ticker) => liveClient.getExpirations(ticker),
   getOptionsChain: (ticker, exp) => liveClient.getOptionsChain(ticker, exp),
   hasDataFor: (ticker) => liveClient.hasDataFor(ticker),
+  // Algo trading
+  getAlgoSignals: (ticker) => algoEngine ? algoEngine.getSignals(ticker) : null,
+  getAlgoPairs: () => algoEngine ? algoEngine.getPairsStatus() : [],
+  getAlgoPnl: () => algoEngine ? algoEngine.getPnl() : null,
 };

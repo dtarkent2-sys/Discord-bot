@@ -28,6 +28,8 @@ const gammaSqueeze = require('../services/gamma-squeeze');
 const gammaHeatmap = require('../services/gamma-heatmap');
 const yoloMode = require('../services/yolo-mode');
 const channelHistory = require('../services/channel-history');
+let algoTrading = null;
+try { algoTrading = require('../services/algo-trading'); } catch { /* algo-trading not available */ }
 const { AttachmentBuilder, MessageFlags, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -112,6 +114,8 @@ async function handleCommand(interaction) {
       return handleYolo(interaction);
     case 'ingest':
       return handleIngest(interaction);
+    case 'algo':
+      return handleAlgo(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -2099,6 +2103,112 @@ async function handleButtonInteraction(interaction) {
       console.error(`[GEX Heatmap Refresh] Error for ${ticker}:`, err);
     }
     return;
+  }
+}
+
+// ── /algo — Algo trading signals (Databento HFT suite) ───────────────
+
+async function handleAlgo(interaction) {
+  await interaction.deferReply();
+
+  const sub = interaction.options.getSubcommand();
+
+  try {
+    if (!algoTrading) {
+      await interaction.editReply('**Algo Trading** module is not available. Ensure `algo-trading.js` is present.');
+      return;
+    }
+
+    if (sub === 'signals') {
+      const ticker = interaction.options.getString('ticker').toUpperCase();
+      await interaction.editReply(`**Algo Trading — ${ticker}**\n⏳ Computing signals...`);
+
+      const formatted = algoTrading.formatForDiscord(ticker);
+      await interaction.editReply(formatted);
+
+    } else if (sub === 'pairs') {
+      await interaction.editReply('**Pairs Trading**\n⏳ Loading pairs status...');
+
+      const ticker = interaction.options.getString('ticker');
+      if (ticker) {
+        // Add pair: format TICKER1/TICKER2
+        const parts = ticker.toUpperCase().split('/');
+        if (parts.length === 2) {
+          algoTrading.addPair(parts[0].trim(), parts[1].trim());
+          const status = algoTrading.engine.pairs.getPairStatus(parts[0].trim(), parts[1].trim());
+          await interaction.editReply(
+            `**Pairs Trading — ${parts[0]}/${parts[1]}** — Pair registered!\n` +
+            (status ? `Hedge β: ${status.hedgeRatio || 'pending'} | Corr: ${status.correlation || 'pending'}` : 'Waiting for price data...')
+          );
+        } else {
+          await interaction.editReply(`**Pairs Trading** — Invalid format. Use \`TICKER1/TICKER2\` (e.g. SPY/QQQ)`);
+        }
+      } else {
+        const formatted = algoTrading.formatPairsForDiscord();
+        await interaction.editReply(formatted);
+      }
+
+    } else if (sub === 'vwap') {
+      const ticker = interaction.options.getString('ticker').toUpperCase();
+      await interaction.editReply(`**VWAP — ${ticker}**\n⏳ Computing...`);
+
+      const formatted = algoTrading.formatVwapForDiscord(ticker);
+      await interaction.editReply(formatted);
+
+    } else if (sub === 'pnl') {
+      const pnl = algoTrading.getPnl();
+      const signals = algoTrading.getRecentSignals(15);
+
+      const parts = ['**Algo Trading P&L**\n'];
+
+      // Book skew P&L
+      parts.push(`**Book Skew Strategy:**`);
+      parts.push(`  Realized: $${pnl.bookSkew.realized} | Unrealized: $${pnl.bookSkew.unrealized} | Total: $${pnl.bookSkew.total}`);
+
+      // Active positions
+      const positions = pnl.positions;
+      const posKeys = Object.keys(positions);
+      if (posKeys.length > 0) {
+        parts.push(`\n**Active Positions (${posKeys.length}):**`);
+        for (const tk of posKeys) {
+          const p = positions[tk];
+          const dir = p.lots > 0 ? 'LONG' : p.lots < 0 ? 'SHORT' : 'FLAT';
+          const total = p.realizedPnl + p.unrealizedPnl;
+          const icon = total >= 0 ? '🟢' : '🔴';
+          parts.push(`  ${icon} **${tk}** ${dir} ${Math.abs(p.lots)} @ $${p.avgEntry.toFixed(2)} — P&L: $${total.toFixed(2)} (${p.tradeCount} trades)`);
+        }
+      } else {
+        parts.push('\n_No active positions_');
+      }
+
+      // Pairs P&L
+      const pairsStatus = algoTrading.getPairsStatus();
+      const activePairs = pairsStatus.filter(p => p.tradeCount > 0);
+      if (activePairs.length > 0) {
+        parts.push(`\n**Pairs Trading:**`);
+        for (const p of activePairs) {
+          const icon = p.pnl >= 0 ? '🟢' : '🔴';
+          parts.push(`  ${icon} ${p.pair}: P&L ${p.pnl} | ${p.wins}W/${p.losses}L | Sharpe: ${p.sharpe}`);
+        }
+      }
+
+      // Recent signals
+      if (signals.length > 0) {
+        parts.push(`\n**Recent Signals (${signals.length}):**`);
+        for (const s of signals.slice(-10)) {
+          const time = new Date(s.ts).toLocaleTimeString();
+          parts.push(`  \`${time}\` ${s.type} — ${s.ticker || s.pair || '?'} ${s.direction || s.side || ''}`);
+        }
+      }
+
+      await interaction.editReply(parts.join('\n'));
+
+    } else {
+      await interaction.editReply('Unknown subcommand. Use `/algo signals`, `/algo pairs`, `/algo vwap`, or `/algo pnl`.');
+    }
+  } catch (err) {
+    console.error(`[Algo] Error:`, err);
+    await interaction.editReply(`**Algo Trading**\n❌ ${err.message}`).catch(() => {});
   }
 }
 
