@@ -776,11 +776,15 @@ class OptionsEngine {
       aiDecision.conviction = Math.min(aiDecision.conviction, 6);
     }
 
-    // Re-check conviction after alignment caps (uses time-adjusted floor)
-    const effectiveMinConviction = Math.max(cfg.options_min_conviction, thetaConvictionFloor);
+    // Re-check conviction after alignment caps
+    // Regime-based floor: require higher conviction in CAUTIOUS/RISK_OFF to avoid getting chopped up
+    const regimeConvictionFloor = macroRegime.regime === 'RISK_OFF' ? cfg.options_min_conviction + 3
+      : macroRegime.regime === 'CAUTIOUS' ? cfg.options_min_conviction + 1
+      : cfg.options_min_conviction;
+    const effectiveMinConviction = Math.max(regimeConvictionFloor, thetaConvictionFloor);
     if (aiDecision.conviction < effectiveMinConviction) {
       const reason = effectiveMinConviction > cfg.options_min_conviction
-        ? `conviction ${aiDecision.conviction}/10 below time-adjusted threshold ${effectiveMinConviction} (${et.minutesToClose} min to close, theta accelerating)`
+        ? `conviction ${aiDecision.conviction}/10 below adjusted threshold ${effectiveMinConviction} (regime=${macroRegime.regime}, ${et.minutesToClose} min to close)`
         : `conviction dropped to ${aiDecision.conviction}/10 after alignment check (min ${cfg.options_min_conviction})`;
       this._log('scan', `${underlying}: ${reason} — skipping`);
       return null;
@@ -1006,13 +1010,15 @@ class OptionsEngine {
       }
     }
 
-    // VWAP
+    // VWAP — hard directional gate: trading against VWAP is the #1 loss pattern
     if (tech.priceAboveVWAP) {
-      bullPoints += 0.5;
-      reasons.push('Price above VWAP (+0.5 bull)');
+      bullPoints += 1;
+      bearPoints = Math.max(0, bearPoints - 1); // penalize bearish bias when above VWAP
+      reasons.push('Price above VWAP (+1 bull, -1 bear penalty)');
     } else {
-      bearPoints += 0.5;
-      reasons.push('Price below VWAP (+0.5 bear)');
+      bearPoints += 1;
+      bullPoints = Math.max(0, bullPoints - 1); // penalize bullish bias when below VWAP
+      reasons.push('Price below VWAP (+1 bear, -1 bull penalty)');
     }
 
     // Bollinger
@@ -1026,11 +1032,15 @@ class OptionsEngine {
       }
     }
 
-    // Volume trend (confirming direction)
-    if (tech.volumeTrend > 1.5) {
-      if (tech.momentum > 0) bullPoints += 0.5;
-      else bearPoints += 0.5;
-      reasons.push(`Volume surging ${tech.volumeTrend.toFixed(1)}x (+0.5 direction confirm)`);
+    // Volume trend — low volume kills 0DTE scalps
+    if (tech.volumeTrend < 0.6) {
+      bullPoints = Math.max(0, bullPoints - 1.5);
+      bearPoints = Math.max(0, bearPoints - 1.5);
+      reasons.push(`LOW VOLUME ${tech.volumeTrend.toFixed(1)}x (-1.5 both — no conviction without volume)`);
+    } else if (tech.volumeTrend > 1.5) {
+      if (tech.momentum > 0) bullPoints += 1;
+      else bearPoints += 1;
+      reasons.push(`Volume surging ${tech.volumeTrend.toFixed(1)}x (+1 direction confirm)`);
     }
 
     // ── VOLATILITY REGIME (thetagang-inspired) ──
@@ -1049,10 +1059,11 @@ class OptionsEngine {
       else bearPoints += 1;
       reasons.push(`Clean trend (chop=${tech.choppiness.toFixed(1)}) (+1 ${trendDir})`);
     } else if (tech.choppiness > 3.0) {
-      // High choppiness = choppy, reduce both sides
-      bullPoints = Math.max(0, bullPoints - 0.5);
-      bearPoints = Math.max(0, bearPoints - 0.5);
-      reasons.push(`Choppy market (chop=${tech.choppiness.toFixed(1)}) (-0.5 both)`);
+      // High choppiness = choppy, heavy penalty — momentum scalps get whipsawed
+      const choppyPenalty = tech.choppiness > 3.5 ? 2 : 1;
+      bullPoints = Math.max(0, bullPoints - choppyPenalty);
+      bearPoints = Math.max(0, bearPoints - choppyPenalty);
+      reasons.push(`Choppy market (chop=${tech.choppiness.toFixed(1)}) (-${choppyPenalty} both — momentum unreliable)`);
     }
 
     // Calculate total and direction
