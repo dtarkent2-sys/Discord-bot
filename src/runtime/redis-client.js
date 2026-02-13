@@ -2,9 +2,33 @@
  * Shared minimal Redis client using native TCP/TLS + RESP protocol.
  * No npm dependency — uses only Node.js built-in `net` and `tls` modules.
  * Supports both redis:// (plain TCP) and rediss:// (TLS) URLs.
+ *
+ * IMPORTANT: The RESP parser works with Buffers (byte-level), NOT strings.
+ * The RESP protocol's $N bulk-string prefix is a BYTE count, so we must
+ * compare against Buffer.length (bytes), not String.length (characters).
+ * Mixing these up causes hangs on any stored data with multi-byte UTF-8
+ * (emoji, CJK, etc.) because the parser thinks it needs more data.
  */
 
 const log = require('../logger')('RedisClient');
+
+const CR = 0x0D; // \r
+const LF = 0x0A; // \n
+const PLUS  = 0x2B; // +
+const MINUS = 0x2D; // -
+const COLON = 0x3A; // :
+const DOLLAR = 0x24; // $
+
+/**
+ * Find \r\n in a Buffer starting at `offset`.
+ * Returns the index of \r, or -1 if not found.
+ */
+function findCRLF(buf, offset) {
+  for (let i = offset; i < buf.length - 1; i++) {
+    if (buf[i] === CR && buf[i + 1] === LF) return i;
+  }
+  return -1;
+}
 
 /**
  * Create a Redis client from a connection URL.
@@ -32,7 +56,7 @@ function createRedisClient(redisUrl) {
     }
 
     function onConnect() {
-      let buffer = '';
+      let buffer = Buffer.alloc(0);
       const pending = [];
 
       function rejectAll(err) {
@@ -53,11 +77,14 @@ function createRedisClient(redisUrl) {
         }
 
         return new Promise((res, rej) => {
-          const parts = [`*${args.length}`];
+          // Build RESP command as Buffer (byte-accurate)
+          const parts = [`*${args.length}\r\n`];
           for (const arg of args) {
             const str = String(arg);
-            parts.push(`$${Buffer.byteLength(str)}`, str);
+            parts.push(`$${Buffer.byteLength(str)}\r\n${str}\r\n`);
           }
+          const payload = Buffer.from(parts.join(''));
+
           // Per-command timeout so a stuck command can never block the boot chain.
           // IMPORTANT: on timeout we mark the entry dead but do NOT splice it from
           // the queue. Redis still sends its response, and the parser must consume
@@ -74,7 +101,7 @@ function createRedisClient(redisUrl) {
             if (!settled) { settled = true; rej(new Error(`Redis command timeout (${timeoutMs / 1000}s)`)); }
           }, timeoutMs);
           pending.push(entry);
-          socket.write(parts.join('\r\n') + '\r\n');
+          socket.write(payload);
         });
       }
 
@@ -89,43 +116,54 @@ function createRedisClient(redisUrl) {
         else entry.resolve(val);
       }
 
-      function parseResponse(data) {
-        buffer += data;
+      /**
+       * Process as many complete RESP responses as possible from the buffer.
+       * All length comparisons use Buffer.length (bytes), matching the RESP
+       * protocol's $N byte-count semantics.
+       */
+      function processBuffer() {
         while (buffer.length > 0) {
-          const nlIndex = buffer.indexOf('\r\n');
-          if (nlIndex === -1) break;
+          const nlIdx = findCRLF(buffer, 0);
+          if (nlIdx === -1) break;
 
           const type = buffer[0];
-          const line = buffer.slice(1, nlIndex);
+          const line = buffer.slice(1, nlIdx).toString('utf-8');
 
-          if (type === '+') {
-            buffer = buffer.slice(nlIndex + 2);
+          if (type === PLUS) {
+            buffer = buffer.slice(nlIdx + 2);
             settle(line, false);
-          } else if (type === '-') {
-            buffer = buffer.slice(nlIndex + 2);
+          } else if (type === MINUS) {
+            buffer = buffer.slice(nlIdx + 2);
             settle(new Error(line), true);
-          } else if (type === ':') {
-            buffer = buffer.slice(nlIndex + 2);
+          } else if (type === COLON) {
+            buffer = buffer.slice(nlIdx + 2);
             settle(parseInt(line, 10), false);
-          } else if (type === '$') {
+          } else if (type === DOLLAR) {
             const len = parseInt(line, 10);
             if (len === -1) {
-              buffer = buffer.slice(nlIndex + 2);
+              buffer = buffer.slice(nlIdx + 2);
               settle(null, false);
             } else {
-              const totalLen = nlIndex + 2 + len + 2;
-              if (buffer.length < totalLen) break;
-              const val = buffer.slice(nlIndex + 2, nlIndex + 2 + len);
-              buffer = buffer.slice(totalLen);
+              // nlIdx + 2 = start of bulk data (bytes)
+              // len = byte count of the bulk string
+              // + 2 = trailing \r\n
+              const totalNeeded = nlIdx + 2 + len + 2;
+              if (buffer.length < totalNeeded) break; // Wait for more data (byte-accurate!)
+              const val = buffer.slice(nlIdx + 2, nlIdx + 2 + len).toString('utf-8');
+              buffer = buffer.slice(totalNeeded);
               settle(val, false);
             }
           } else {
-            buffer = buffer.slice(nlIndex + 2);
+            // Unknown type — skip this line
+            buffer = buffer.slice(nlIdx + 2);
           }
         }
       }
 
-      socket.on('data', (data) => parseResponse(data.toString()));
+      socket.on('data', (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        processBuffer();
+      });
       socket.on('error', (err) => rejectAll(err));
       socket.on('close', () => rejectAll(new Error('Redis connection closed')));
 
