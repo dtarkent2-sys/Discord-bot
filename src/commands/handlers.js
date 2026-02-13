@@ -25,6 +25,7 @@ const policy = require('../services/policy');
 const optionsEngine = require('../services/options-engine');
 const initiative = require('../services/initiative');
 const gammaSqueeze = require('../services/gamma-squeeze');
+const gammaHeatmap = require('../services/gamma-heatmap');
 const yoloMode = require('../services/yolo-mode');
 const channelHistory = require('../services/channel-history');
 const { AttachmentBuilder, MessageFlags, PermissionsBitField, ChannelType } = require('discord.js');
@@ -734,6 +735,8 @@ async function handleGEX(interaction) {
       return handleGEXSummary(interaction);
     case 'alerts':
       return handleGEXAlerts(interaction);
+    case 'heatmap':
+      return handleGEXHeatmap(interaction);
     default:
       return handleGEXChart(interaction);
   }
@@ -876,6 +879,38 @@ async function handleGEXAlerts(interaction) {
   } catch (err) {
     console.error(`[GEX Alerts] Error for ${ticker}:`, err);
     await interaction.editReply(`**${ticker} — GEX Alerts**\n❌ ${err.message || 'Unknown error'}`);
+  }
+}
+
+/**
+ * /gex heatmap — Gamma heat map: GEX by strike × expiration with color intensity
+ */
+async function handleGEXHeatmap(interaction) {
+  const rawTicker = interaction.options.getString('ticker');
+  const ticker = yahoo.sanitizeTicker(rawTicker);
+  const strikeRange = interaction.options.getInteger('range') || 20;
+  if (!ticker) {
+    return interaction.editReply('Invalid ticker symbol. Use 1-12 alphanumeric characters (e.g. SPY, AAPL).');
+  }
+
+  if (!gammaHeatmap.enabled) {
+    return interaction.editReply('Gamma heat map is unavailable — canvas module not loaded.');
+  }
+
+  try {
+    await interaction.editReply(`**${ticker} — Gamma Heat Map**\n⏳ Fetching options chains across expirations...`);
+
+    const result = await gammaHeatmap.generate(ticker, { strikeRange });
+    const summary = gammaHeatmap.formatForDiscord(ticker, result.spotPrice, result.expirations);
+
+    const attachment = new AttachmentBuilder(result.buffer, { name: `${ticker}-gamma-heatmap.png` });
+    await interaction.editReply({
+      content: summary,
+      files: [attachment],
+    });
+  } catch (err) {
+    console.error(`[GEX Heatmap] Error for ${ticker}:`, err);
+    await interaction.editReply(`**${ticker} — Gamma Heat Map**\n❌ ${err.message || 'Unknown error'}`);
   }
 }
 
