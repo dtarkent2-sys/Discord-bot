@@ -903,9 +903,12 @@ async function handleGEXHeatmap(interaction) {
     const result = await gammaHeatmap.generate(ticker, { strikeRange });
     const summary = gammaHeatmap.formatForDiscord(ticker, result.spotPrice, result.expirations);
 
+    // Dashboard link for interactive view
+    const dashLine = `\n🖥️ **Interactive Dashboard** → \`/gex\` route on the bot's web server (port ${require('../config').port}) — real-time updates, toggle expirations, hover for details`;
+
     const attachment = new AttachmentBuilder(result.buffer, { name: `${ticker}-gamma-heatmap.png` });
     await interaction.editReply({
-      content: summary,
+      content: summary + dashLine,
       files: [attachment],
     });
   } catch (err) {
