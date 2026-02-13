@@ -508,9 +508,8 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
 
   const sourcesToTry = [];
   if (live && live.hasDataFor(ticker)) sourcesToTry.push('DatabentoLive');
-  // Skip Databento Historical if live stream is connected — same data but lagged and slow
-  const liveConnected = live && live.client && live.client.connected;
-  if (databento.enabled && !liveConnected) sourcesToTry.push('Databento');
+  // Databento Historical REST API skipped — too slow for interactive use
+  // (3 HTTP reqs × 6 expirations × 30-45s each = 3-5 min total)
   if (tradier.enabled) sourcesToTry.push('Tradier');
   if (publicService.enabled) sourcesToTry.push('Public.com');
   sourcesToTry.push('Yahoo');
@@ -565,13 +564,54 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
     expirationResults = [];
     allStrikes = new Set();
 
-    for (const expDate of targetExpDates) {
-      try {
-        let strikeGEXMap;
-        let totalGEX;
+    if (trySource === 'Yahoo') {
+      // ── Yahoo: fetch all expirations in parallel for speed ──
+      const fetchResults = await Promise.allSettled(targetExpDates.map(async (expDate) => {
+        const expObj = yahooExps?.find(e => e.date === expDate);
+        if (!expObj) return null;
+        const result = await gamma._yahooFetch(ticker, expObj.epoch);
+        const options = result.options?.[0];
+        if (!options) return null;
 
-        if (trySource !== 'Yahoo') {
-          // ── Real data path: Live OPRA, Hist OPRA, Tradier, or Public.com ──
+        const chain = [];
+        for (const c of (options.calls || [])) {
+          chain.push({
+            strike: c.strike, expiration: expDate, expirationEpoch: expObj.epoch,
+            type: 'call', openInterest: c.openInterest || 0, impliedVolatility: c.impliedVolatility || 0,
+          });
+        }
+        for (const p of (options.puts || [])) {
+          chain.push({
+            strike: p.strike, expiration: expDate, expirationEpoch: expObj.epoch,
+            type: 'put', openInterest: p.openInterest || 0, impliedVolatility: p.impliedVolatility || 0,
+          });
+        }
+
+        const detailed = gamma.calculateDetailedGEX(chain, spotPrice);
+        const strikeGEXMap = {};
+        const strikes = [];
+        for (const s of detailed.strikes) {
+          strikeGEXMap[s.strike] = {
+            net: s['netGEX$'], call: s['callGEX$'], put: s['putGEX$'],
+            callOI: s.callOI, putOI: s.putOI,
+          };
+          strikes.push(s.strike);
+        }
+        return { date: expDate, strikeGEX: strikeGEXMap, totalGEX: detailed['totalNetGEX$'], strikes };
+      }));
+
+      for (const r of fetchResults) {
+        if (r.status === 'fulfilled' && r.value && Object.keys(r.value.strikeGEX).length > 0) {
+          expirationResults.push({ date: r.value.date, strikeGEX: r.value.strikeGEX, totalGEX: r.value.totalGEX });
+          for (const s of r.value.strikes) allStrikes.add(s);
+        } else if (r.status === 'rejected') {
+          console.warn(`[GEXHeatmap] Yahoo exp failed: ${r.reason?.message}`);
+        }
+      }
+    } else {
+      // ── Non-Yahoo sources: sequential (DatabentoLive is in-memory = fast) ──
+      for (const expDate of targetExpDates) {
+        try {
           let contracts;
           if (trySource === 'DatabentoLive') {
             contracts = live.getOptionsChain(ticker, expDate);
@@ -584,87 +624,48 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
           }
           if (!contracts || contracts.length === 0) continue;
 
-          // Time to expiry for BS gamma estimation
           const T = Math.max((new Date(expDate).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
 
-          // Compute GEX per strike
           const strikeMap = new Map();
           for (const c of contracts) {
             if (!c.strike || !c.openInterest) continue;
 
             let contractGamma = c.gamma;
-
-            // Estimate gamma via Black-Scholes when real greeks are missing
             if (!contractGamma || contractGamma === 0) {
               const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
               const iv = _estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
               contractGamma = _bsGamma(spotPrice, c.strike, iv, T);
             }
-
             if (!contractGamma) continue;
 
             const gex = c.openInterest * contractGamma * 100 * spotPrice;
-
             const entry = strikeMap.get(c.strike) || { net: 0, call: 0, put: 0, callOI: 0, putOI: 0 };
             if (c.type === 'call') {
               entry.call += gex;
               entry.callOI += c.openInterest;
             } else {
-              entry.put -= gex; // negative for dealer short puts
+              entry.put -= gex;
               entry.putOI += c.openInterest;
             }
             entry.net = entry.call + entry.put;
             strikeMap.set(c.strike, entry);
           }
 
-          strikeGEXMap = {};
-          totalGEX = 0;
+          const strikeGEXMap = {};
+          let totalGEX = 0;
           for (const [strike, data] of strikeMap) {
             strikeGEXMap[strike] = data;
             allStrikes.add(strike);
             totalGEX += data.net;
           }
-        } else {
-          // ── Yahoo fallback: Black-Scholes estimated gamma ──
-          const expObj = yahooExps?.find(e => e.date === expDate);
-          if (!expObj) continue;
-          const result = await gamma._yahooFetch(ticker, expObj.epoch);
-          const options = result.options?.[0];
-          if (!options) continue;
 
-          const chain = [];
-          for (const c of (options.calls || [])) {
-            chain.push({
-              strike: c.strike, expiration: expDate, expirationEpoch: expObj.epoch,
-              type: 'call', openInterest: c.openInterest || 0, impliedVolatility: c.impliedVolatility || 0,
-            });
+          if (Object.keys(strikeGEXMap).length > 0) {
+            expirationResults.push({ date: expDate, strikeGEX: strikeGEXMap, totalGEX });
           }
-          for (const p of (options.puts || [])) {
-            chain.push({
-              strike: p.strike, expiration: expDate, expirationEpoch: expObj.epoch,
-              type: 'put', openInterest: p.openInterest || 0, impliedVolatility: p.impliedVolatility || 0,
-            });
-          }
-
-          const detailed = gamma.calculateDetailedGEX(chain, spotPrice);
-          strikeGEXMap = {};
-          for (const s of detailed.strikes) {
-            strikeGEXMap[s.strike] = {
-              net: s['netGEX$'], call: s['callGEX$'], put: s['putGEX$'],
-              callOI: s.callOI, putOI: s.putOI,
-            };
-            allStrikes.add(s.strike);
-          }
-          totalGEX = detailed['totalNetGEX$'];
+        } catch (err) {
+          console.warn(`[GEXHeatmap API] Skipping ${expDate}: ${err.message}`);
+          if (err.name === 'TimeoutError' || err.message.includes('timeout')) break;
         }
-
-        if (Object.keys(strikeGEXMap).length > 0) {
-          expirationResults.push({ date: expDate, strikeGEX: strikeGEXMap, totalGEX });
-        }
-      } catch (err) {
-        console.warn(`[GEXHeatmap API] Skipping ${expDate}: ${err.message}`);
-        // If we hit a timeout, don't waste time on remaining expirations for this source
-        if (err.name === 'TimeoutError' || err.message.includes('timeout')) break;
       }
     }
 
