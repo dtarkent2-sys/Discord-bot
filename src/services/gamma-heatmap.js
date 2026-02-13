@@ -17,6 +17,7 @@
 const path = require('path');
 const gamma = require('./gamma');
 const databento = require('./databento');
+const databentoLive = require('./databento-live');
 const tradier = require('./tradier');
 const publicService = require('./public');
 const priceFetcher = require('../tools/price-fetcher');
@@ -141,13 +142,23 @@ class GammaHeatmapService {
     const upper = ticker.toUpperCase();
     const strikeRange = opts.strikeRange || 20;
 
-    // ── Data source priority: Databento (OPRA) > Tradier (ORATS) > Public.com > Yahoo ──
+    // ── Data source priority: DatabentoLive > Databento Hist > Tradier > Public.com > Yahoo ──
     let source = 'Yahoo';
     let allExpDates = null;
     let yahooExps = null;
 
     // 1. Get available expirations — try sources in order
-    if (databento.enabled) {
+    // DatabentoLive (real-time OPRA TCP stream — zero lag, has OI + quotes)
+    if (databentoLive.hasDataFor(upper)) {
+      try {
+        const dates = databentoLive.getExpirations(upper);
+        if (dates.length > 0) { allExpDates = dates; source = 'DatabentoLive'; }
+      } catch (err) {
+        console.warn(`[GammaHeatmap] DatabentoLive expirations failed: ${err.message}`);
+      }
+    }
+    // Databento Historical API (~35min lag, used when live stream not connected)
+    if (!allExpDates && databento.enabled) {
       try {
         const dates = await databento.getOptionExpirations(upper);
         if (dates.length > 0) { allExpDates = dates; source = 'Databento'; }
@@ -195,8 +206,9 @@ class GammaHeatmapService {
     }
 
     // 2. Get spot price
+    // OPRA (Databento) is options-only — always try Tradier for equity spot
     let spotPrice = null;
-    if (source === 'Tradier') {
+    if (tradier.enabled) {
       try {
         const q = await tradier.getQuote(upper);
         spotPrice = q.price;
@@ -223,10 +235,13 @@ class GammaHeatmapService {
         let strikeGEX;
         let totalGEX;
 
-        if (source === 'Databento' || source === 'Tradier' || source === 'Public.com') {
-          // ── Real data path: Databento (OPRA+ORATS), Tradier (ORATS), or Public.com ──
+        if (source === 'DatabentoLive' || source === 'Databento' || source === 'Tradier' || source === 'Public.com') {
+          // ── Real data path: Live OPRA, Hist OPRA, Tradier, or Public.com ──
           let contracts;
-          if (source === 'Databento') {
+          if (source === 'DatabentoLive') {
+            // Real-time OPRA stream — OI + quotes, gamma=0 (BS estimation below)
+            contracts = databentoLive.getOptionsChain(upper, expDate);
+          } else if (source === 'Databento') {
             // Databento OPRA quotes/OI merged with Tradier ORATS greeks
             contracts = await databento.getOptionsWithGreeks(upper, expDate);
           } else if (source === 'Tradier') {
@@ -546,7 +561,8 @@ class GammaHeatmapService {
    * Format Discord text summary to accompany the heat map image.
    */
   formatForDiscord(ticker, spotPrice, expirations, source) {
-    const sourceLabel = source === 'Databento' ? 'Databento OPRA + ORATS greeks'
+    const sourceLabel = source === 'DatabentoLive' ? 'Databento Live OPRA (real-time)'
+      : source === 'Databento' ? 'Databento OPRA + ORATS greeks'
       : source === 'Tradier' ? 'Tradier (ORATS real greeks)'
       : source === 'Public.com' ? 'Public.com (real greeks)'
       : 'Yahoo Finance (Black-Scholes est.)';
