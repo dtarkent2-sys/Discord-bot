@@ -9,6 +9,7 @@ const auditLog = require('./audit-log');
 const { todayString, nowEST, ragEnforcementBlock, MODEL_CUTOFF, userMessageDateAnchor, detectHallucinations, buildHallucinationWarning } = require('../date-awareness');
 const priceFetcher = require('../tools/price-fetcher');
 const selfAwareness = require('./self-awareness');
+const channelHistory = require('./channel-history');
 
 class AIService {
   constructor() {
@@ -178,6 +179,7 @@ ${searchResults ? `\nWEB SEARCH RESULTS (fetched ${now} — use as source of tru
 ${mood.buildMoodContext()}
 
 ${selfAwareness.buildSelfKnowledge()}
+${channelHistory.buildContext()}
 ${this._buildReactionContext()}
 `.trim();
   }

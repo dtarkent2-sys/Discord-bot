@@ -363,11 +363,10 @@ const commands = [
     )
     .addStringOption(opt =>
       opt.setName('strategy')
-        .setDescription('Trading strategy (optional — AI picks if omitted)')
+        .setDescription('Trading strategy — 0DTE scalp only')
         .setRequired(false)
         .addChoices(
-          { name: 'scalp — quick in/out, tight stops', value: 'scalp' },
-          { name: 'swing — larger move, wider stops', value: 'swing' },
+          { name: 'scalp — quick in/out, tight stops (0DTE)', value: 'scalp' },
         )
     ),
   new SlashCommandBuilder()
@@ -401,6 +400,22 @@ const commands = [
       opt.setName('ticker')
         .setDescription('Stock symbol (for detail view, e.g. SPY, QQQ)')
         .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('ingest')
+    .setDescription('Read channel history into memory — Billy learns from past conversations')
+    .addChannelOption(opt =>
+      opt.setName('channel')
+        .setDescription('Channel to ingest (omit to ingest all text channels)')
+        .setRequired(false)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('limit')
+        .setDescription('Max messages to read per channel (default 2000)')
+        .setRequired(false)
+        .setMinValue(100)
+        .setMaxValue(5000)
     ),
 
   new SlashCommandBuilder()
