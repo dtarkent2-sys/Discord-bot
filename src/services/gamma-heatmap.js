@@ -16,7 +16,6 @@
 
 const path = require('path');
 const gamma = require('./gamma');
-const databento = require('./databento');
 let databentoLive = null;
 try { databentoLive = require('./databento-live'); } catch { /* not available */ }
 const tradier = require('./tradier');

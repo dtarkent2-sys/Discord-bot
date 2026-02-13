@@ -1257,8 +1257,9 @@ class OptionsEngine {
       let hasRealGreeks = false;
 
       // Databento: institutional OPRA data merged with Tradier ORATS greeks
-      const databento = require('./databento');
-      if (databento.enabled) {
+      let databento = null;
+      try { databento = require('./databento'); } catch { /* module removed */ }
+      if (databento && databento.enabled) {
         try {
           const allContracts = await databento.getOptionsWithGreeks(underlying, et.todayString);
           options = optionType

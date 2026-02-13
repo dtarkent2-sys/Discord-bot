@@ -162,8 +162,9 @@ function startDashboard() {
       } catch { /* live not available */ }
 
       // Fall back to historical API
-      const db = require('../services/databento');
-      if (!db.enabled) return res.json({ enabled: false, error: 'Databento not configured' });
+      let db = null;
+      try { db = require('../services/databento'); } catch { /* module removed */ }
+      if (!db || !db.enabled) return res.json({ enabled: false, error: 'Databento not configured' });
       const minutes = Math.min(Math.max(parseInt(req.query.minutes) || 15, 1), 60);
       const flow = await db.getOrderFlow(ticker, minutes);
       res.json(flow);
