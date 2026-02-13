@@ -1,14 +1,19 @@
 /**
  * ML Trading Predictor — Machine Learning Price Prediction
  *
- * Uses Databento Historical MBP-10 (Market-by-Price, 10 levels) data to build
+ * Uses Databento Historical TBBO (Trade with Best Bid/Offer) data to build
  * high-frequency trading signals and train linear regression models.
  *
  * Based on: https://databento.com/docs/examples/algo-trading/machine-learning
  *
+ * Schema choice:
+ *   MBP-10 fires on every book event (thousands/sec for ES) — too large for HTTP.
+ *   TBBO fires only on trades and includes top-of-book BBO at trade time.
+ *   This is orders of magnitude smaller while keeping both key signals.
+ *
  * Features:
  *   - Book skew: log(bid_size) - log(ask_size) at top-of-book
- *   - Order imbalance: log(total_bid_count) - log(total_ask_count) across 10 levels
+ *   - Order imbalance: log(bid_count) - log(ask_count) at top-of-book
  *   - Forward midprice return (markout)
  *
  * Model: OLS linear regression with non-negative coefficient constraint
@@ -57,7 +62,7 @@ try {
 const _resultCache = new Map();
 const RESULT_CACHE_TTL = 5 * 60 * 1000; // 5 min
 
-// Product metadata: dataset and front-month continuous symbol format
+// Product metadata
 const PRODUCTS = {
   ES:  { dataset: 'GLBX.MDP3', name: 'E-mini S&P 500' },
   NQ:  { dataset: 'GLBX.MDP3', name: 'E-mini Nasdaq-100' },
@@ -93,29 +98,28 @@ class MLPredictor {
   // ── Databento Historical API ─────────────────────────────────────────
 
   /**
-   * Fetch MBP-10 data from Databento Historical API.
-   * Returns raw JSON records (one per book update event).
+   * Fetch trade data from Databento Historical API.
    *
-   * MBP-10 is extremely high-volume (thousands of events/sec for ES).
-   * We use a record limit + streaming to keep memory/time bounded.
+   * Uses TBBO schema (Trade with Best Bid/Offer): each record is a trade
+   * event with the top-of-book BBO snapshot at trade time.  This is orders
+   * of magnitude smaller than MBP-10 (which fires on every book event)
+   * while preserving the signals we need (skew + top-level imbalance).
    *
    * @param {string} product - Futures product symbol
    * @param {string} start - Start timestamp
    * @param {string} end - End timestamp
    * @param {object} [fetchOpts]
-   * @param {number} [fetchOpts.limit=100000] - Max records from API
    * @param {number} [fetchOpts.timeoutMs=300000] - HTTP timeout (5 min)
-   * @param {number} [fetchOpts.maxRecords=100000] - Stop parsing after this many
+   * @param {number} [fetchOpts.maxRecords=50000] - Stop parsing after this many
    */
-  async _fetchMBP10(product, start, end, fetchOpts = {}) {
+  async _fetchTrades(product, start, end, fetchOpts = {}) {
     if (!this.enabled) throw new Error('Databento API key not configured');
 
     const meta = PRODUCTS[product.toUpperCase()];
     if (!meta) throw new Error(`Unknown product: ${product}. Supported: ${Object.keys(PRODUCTS).join(', ')}`);
 
-    const limit = fetchOpts.limit || 100000;
     const timeoutMs = fetchOpts.timeoutMs || 300000; // 5 min
-    const maxRecords = fetchOpts.maxRecords || 100000;
+    const maxRecords = fetchOpts.maxRecords || 50000;
 
     // Ensure timestamps have nanosecond precision + UTC suffix
     start = _ensureNanoTimestamp(start);
@@ -124,18 +128,17 @@ class MLPredictor {
     const url = `${HIST_BASE}/v${API_VERSION}/timeseries.get_range`;
     const params = {
       dataset: meta.dataset,
-      schema: 'mbp-10',
+      schema: 'tbbo',  // Trade with Best Bid/Offer — only fires on trades
       symbols: `${product.toUpperCase()}.v.0`, // front-month continuous
       stype_in: 'continuous',
       encoding: 'json',
       compression: 'none',
       start,
       end,
-      limit: String(limit),
     };
 
     const body = new URLSearchParams(params);
-    console.log(`[ML-Predictor] Fetching MBP-10 for ${product} from ${start} to ${end} (limit=${limit})`);
+    console.log(`[ML-Predictor] Fetching TBBO for ${product} from ${start} to ${end}`);
 
     const res = await fetch(url, {
       method: 'POST',
@@ -152,7 +155,7 @@ class MLPredictor {
       throw new Error(`Databento API ${res.status}: ${text.slice(0, 500)}`);
     }
 
-    // Stream the response line-by-line to avoid buffering hundreds of MB.
+    // Stream the response line-by-line to avoid buffering everything.
     // Databento returns JSON Lines (one JSON object per line).
     const records = [];
     const reader = res.body.getReader();
@@ -165,8 +168,7 @@ class MLPredictor {
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
-      // Keep the last (possibly incomplete) line in the buffer
-      buffer = lines.pop();
+      buffer = lines.pop(); // keep last (possibly incomplete) line
 
       for (const line of lines) {
         const trimmed = line.trim();
@@ -180,13 +182,12 @@ class MLPredictor {
       }
 
       if (records.length >= maxRecords) {
-        // Cancel the rest of the stream — we have enough data
         reader.cancel().catch(() => {});
         break;
       }
     }
 
-    // Process any remaining data in the buffer
+    // Process remaining buffer
     if (buffer.trim() && records.length < maxRecords) {
       try {
         records.push(JSON.parse(buffer.trim()));
@@ -195,34 +196,32 @@ class MLPredictor {
       }
     }
 
-    console.log(`[ML-Predictor] Received ${records.length} MBP-10 records for ${product}`);
+    console.log(`[ML-Predictor] Received ${records.length} TBBO records for ${product}`);
     return records;
   }
 
   // ── Feature Extraction ────────────────────────────────────────────────
 
   /**
-   * Extract a level's bid/ask price, size, and count from a record.
+   * Extract top-of-book BBO from a TBBO record.
    * Handles both flat format (bid_px_00) and nested levels array.
    */
-  _getLevel(rec, level) {
-    const pad = String(level).padStart(2, '0');
-
-    // Try flat format first (bid_px_00, ask_px_00, etc.)
-    if (rec[`bid_px_${pad}`] != null) {
+  _getBBO(rec) {
+    // Flat format (bid_px_00, ask_px_00, etc.)
+    if (rec.bid_px_00 != null) {
       return {
-        bidPx: rec[`bid_px_${pad}`] / PRICE_SCALE,
-        askPx: rec[`ask_px_${pad}`] / PRICE_SCALE,
-        bidSz: rec[`bid_sz_${pad}`] || 0,
-        askSz: rec[`ask_sz_${pad}`] || 0,
-        bidCt: rec[`bid_ct_${pad}`] || 0,
-        askCt: rec[`ask_ct_${pad}`] || 0,
+        bidPx: rec.bid_px_00 / PRICE_SCALE,
+        askPx: rec.ask_px_00 / PRICE_SCALE,
+        bidSz: rec.bid_sz_00 || 0,
+        askSz: rec.ask_sz_00 || 0,
+        bidCt: rec.bid_ct_00 || 0,
+        askCt: rec.ask_ct_00 || 0,
       };
     }
 
-    // Try nested levels array
-    if (rec.levels && rec.levels[level]) {
-      const lv = rec.levels[level];
+    // Nested levels array
+    if (rec.levels && rec.levels[0]) {
+      const lv = rec.levels[0];
       return {
         bidPx: (lv.bid_px || 0) / PRICE_SCALE,
         askPx: (lv.ask_px || 0) / PRICE_SCALE,
@@ -237,60 +236,37 @@ class MLPredictor {
   }
 
   /**
-   * Get the action type from a record.
-   * Trade actions: 'T' (trade) or numeric equivalent.
-   */
-  _isTrade(rec) {
-    const action = rec.action;
-    if (typeof action === 'string') return action === 'T';
-    // Databento action enum: Trade = 84 (ASCII 'T')
-    if (typeof action === 'number') return action === 84;
-    return false;
-  }
-
-  /**
-   * Process raw MBP-10 records into a feature DataFrame.
-   * Filters to trades only, calculates features, and forward returns.
+   * Process TBBO records into a feature set.
+   * TBBO records are already trade-only — no filtering needed.
    *
-   * @param {object[]} records - Raw MBP-10 JSON records
+   * @param {object[]} records - Raw TBBO JSON records
    * @param {number} markout - Forward trade count for return calculation (default 500)
    * @returns {object} { data: Array<{mid, skew, imbalance, ret}>, stats }
    */
   buildFeatures(records, markout = 500) {
-    // Step 1: Filter to trade events only
-    const trades = records.filter(rec => this._isTrade(rec));
-
-    if (trades.length < markout * 2) {
-      throw new Error(`Insufficient trade data: ${trades.length} trades (need at least ${markout * 2} for markout=${markout})`);
+    if (records.length < markout * 2) {
+      throw new Error(`Insufficient trade data: ${records.length} trades (need at least ${markout * 2} for markout=${markout})`);
     }
 
-    // Step 2: Extract features for each trade
+    // Extract features for each trade
     const rows = [];
-    for (const rec of trades) {
-      const top = this._getLevel(rec, 0);
+    for (const rec of records) {
+      const bbo = this._getBBO(rec);
 
-      // Skip records with invalid prices
-      if (top.bidPx <= 0 || top.askPx <= 0 || top.bidSz <= 0 || top.askSz <= 0) continue;
+      // Skip records with invalid prices or zero sizes
+      if (bbo.bidPx <= 0 || bbo.askPx <= 0 || bbo.bidSz <= 0 || bbo.askSz <= 0) continue;
 
       // Midprice
-      const mid = (top.bidPx + top.askPx) / 2;
+      const mid = (bbo.bidPx + bbo.askPx) / 2;
 
       // Book skew: log imbalance of top-level sizes
-      const skew = Math.log(top.bidSz) - Math.log(top.askSz);
+      const skew = Math.log(bbo.bidSz) - Math.log(bbo.askSz);
 
-      // Order imbalance: log imbalance of order count across all 10 levels
-      let totalBidCt = 0;
-      let totalAskCt = 0;
-      for (let i = 0; i < 10; i++) {
-        const lv = this._getLevel(rec, i);
-        totalBidCt += lv.bidCt;
-        totalAskCt += lv.askCt;
-      }
-
-      // Guard against zero counts
-      if (totalBidCt <= 0 || totalAskCt <= 0) continue;
-
-      const imbalance = Math.log(totalBidCt) - Math.log(totalAskCt);
+      // Order imbalance: log imbalance of top-level order counts
+      // (TBBO only has level 0; with MBP-10 you'd sum across 10 levels)
+      const bidCt = bbo.bidCt || 1;
+      const askCt = bbo.askCt || 1;
+      const imbalance = Math.log(bidCt) - Math.log(askCt);
 
       rows.push({ mid, skew, imbalance });
     }
@@ -299,7 +275,7 @@ class MLPredictor {
       throw new Error(`Insufficient valid trades after filtering: ${rows.length} (need ${markout * 2})`);
     }
 
-    // Step 3: Calculate forward midprice returns (markout)
+    // Calculate forward midprice returns (markout)
     const data = [];
     for (let i = 0; i < rows.length - markout; i++) {
       data.push({
@@ -314,7 +290,7 @@ class MLPredictor {
       data,
       stats: {
         totalRecords: records.length,
-        totalTrades: trades.length,
+        totalTrades: rows.length,
         validRows: data.length,
         markout,
       },
@@ -360,10 +336,9 @@ class MLPredictor {
     if (p === 1) {
       beta = [XtX[0][0] > 0 ? Xty[0] / XtX[0][0] : 0];
     } else if (p === 2) {
-      // 2x2 matrix inverse
       const det = XtX[0][0] * XtX[1][1] - XtX[0][1] * XtX[1][0];
       if (Math.abs(det) < 1e-12) {
-        beta = [0, 0]; // Singular matrix
+        beta = [0, 0];
       } else {
         beta = [
           (XtX[1][1] * Xty[0] - XtX[0][1] * Xty[1]) / det,
@@ -371,7 +346,6 @@ class MLPredictor {
         ];
       }
     } else {
-      // For larger systems, use Gaussian elimination
       beta = this._solveGaussian(XtX, Xty);
     }
 
@@ -387,16 +361,12 @@ class MLPredictor {
     const aug = A.map((row, i) => [...row, b[i]]);
 
     for (let col = 0; col < n; col++) {
-      // Partial pivoting
       let maxRow = col;
       for (let row = col + 1; row < n; row++) {
         if (Math.abs(aug[row][col]) > Math.abs(aug[maxRow][col])) maxRow = row;
       }
       [aug[col], aug[maxRow]] = [aug[maxRow], aug[col]];
-
       if (Math.abs(aug[col][col]) < 1e-12) continue;
-
-      // Eliminate below
       for (let row = col + 1; row < n; row++) {
         const factor = aug[row][col] / aug[col][col];
         for (let j = col; j <= n; j++) {
@@ -405,7 +375,6 @@ class MLPredictor {
       }
     }
 
-    // Back substitution
     const x = new Array(n).fill(0);
     for (let i = n - 1; i >= 0; i--) {
       if (Math.abs(aug[i][i]) < 1e-12) continue;
@@ -415,7 +384,6 @@ class MLPredictor {
       }
       x[i] /= aug[i][i];
     }
-
     return x;
   }
 
@@ -428,9 +396,6 @@ class MLPredictor {
 
   // ── Correlation Matrix ────────────────────────────────────────────────
 
-  /**
-   * Compute Pearson correlation matrix for named columns.
-   */
   correlationMatrix(data, columns) {
     const n = data.length;
     const vals = columns.map(col => data.map(d => d[col]));
@@ -444,10 +409,7 @@ class MLPredictor {
     const corr = Array.from({ length: columns.length }, () => new Array(columns.length).fill(0));
     for (let i = 0; i < columns.length; i++) {
       for (let j = 0; j < columns.length; j++) {
-        if (stds[i] === 0 || stds[j] === 0) {
-          corr[i][j] = 0;
-          continue;
-        }
+        if (stds[i] === 0 || stds[j] === 0) { corr[i][j] = 0; continue; }
         let cov = 0;
         for (let k = 0; k < n; k++) {
           cov += (vals[i][k] - means[i]) * (vals[j][k] - means[j]);
@@ -455,35 +417,19 @@ class MLPredictor {
         corr[i][j] = cov / (n * stds[i] * stds[j]);
       }
     }
-
     return { columns, matrix: corr };
   }
 
   // ── Cumulative Markout PnL ────────────────────────────────────────────
 
-  /**
-   * Calculate cumulative markout PnL from predictions.
-   * Sorts by absolute prediction value, flips return sign for short predictions.
-   *
-   * Logic: for each trade, if we predict positive return -> go long (keep return as-is)
-   *        if we predict negative return -> go short (flip return sign)
-   *        sort by prediction value to show PnL from most negative to most positive signal
-   */
   getCumulativeMarkoutPnL(predictions, actualReturns) {
     const pairs = predictions.map((pred, i) => ({
       pred,
       ret: pred < 0 ? -actualReturns[i] : actualReturns[i],
     }));
-
-    // Sort by prediction value (most negative to most positive)
     pairs.sort((a, b) => a.pred - b.pred);
-
-    // Cumulative sum
     let cumSum = 0;
-    return pairs.map(p => {
-      cumSum += p.ret;
-      return cumSum;
-    });
+    return pairs.map(p => { cumSum += p.ret; return cumSum; });
   }
 
   // ── Main Prediction Pipeline ──────────────────────────────────────────
@@ -507,15 +453,14 @@ class MLPredictor {
     const markout = options.markout || 500;
     const trainSplit = options.trainSplit || 0.66;
 
-    // Default: 2-hour window during active trading (10:00-12:00 ET).
-    // MBP-10 is extremely high-volume — a full session would be millions of
-    // records.  2 hours of ES gives ~5,000-15,000 trades, plenty for ML.
-    // Databento requires nanosecond-precision UTC timestamps.
+    // Default: full regular-hours session on last trading day.
+    // TBBO schema only fires on trades (~10-30k/day for ES) so a full
+    // session is manageable, unlike MBP-10 which fires on every book event.
     let { start, end } = options;
     if (!start || !end) {
       const d = _lastTradingDay();
-      start = `${d}T15:00:00.000000000Z`;  // 10:00 AM ET = 15:00 UTC
-      end = `${d}T17:00:00.000000000Z`;    // 12:00 PM ET = 17:00 UTC
+      start = `${d}T14:30:00.000000000Z`;  // 9:30 AM ET = 14:30 UTC
+      end = `${d}T21:00:00.000000000Z`;    // 4:00 PM ET = 21:00 UTC
     }
 
     // Check cache
@@ -523,8 +468,8 @@ class MLPredictor {
     const cached = _resultCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL) return cached.data;
 
-    // Step 1: Fetch MBP-10 data
-    const records = await this._fetchMBP10(product, start, end);
+    // Step 1: Fetch TBBO data
+    const records = await this._fetchTrades(product, start, end);
 
     // Step 2: Build features
     const { data, stats: featureStats } = this.buildFeatures(records, markout);
@@ -577,6 +522,7 @@ class MLPredictor {
     const result = {
       product,
       productName: meta.name,
+      schema: 'tbbo',
       start,
       end,
       markout,
@@ -614,9 +560,6 @@ class MLPredictor {
 
   // ── Chart Generation ──────────────────────────────────────────────────
 
-  /**
-   * Render cumulative PnL chart as PNG buffer.
-   */
   async renderPnLChart(result) {
     if (!chartRenderer) throw new Error('Chart renderer not available');
 
@@ -706,11 +649,7 @@ class MLPredictor {
               color: '#a0a0a0',
               font: { family: FONT_FAMILY },
             },
-            ticks: {
-              color: '#a0a0a0',
-              font: { family: FONT_FAMILY },
-              maxTicksLimit: 10,
-            },
+            ticks: { color: '#a0a0a0', font: { family: FONT_FAMILY }, maxTicksLimit: 10 },
             grid: { color: 'rgba(255,255,255,0.05)' },
           },
           y: {
@@ -720,11 +659,7 @@ class MLPredictor {
               color: '#a0a0a0',
               font: { family: FONT_FAMILY },
             },
-            ticks: {
-              color: '#a0a0a0',
-              font: { family: FONT_FAMILY },
-              callback: (v) => v.toFixed(2),
-            },
+            ticks: { color: '#a0a0a0', font: { family: FONT_FAMILY }, callback: (v) => v.toFixed(2) },
             grid: { color: 'rgba(255,255,255,0.1)' },
           },
         },
@@ -736,20 +671,14 @@ class MLPredictor {
 
   // ── Discord Formatting ────────────────────────────────────────────────
 
-  /**
-   * Format correlation matrix as a Discord code block.
-   */
   formatCorrelationMatrix(corr) {
     const { columns, matrix } = corr;
     const colWidth = 12;
-
     let out = '```\n';
     out += ''.padEnd(colWidth) + columns.map(c => c.padStart(colWidth)).join('') + '\n';
-
     for (let i = 0; i < columns.length; i++) {
       let row = columns[i].padEnd(colWidth);
       for (let j = 0; j < columns.length; j++) {
-        // Upper-triangle only (like the Python example)
         if (j >= i) {
           row += matrix[i][j].toFixed(6).padStart(colWidth);
         } else {
@@ -758,21 +687,17 @@ class MLPredictor {
       }
       out += row + '\n';
     }
-
     out += '```';
     return out;
   }
 
-  /**
-   * Format full results as Discord message.
-   */
   formatResults(result) {
     const { product, productName, start, end, markout, featureStats, trainSize, testSize, models, correlation } = result;
 
     const lines = [
       `**ML Price Predictor — ${product} (${productName})**`,
       '',
-      `**Data:** ${featureStats.totalRecords.toLocaleString()} MBP-10 records | ${featureStats.totalTrades.toLocaleString()} trades`,
+      `**Data:** ${featureStats.totalRecords.toLocaleString()} TBBO records | ${featureStats.totalTrades.toLocaleString()} trades`,
       `**Period:** ${start} to ${end}`,
       `**Markout:** ${markout} trades forward | **Split:** ${trainSize.toLocaleString()} train / ${testSize.toLocaleString()} test`,
       '',
@@ -782,7 +707,7 @@ class MLPredictor {
       '**Out-of-Sample Model Performance:**',
     ];
 
-    for (const [key, model] of Object.entries(models)) {
+    for (const [, model] of Object.entries(models)) {
       const coeffStr = Object.entries(model.coefficients)
         .map(([k, v]) => `${k}=${v.toFixed(6)}`)
         .join(', ');
@@ -790,7 +715,6 @@ class MLPredictor {
       lines.push(`  **${model.name}** | corr=${model.oosCorrelation.toFixed(4)} | PnL=${pnlSign}${model.finalPnL.toFixed(2)} ticks | coeff: ${coeffStr}`);
     }
 
-    // Determine best model
     const best = Object.entries(models).reduce((a, b) => b[1].finalPnL > a[1].finalPnL ? b : a);
     lines.push('');
     lines.push(`**Best model:** ${best[1].name} (${best[1].finalPnL >= 0 ? '+' : ''}${best[1].finalPnL.toFixed(2)} ticks cumulative return)`);
@@ -798,14 +722,8 @@ class MLPredictor {
     return lines.join('\n');
   }
 
-  /**
-   * Get supported products list.
-   */
   getSupportedProducts() {
-    return Object.entries(PRODUCTS).map(([symbol, meta]) => ({
-      symbol,
-      name: meta.name,
-    }));
+    return Object.entries(PRODUCTS).map(([symbol, meta]) => ({ symbol, name: meta.name }));
   }
 
   getStatus() {
@@ -820,9 +738,6 @@ class MLPredictor {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-/**
- * Get the last trading day (skip weekends).
- */
 function _lastTradingDay() {
   const d = new Date();
   d.setDate(d.getDate() - 1);
@@ -832,33 +747,21 @@ function _lastTradingDay() {
   return d.toISOString().slice(0, 10);
 }
 
-/**
- * Ensure a timestamp has nanosecond precision and UTC suffix.
- * Databento requires format like: 2023-12-06T14:30:00.000000000Z
- */
 function _ensureNanoTimestamp(ts) {
   if (!ts) return ts;
-  // Already has nanosecond precision
   if (/\.\d{9}Z$/.test(ts)) return ts;
-  // Has some fractional seconds - normalize to 9 digits
   if (/\.\d+Z?$/.test(ts)) {
     const base = ts.replace(/Z$/, '').replace(/\.(\d+)$/, (_, frac) => '.' + frac.padEnd(9, '0'));
     return base + 'Z';
   }
-  // No fractional seconds - add .000000000Z
   return ts.replace(/Z$/, '') + '.000000000Z';
 }
 
-/**
- * Pearson correlation between two arrays.
- */
 function _pearson(a, b) {
   const n = a.length;
   if (n === 0) return 0;
-
   const meanA = a.reduce((s, x) => s + x, 0) / n;
   const meanB = b.reduce((s, x) => s + x, 0) / n;
-
   let cov = 0, varA = 0, varB = 0;
   for (let i = 0; i < n; i++) {
     const da = a[i] - meanA;
@@ -867,7 +770,6 @@ function _pearson(a, b) {
     varA += da * da;
     varB += db * db;
   }
-
   const denom = Math.sqrt(varA * varB);
   return denom > 0 ? cov / denom : 0;
 }
