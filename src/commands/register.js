@@ -178,6 +178,22 @@ const commands = [
             .setDescription('Stock symbol (e.g. SPY, QQQ)')
             .setRequired(true)
         )
+    )
+    .addSubcommand(sub =>
+      sub.setName('heatmap')
+        .setDescription('Gamma heat map — GEX by strike × expiration with color intensity')
+        .addStringOption(opt =>
+          opt.setName('ticker')
+            .setDescription('Stock symbol (e.g. SPY, QQQ, AAPL)')
+            .setRequired(true)
+        )
+        .addIntegerOption(opt =>
+          opt.setName('range')
+            .setDescription('Number of strikes above/below spot (default: 20)')
+            .setRequired(false)
+            .setMinValue(5)
+            .setMaxValue(40)
+        )
     ),
 
   new SlashCommandBuilder()
