@@ -40,6 +40,10 @@ function startDashboard() {
 
   // Parse JSON bodies (for TradingView webhook POSTs)
   app.use(express.json({ limit: '1mb' }));
+
+  // ── GEX Gamma Heat Map interactive dashboard ──────────────────────────
+  const { registerGEXHeatmapRoutes } = require('./gex-heatmap');
+  registerGEXHeatmapRoutes(app);
   // Also accept plain text (some TradingView configs send text/plain)
   app.use(express.text({ type: 'text/plain', limit: '1mb' }));
 
@@ -257,7 +261,7 @@ function startDashboard() {
     </div>
   </div>
 
-  <footer>Auto-refreshes every 30s &bull; <a href="/api/stats" style="color:#7289da">Stats API</a> &bull; <a href="/api/safety" style="color:#7289da">Safety API</a> &bull; <a href="/api/audit" style="color:#7289da">Audit Log</a> &bull; <a href="/api/backups" style="color:#7289da">Backups</a></footer>
+  <footer>Auto-refreshes every 30s &bull; <a href="/gex" style="color:#7289da;font-weight:bold">Gamma Heat Map</a> &bull; <a href="/api/stats" style="color:#7289da">Stats API</a> &bull; <a href="/api/safety" style="color:#7289da">Safety API</a> &bull; <a href="/api/audit" style="color:#7289da">Audit Log</a> &bull; <a href="/api/backups" style="color:#7289da">Backups</a></footer>
   <script>setTimeout(() => location.reload(), 30000);</script>
 </body>
 </html>`);
