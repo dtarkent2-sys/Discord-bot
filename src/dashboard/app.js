@@ -245,12 +245,92 @@ function registerDashboardRoutes(app) {
     }
   });
 
+  // ── API: Algo Trading Signals ────────────────────────────────────────
+  app.get('/api/algo/signals/:ticker', (req, res) => {
+    try {
+      let algoTrading;
+      try { algoTrading = require('../services/algo-trading'); } catch { return res.json({ error: 'Algo trading module not available' }); }
+      const ticker = (req.params.ticker || 'SPY').toUpperCase();
+      const signals = algoTrading.getSignals(ticker);
+      res.json(signals);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API: Algo Trading Pairs ────────────────────────────────────────
+  app.get('/api/algo/pairs', (req, res) => {
+    try {
+      let algoTrading;
+      try { algoTrading = require('../services/algo-trading'); } catch { return res.json({ pairs: [] }); }
+      res.json({ pairs: algoTrading.getPairsStatus() });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API: Algo Trading Add Pair ────────────────────────────────────
+  app.post('/api/algo/pairs', (req, res) => {
+    try {
+      let algoTrading;
+      try { algoTrading = require('../services/algo-trading'); } catch { return res.json({ error: 'Algo trading module not available' }); }
+      const { tickerY, tickerX, lookback, entryZ, exitZ } = req.body || {};
+      if (!tickerY || !tickerX) return res.status(400).json({ error: 'tickerY and tickerX required' });
+      algoTrading.addPair(tickerY, tickerX, { lookback, entryZ, exitZ });
+      res.json({ ok: true, pair: `${tickerY.toUpperCase()}/${tickerX.toUpperCase()}` });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API: Algo Trading P&L ─────────────────────────────────────────
+  app.get('/api/algo/pnl', (req, res) => {
+    try {
+      let algoTrading;
+      try { algoTrading = require('../services/algo-trading'); } catch { return res.json({ error: 'Algo trading module not available' }); }
+      const pnl = algoTrading.getPnl();
+      const signals = algoTrading.getRecentSignals(50);
+      res.json({ pnl, recentSignals: signals });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API: Algo Trading VWAP ────────────────────────────────────────
+  app.get('/api/algo/vwap/:ticker', (req, res) => {
+    try {
+      let algoTrading;
+      try { algoTrading = require('../services/algo-trading'); } catch { return res.json({ error: 'Algo trading module not available' }); }
+      const ticker = (req.params.ticker || 'SPY').toUpperCase();
+      const vwap = algoTrading.engine.vwapTwap.getVwap(ticker);
+      const barVwap = algoTrading.engine.vwapTwap.getBarVwap(ticker);
+      const volumeProfile = algoTrading.engine.vwapTwap.getVolumeProfile(ticker);
+      res.json({ ticker, vwap, barVwap, volumeProfile });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── API: Algo Trading ML Model Info ───────────────────────────────
+  app.get('/api/algo/ml/:ticker', (req, res) => {
+    try {
+      let algoTrading;
+      try { algoTrading = require('../services/algo-trading'); } catch { return res.json({ error: 'Algo trading module not available' }); }
+      const ticker = (req.params.ticker || 'SPY').toUpperCase();
+      const prediction = algoTrading.engine.ml.getPrediction(ticker);
+      const modelInfo = algoTrading.engine.ml.getModelInfo(ticker);
+      res.json({ ticker, prediction, model: modelInfo });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Main Dashboard SPA ────────────────────────────────────────────────
   app.get('/dashboard', (_req, res) => {
     res.send(_dashboardHTML());
   });
 
-  console.log('[Dashboard] Command Center routes registered: /dashboard, /api/agent, /api/options, /api/trades, /api/overview');
+  console.log('[Dashboard] Command Center routes registered: /dashboard, /api/agent, /api/options, /api/trades, /api/overview, /api/algo/*');
 }
 
 // ── Dashboard HTML ────────────────────────────────────────────────────────

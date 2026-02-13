@@ -452,6 +452,41 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName('algo')
+    .setDescription('Algo Trading — Databento HFT signals, pairs trading, VWAP/TWAP, ML predictions')
+    .addSubcommand(sub =>
+      sub.setName('signals')
+        .setDescription('Live algo signals — book skew, OBI, VWAP, ML prediction for a ticker')
+        .addStringOption(opt =>
+          opt.setName('ticker')
+            .setDescription('Stock symbol (e.g. SPY, QQQ, AAPL)')
+            .setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
+      sub.setName('pairs')
+        .setDescription('Pairs trading — cointegration, z-scores, stat-arb signals')
+        .addStringOption(opt =>
+          opt.setName('ticker')
+            .setDescription('Add pair: TICKER1/TICKER2 (e.g. SPY/QQQ) — omit to see all pairs')
+            .setRequired(false)
+        )
+    )
+    .addSubcommand(sub =>
+      sub.setName('vwap')
+        .setDescription('VWAP/TWAP analysis — execution benchmarks, volume profile, bands')
+        .addStringOption(opt =>
+          opt.setName('ticker')
+            .setDescription('Stock symbol (e.g. SPY, QQQ, AAPL)')
+            .setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
+      sub.setName('pnl')
+        .setDescription('Algo trading P&L — strategy performance, positions, recent signals')
+    ),
+
+  new SlashCommandBuilder()
     .setName('mlpredict')
     .setDescription('ML Price Predictor — train momentum & volume models on futures OHLCV data')
     .addStringOption(opt =>
