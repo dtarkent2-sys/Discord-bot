@@ -450,6 +450,37 @@ const commands = [
           { name: 'logs — journal of all YOLO decisions', value: 'logs' },
         )
     ),
+
+  new SlashCommandBuilder()
+    .setName('mlpredict')
+    .setDescription('ML Price Predictor — train book skew & imbalance models on futures MBP-10 data')
+    .addStringOption(opt =>
+      opt.setName('product')
+        .setDescription('Futures product to analyze')
+        .setRequired(true)
+        .addChoices(
+          { name: 'ES — E-mini S&P 500', value: 'ES' },
+          { name: 'NQ — E-mini Nasdaq-100', value: 'NQ' },
+          { name: 'YM — E-mini Dow', value: 'YM' },
+          { name: 'RTY — E-mini Russell 2000', value: 'RTY' },
+          { name: 'CL — Crude Oil', value: 'CL' },
+          { name: 'GC — Gold', value: 'GC' },
+          { name: 'ZB — 30-Year Treasury', value: 'ZB' },
+          { name: 'ZN — 10-Year Treasury', value: 'ZN' },
+        )
+    )
+    .addIntegerOption(opt =>
+      opt.setName('markout')
+        .setDescription('Forward trade count for return calculation (default: 500)')
+        .setRequired(false)
+        .setMinValue(50)
+        .setMaxValue(5000)
+    )
+    .addStringOption(opt =>
+      opt.setName('date')
+        .setDescription('Trading date to analyze (YYYY-MM-DD, default: last trading day)')
+        .setRequired(false)
+    ),
 ];
 
 async function registerCommands() {
