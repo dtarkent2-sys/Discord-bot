@@ -167,7 +167,8 @@ class GammaHeatmapService {
     // If a source has expirations but produces no usable chain data (e.g. OI=0), fall back to next
     const sourcesToTry = [];
     if (databentoLive && databentoLive.hasDataFor(upper)) sourcesToTry.push('DatabentoLive');
-    if (databento.enabled) sourcesToTry.push('Databento');
+    // Skip Databento Historical if live stream is connected — same data but lagged and slow
+    if (databento.enabled && !(databentoLive && databentoLive.connected)) sourcesToTry.push('Databento');
     if (tradier.enabled) sourcesToTry.push('Tradier');
     if (publicService.enabled) sourcesToTry.push('Public.com');
     sourcesToTry.push('Yahoo');
@@ -296,6 +297,8 @@ class GammaHeatmapService {
           expirationData.push({ date: expDate, strikeGEX, totalGEX });
         } catch (err) {
           console.warn(`[GammaHeatmap] Skipping ${expDate}: ${err.message}`);
+          // If we hit a timeout, don't waste time on remaining expirations for this source
+          if (err.name === 'TimeoutError' || err.message.includes('timeout')) break;
         }
       }
 

@@ -88,54 +88,70 @@ class DatabentoService {
 
     console.log(`[Databento] POST timeseries.get_range schema=${params.schema} symbols=${params.symbols}`);
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': this._getAuthHeader(),
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: body.toString(),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    // Use AbortController with explicit timer to enforce timeout during streaming.
+    // AbortSignal.timeout() only reliably aborts the initial fetch(), not the body
+    // stream reader loop — so we need to manually check + abort during reads.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw new Error(`Databento API ${res.status}: ${text.slice(0, 500)}`);
-    }
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': this._getAuthHeader(),
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: body.toString(),
+        signal: controller.signal,
+      });
 
-    // Stream JSON Lines response incrementally to avoid string-length overflow.
-    // res.text() would load the entire body (~500MB+ for SPY OPRA) into one
-    // string, hitting Node.js's 0x1fffffe8-character limit.
-    const records = [];
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let partial = '';
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Databento API ${res.status}: ${text.slice(0, 500)}`);
+      }
 
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      // Stream JSON Lines response incrementally to avoid string-length overflow.
+      // res.text() would load the entire body (~500MB+ for SPY OPRA) into one
+      // string, hitting Node.js's 0x1fffffe8-character limit.
+      const records = [];
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let partial = '';
 
-      partial += decoder.decode(value, { stream: true });
-      const lines = partial.split('\n');
-      partial = lines.pop(); // keep the incomplete trailing line
+      for (;;) {
+        // Check abort before each read — catches timeout between chunks
+        if (controller.signal.aborted) {
+          reader.cancel().catch(() => {});
+          throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+        }
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          records.push(JSON.parse(trimmed));
-        } catch {
-          // Skip malformed lines
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        partial += decoder.decode(value, { stream: true });
+        const lines = partial.split('\n');
+        partial = lines.pop(); // keep the incomplete trailing line
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          try {
+            records.push(JSON.parse(trimmed));
+          } catch {
+            // Skip malformed lines
+          }
         }
       }
-    }
 
-    // Handle final partial line
-    if (partial.trim()) {
-      try { records.push(JSON.parse(partial.trim())); } catch {}
-    }
+      // Handle final partial line
+      if (partial.trim()) {
+        try { records.push(JSON.parse(partial.trim())); } catch {}
+      }
 
-    return records;
+      return records;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
