@@ -21,7 +21,8 @@
  *   - GEX Engine (gamma regime, walls, flip levels)
  *   - Technicals (RSI, MACD, Bollinger, ATR on intraday bars)
  *   - Macro (risk regime, sector rotation)
- *   - Public.com (preferred: real-time options chain + greeks)
+ *   - Databento (preferred: OPRA institutional NBBO + OI, merged with Tradier ORATS greeks)
+ *   - Public.com (fallback: real-time options chain + greeks)
  *   - Alpaca (fallback: indicative options chain, quotes, execution)
  *   - AI (Ollama decision engine)
  */
@@ -1251,11 +1252,30 @@ class OptionsEngine {
     const et = this._getETTime();
 
     try {
-      // Try Public.com first (real-time greeks), fall back to Alpaca
+      // Try Databento+Tradier first (OPRA NBBO + ORATS greeks), then Public.com, then Alpaca
       let options = [];
       let hasRealGreeks = false;
 
-      if (publicApi.enabled) {
+      // Databento: institutional OPRA data merged with Tradier ORATS greeks
+      const databento = require('./databento');
+      if (databento.enabled) {
+        try {
+          const allContracts = await databento.getOptionsWithGreeks(underlying, et.todayString);
+          options = optionType
+            ? allContracts.filter(c => c.type === optionType)
+            : allContracts;
+          hasRealGreeks = options.some(o => o.delta && Math.abs(o.delta) > 0.01);
+          if (options.length > 0) {
+            this._log('contract', `${underlying}: using Databento OPRA data (${options.length} contracts, greeks=${hasRealGreeks ? 'ORATS' : 'missing'})`);
+          }
+        } catch (err) {
+          console.error(`[0DTE] Databento chain error for ${underlying}: ${err.message} — falling back`);
+          options = [];
+        }
+      }
+
+      // Public.com fallback (real-time greeks)
+      if (options.length === 0 && publicApi.enabled) {
         try {
           options = await publicApi.getOptionsWithGreeks(underlying, et.todayString, optionType);
           hasRealGreeks = options.some(o => o.delta && Math.abs(o.delta) > 0.01);
@@ -1268,7 +1288,7 @@ class OptionsEngine {
         }
       }
 
-      // Fallback: Alpaca indicative feed
+      // Alpaca fallback (indicative feed)
       if (options.length === 0) {
         options = await alpaca.getOptionsSnapshots(underlying, et.todayString, optionType);
         hasRealGreeks = options.some(o => o.delta && Math.abs(o.delta) > 0.01);

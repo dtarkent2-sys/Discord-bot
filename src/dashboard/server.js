@@ -117,12 +117,16 @@ function startDashboard() {
     });
   });
 
-  // Trading safety status — circuit breaker, mood, audit log summary
+  // Trading safety status — circuit breaker, mood, audit log summary, data sources
   app.get('/api/safety', (req, res) => {
+    let databentoStatus = null;
+    try { const db = require('../services/databento'); databentoStatus = db.getStatus(); } catch { /* skip */ }
+
     res.json({
       circuitBreaker: circuitBreaker.getStatus(),
       mood: mood.getSummary(),
       auditLog: auditLog.getStats(),
+      databento: databentoStatus,
     });
   });
 

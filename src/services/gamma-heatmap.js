@@ -16,6 +16,7 @@
 
 const path = require('path');
 const gamma = require('./gamma');
+const databento = require('./databento');
 const tradier = require('./tradier');
 const publicService = require('./public');
 const priceFetcher = require('../tools/price-fetcher');
@@ -88,13 +89,21 @@ class GammaHeatmapService {
     const upper = ticker.toUpperCase();
     const strikeRange = opts.strikeRange || 20;
 
-    // ── Data source priority: Tradier (ORATS) > Public.com > Yahoo (Black-Scholes) ──
+    // ── Data source priority: Databento (OPRA) > Tradier (ORATS) > Public.com > Yahoo ──
     let source = 'Yahoo';
     let allExpDates = null;
     let yahooExps = null;
 
     // 1. Get available expirations — try sources in order
-    if (tradier.enabled) {
+    if (databento.enabled) {
+      try {
+        const dates = await databento.getOptionExpirations(upper);
+        if (dates.length > 0) { allExpDates = dates; source = 'Databento'; }
+      } catch (err) {
+        console.warn(`[GammaHeatmap] Databento expirations failed: ${err.message}`);
+      }
+    }
+    if (!allExpDates && tradier.enabled) {
       try {
         const dates = await tradier.getOptionExpirations(upper);
         if (dates.length > 0) { allExpDates = dates; source = 'Tradier'; }
@@ -162,10 +171,13 @@ class GammaHeatmapService {
         let strikeGEX;
         let totalGEX;
 
-        if (source === 'Tradier' || source === 'Public.com') {
-          // ── Real greeks path: Tradier (ORATS) or Public.com ──
+        if (source === 'Databento' || source === 'Tradier' || source === 'Public.com') {
+          // ── Real data path: Databento (OPRA+ORATS), Tradier (ORATS), or Public.com ──
           let contracts;
-          if (source === 'Tradier') {
+          if (source === 'Databento') {
+            // Databento OPRA quotes/OI merged with Tradier ORATS greeks
+            contracts = await databento.getOptionsWithGreeks(upper, expDate);
+          } else if (source === 'Tradier') {
             contracts = await tradier.getOptionsWithGreeks(upper, expDate);
           } else {
             contracts = await publicService.getOptionsWithGreeks(upper, expDate);
@@ -468,7 +480,8 @@ class GammaHeatmapService {
    * Format Discord text summary to accompany the heat map image.
    */
   formatForDiscord(ticker, spotPrice, expirations, source) {
-    const sourceLabel = source === 'Tradier' ? 'Tradier (ORATS real greeks)'
+    const sourceLabel = source === 'Databento' ? 'Databento OPRA + ORATS greeks'
+      : source === 'Tradier' ? 'Tradier (ORATS real greeks)'
       : source === 'Public.com' ? 'Public.com (real greeks)'
       : 'Yahoo Finance (Black-Scholes est.)';
     return [

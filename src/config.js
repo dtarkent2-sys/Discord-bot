@@ -60,7 +60,10 @@ module.exports = {
   alertMinConviction: parseInt(process.env.ALERT_MIN_CONVICTION, 10) || 4, // Only post alerts with conviction >= this (1-10, default 4 = show most signals)
   webhookSecret: process.env.WEBHOOK_SECRET || '', // Optional auth for TradingView webhook
 
-  // Tradier API (options chain with ORATS real greeks — preferred source)
+  // Databento OPRA (institutional-grade real-time options data — top-tier source)
+  databentoApiKey: process.env.DATABENTO_API_KEY || '',
+
+  // Tradier API (options chain with ORATS real greeks — used for greeks alongside Databento)
   tradierApiKey: process.env.TRADIER_API_KEY || '',
   tradierSandbox: (process.env.TRADIER_SANDBOX || 'true').toLowerCase() === 'true',
 
