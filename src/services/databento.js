@@ -72,6 +72,8 @@ class DatabentoService {
   /**
    * POST to timeseries.get_range — returns parsed JSON records.
    * Databento returns JSON Lines (one JSON object per line).
+   * Streams the response body to avoid Node.js string-length limits
+   * (~512 MB) on large OPRA datasets (SPY has 12K+ instruments).
    */
   async _getRange(params, timeoutMs = 30000) {
     if (!this.enabled) throw new Error('Databento API key not configured');
@@ -101,17 +103,36 @@ class DatabentoService {
       throw new Error(`Databento API ${res.status}: ${text.slice(0, 500)}`);
     }
 
-    // Parse JSON Lines response
-    const text = await res.text();
+    // Stream JSON Lines response incrementally to avoid string-length overflow.
+    // res.text() would load the entire body (~500MB+ for SPY OPRA) into one
+    // string, hitting Node.js's 0x1fffffe8-character limit.
     const records = [];
-    for (const line of text.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        records.push(JSON.parse(trimmed));
-      } catch {
-        // Skip malformed lines
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let partial = '';
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      partial += decoder.decode(value, { stream: true });
+      const lines = partial.split('\n');
+      partial = lines.pop(); // keep the incomplete trailing line
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          records.push(JSON.parse(trimmed));
+        } catch {
+          // Skip malformed lines
+        }
       }
+    }
+
+    // Handle final partial line
+    if (partial.trim()) {
+      try { records.push(JSON.parse(partial.trim())); } catch {}
     }
 
     return records;
