@@ -453,7 +453,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('mlpredict')
-    .setDescription('ML Order Book Predictor — MBP-10 depth + scikit-learn on CME futures')
+    .setDescription('ML walk-forward backtest — MBP-10 order book + scikit-learn on CME futures')
     .addStringOption(opt =>
       opt.setName('product')
         .setDescription('Futures product to analyze')
@@ -470,16 +470,28 @@ const commands = [
         )
     )
     .addIntegerOption(opt =>
-      opt.setName('markout')
-        .setDescription('Forward trade count for returns (default: 500 trades)')
+      opt.setName('days')
+        .setDescription('Calendar days to backtest (default: 60, max: 180)')
         .setRequired(false)
-        .setMinValue(100)
-        .setMaxValue(5000)
+        .setMinValue(5)
+        .setMaxValue(180)
     )
     .addStringOption(opt =>
-      opt.setName('date')
-        .setDescription('Trading date to analyze (YYYY-MM-DD, default: last trading day)')
+      opt.setName('start_date')
+        .setDescription('Backtest start date (YYYY-MM-DD)')
         .setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('end_date')
+        .setDescription('Backtest end date (YYYY-MM-DD, default: last trading day)')
+        .setRequired(false)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('markout')
+        .setDescription('Forward trade count for returns (default: 300)')
+        .setRequired(false)
+        .setMinValue(50)
+        .setMaxValue(5000)
     )
     .addStringOption(opt =>
       opt.setName('model')
@@ -490,6 +502,11 @@ const commands = [
           { name: 'Linear — LinearRegression only (fast)', value: 'linear' },
           { name: 'Gradient Boost — HistGradientBoosting only', value: 'gradient_boost' },
         )
+    )
+    .addStringOption(opt =>
+      opt.setName('date')
+        .setDescription('[Deprecated] Single date — use start_date/end_date instead')
+        .setRequired(false)
     ),
 ];
 
