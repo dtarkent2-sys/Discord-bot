@@ -2115,7 +2115,7 @@ async function handleMLPredict(interaction) {
   await interaction.deferReply();
 
   const product = interaction.options.getString('product');
-  const markout = interaction.options.getInteger('markout') || 500;
+  const markout = interaction.options.getInteger('markout') || 300; // 300 bars = 5 min forward
   const dateStr = interaction.options.getString('date');
 
   try {

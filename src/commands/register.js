@@ -453,7 +453,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('mlpredict')
-    .setDescription('ML Price Predictor — train book skew & imbalance models on futures MBP-10 data')
+    .setDescription('ML Price Predictor — train momentum & volume models on futures OHLCV data')
     .addStringOption(opt =>
       opt.setName('product')
         .setDescription('Futures product to analyze')
@@ -471,10 +471,10 @@ const commands = [
     )
     .addIntegerOption(opt =>
       opt.setName('markout')
-        .setDescription('Forward trade count for return calculation (default: 500)')
+        .setDescription('Forward lookback in seconds/bars (default: 300 = 5 min)')
         .setRequired(false)
-        .setMinValue(50)
-        .setMaxValue(5000)
+        .setMinValue(60)
+        .setMaxValue(3600)
     )
     .addStringOption(opt =>
       opt.setName('date')
