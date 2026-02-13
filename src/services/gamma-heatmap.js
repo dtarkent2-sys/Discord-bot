@@ -115,11 +115,12 @@ class GammaHeatmapService {
     // If a source has expirations but produces no usable chain data (e.g. OI=0), fall back to next
     const sourcesToTry = [];
     if (databentoLive && databentoLive.hasDataFor(upper)) sourcesToTry.push('DatabentoLive');
-    // Databento Historical REST API skipped — too slow for interactive use
-    // (3 HTTP reqs × 6 expirations × 30-45s each = 3-5 min total)
     if (tradier.enabled) sourcesToTry.push('Tradier');
     if (publicService.enabled) sourcesToTry.push('Public.com');
     sourcesToTry.push('Yahoo');
+    if (sourcesToTry.length === 1) {
+      console.warn('[GammaHeatmap] No premium sources configured — using Yahoo only. Set TRADIER_API_KEY for real greeks (free sandbox).');
+    }
 
     let source = null;
     let expirationData = [];
@@ -134,9 +135,6 @@ class GammaHeatmapService {
       try {
         if (trySource === 'DatabentoLive') {
           const dates = databentoLive.getExpirations(upper);
-          if (dates.length > 0) allExpDates = dates;
-        } else if (trySource === 'Databento') {
-          const dates = await databento.getOptionExpirations(upper);
           if (dates.length > 0) allExpDates = dates;
         } else if (trySource === 'Tradier') {
           const dates = await tradier.getOptionExpirations(upper);
@@ -217,8 +215,6 @@ class GammaHeatmapService {
             let contracts;
             if (trySource === 'DatabentoLive') {
               contracts = databentoLive.getOptionsChain(upper, expDate);
-            } else if (trySource === 'Databento') {
-              contracts = await databento.getOptionsWithGreeks(upper, expDate);
             } else if (trySource === 'Tradier') {
               contracts = await tradier.getOptionsWithGreeks(upper, expDate);
             } else {
@@ -535,7 +531,6 @@ class GammaHeatmapService {
    */
   formatForDiscord(ticker, spotPrice, expirations, source) {
     const sourceLabel = source === 'DatabentoLive' ? 'Databento Live OPRA (real-time)'
-      : source === 'Databento' ? 'Databento OPRA + ORATS greeks'
       : source === 'Tradier' ? 'Tradier (ORATS real greeks)'
       : source === 'Public.com' ? 'Public.com (real greeks)'
       : 'Yahoo Finance (Black-Scholes est.)';

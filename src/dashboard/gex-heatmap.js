@@ -439,11 +439,15 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
 
   const sourcesToTry = [];
   if (live && live.hasDataFor(ticker)) sourcesToTry.push('DatabentoLive');
-  // Databento Historical REST API skipped — too slow for interactive use
-  // (3 HTTP reqs × 6 expirations × 30-45s each = 3-5 min total)
   if (tradier.enabled) sourcesToTry.push('Tradier');
   if (publicService.enabled) sourcesToTry.push('Public.com');
+  // Alpaca omitted: indicative feed has no open interest data (OI=0),
+  // and no expiration discovery API. Needs SIP feed ($99/mo) for OI.
+  // Free alternative: set TRADIER_API_KEY (sandbox is free, includes ORATS greeks + OI)
   sourcesToTry.push('Yahoo');
+  if (sourcesToTry.length === 1) {
+    console.warn('[GEXHeatmap] No premium sources configured — using Yahoo only. Set TRADIER_API_KEY for real greeks (free sandbox).');
+  }
 
   let source = null;
   let expirationResults = [];

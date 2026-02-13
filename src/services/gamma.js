@@ -1142,37 +1142,45 @@ class GammaService {
 
         if (options.length > 0 && alpacaSpot) {
           const spotPrice = alpacaSpot;
-          // Use the actual expiration from returned data (may differ slightly)
           const expiration = this._pickAlpacaExpiration(options, expirationPref) || targetExp;
 
-          // If all gammas are 0 (indicative feed with no greeks), estimate via BS
-          const hasGreeks = options.some(o => o.gamma > 0 && o.expiration === expiration);
-          if (!hasGreeks) {
-            console.log(`[Gamma] Alpaca ${upper}: no greeks (indicative feed), estimating gamma via BS...`);
-            const T = Math.max((new Date(expiration).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
-            for (const o of options) {
-              if (o.expiration !== expiration) continue;
-              if (!o.gamma || o.gamma === 0) {
-                const mid = o.lastPrice || (o.bid > 0 && o.ask > 0 ? (o.bid + o.ask) / 2 : 0);
-                if (mid > 0) {
-                  const iv = this._estimateIV(mid, spotPrice, o.strike, T, o.type === 'call');
-                  o.gamma = this._bsGamma(spotPrice, o.strike, iv, T);
-                  o.impliedVolatility = iv;
+          // Check if open interest is available — indicative feed returns OI=0 for all contracts,
+          // making GEX calculation impossible (GEX = OI × gamma × 100 × spot)
+          const hasOI = options.some(o => o.openInterest > 0 && o.expiration === expiration);
+          if (!hasOI) {
+            console.log(`[Gamma] Alpaca ${upper}: no open interest data (indicative feed) — cannot compute GEX, falling back`);
+          } else {
+            // If all gammas are 0 (indicative feed with no greeks), estimate via BS
+            const hasGreeks = options.some(o => o.gamma > 0 && o.expiration === expiration);
+            if (!hasGreeks) {
+              console.log(`[Gamma] Alpaca ${upper}: no greeks (indicative feed), estimating gamma via BS...`);
+              const T = Math.max((new Date(expiration).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+              for (const o of options) {
+                if (o.expiration !== expiration) continue;
+                if (!o.gamma || o.gamma === 0) {
+                  const mid = o.lastPrice || (o.bid > 0 && o.ask > 0 ? (o.bid + o.ask) / 2 : 0);
+                  if (mid > 0) {
+                    const iv = this._estimateIV(mid, spotPrice, o.strike, T, o.type === 'call');
+                    o.gamma = this._bsGamma(spotPrice, o.strike, iv, T);
+                    o.impliedVolatility = iv;
+                  }
                 }
               }
             }
-          }
 
-          const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
-          if (gexData.strikes.length > 0) {
-            const flip = this.findGammaFlip(gexData, spotPrice);
-            const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
+            const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
+            if (gexData.strikes.length > 0) {
+              const flip = this.findGammaFlip(gexData, spotPrice);
+              const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
 
-            console.log(`[Gamma] ${upper}: Alpaca OK — ${options.length} contracts, exp ${expiration}`);
-            return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Alpaca' };
+              console.log(`[Gamma] ${upper}: Alpaca OK — ${options.length} contracts, exp ${expiration}`);
+              return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Alpaca' };
+            }
+            console.log(`[Gamma] Alpaca returned insufficient data for ${upper}, falling back to Yahoo`);
           }
+        } else {
+          console.log(`[Gamma] Alpaca returned no contracts for ${upper}, falling back to Yahoo`);
         }
-        console.log(`[Gamma] Alpaca returned insufficient data for ${upper}, falling back to Yahoo`);
       } catch (err) {
         console.warn(`[Gamma] Alpaca failed for ${upper}: ${err.message}, falling back to Yahoo`);
       }
