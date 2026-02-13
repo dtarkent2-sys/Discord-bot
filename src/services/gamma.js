@@ -1,12 +1,15 @@
 /**
  * Gamma Exposure (GEX) Engine
  *
- * Pulls options chain data from Yahoo Finance (free, no API key needed),
- * calculates per-strike gamma exposure using Black-Scholes, finds the
- * gamma flip point, and generates bar-chart PNGs for Discord.
+ * Calculates per-strike gamma exposure, finds the gamma flip point,
+ * and generates bar-chart PNGs for Discord.
  *
- * Data source: Yahoo Finance options endpoint (OI, IV, strikes, expirations)
- * Spot price: FMP quote (already configured) with Yahoo fallback
+ * Data source priority:
+ *   1. Databento OPRA (institutional NBBO + OI) + Tradier ORATS greeks
+ *   2. Tradier (ORATS real greeks, full chain)
+ *   3. Alpaca (pre-calculated greeks, indicative feed)
+ *   4. Yahoo Finance (free, Black-Scholes estimated gamma)
+ * Spot price: Tradier → Alpaca → FMP → yahoo-finance2 fallback
  *
  * Key concepts:
  *   - GEX per strike = (CallOI × CallGamma − PutOI × PutGamma) × 100 × Spot
@@ -40,6 +43,18 @@ if (!process.env.FONTCONFIG_PATH) {
 const config = require('../config');
 const alpaca = require('./alpaca');
 const priceFetcher = require('../tools/price-fetcher');
+
+// Databento + Tradier — lazy-loaded to avoid circular deps and slow startup
+let _databento = null, _databentoLoaded = false;
+function getDatabento() {
+  if (!_databentoLoaded) { _databentoLoaded = true; try { _databento = require('./databento'); } catch { _databento = null; } }
+  return _databento;
+}
+let _tradier = null, _tradierLoaded = false;
+function getTradier() {
+  if (!_tradierLoaded) { _tradierLoaded = true; try { _tradier = require('./tradier'); } catch { _tradier = null; } }
+  return _tradier;
+}
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
@@ -609,7 +624,25 @@ class GammaService {
 
         // Now compute detailed GEX for this expiry
         let detailedGEX;
-        if (result.source === 'Alpaca') {
+        if (result.source === 'Databento' || result.source === 'Tradier') {
+          // Already have real greeks — re-fetch for detailed breakdown
+          const targetExp = this._computeTargetDate(pref);
+          const databento = getDatabento();
+          const tradier = getTradier();
+          let contracts = [];
+          if (result.source === 'Databento' && databento && databento.enabled) {
+            contracts = await databento.getOptionsWithGreeks(upper, targetExp).catch(() => []);
+          }
+          if (contracts.length === 0 && tradier && tradier.enabled) {
+            contracts = await tradier.getOptionsWithGreeks(upper, targetExp).catch(() => []);
+          }
+          if (contracts.length > 0) {
+            detailedGEX = this.calculateDetailedGEXFromAlpaca(contracts, spotPrice, targetExp);
+          } else {
+            const { chain } = await this.fetchOptionsChain(upper, pref);
+            detailedGEX = this.calculateDetailedGEX(chain, spotPrice);
+          }
+        } else if (result.source === 'Alpaca') {
           // Re-fetch Alpaca data for detailed breakdown
           const targetExp = this._computeTargetDate(pref);
           const [options] = await Promise.all([
@@ -955,7 +988,90 @@ class GammaService {
   async analyze(ticker, expirationPref = '0dte') {
     const upper = ticker.toUpperCase();
 
-    // ── Try Alpaca first (pre-calculated greeks, no auth headaches) ──
+    // ── Try Databento first (institutional OPRA data + ORATS greeks) ──
+    const databento = getDatabento();
+    const tradier = getTradier();
+    if (databento && databento.enabled) {
+      try {
+        console.log(`[Gamma] Trying Databento OPRA for ${upper} (pref: ${expirationPref})...`);
+        const targetExp = this._computeTargetDate(expirationPref);
+        const contracts = await databento.getOptionsWithGreeks(upper, targetExp);
+
+        // Get spot price via Tradier (Databento is options-only)
+        let spotPrice = null;
+        if (tradier && tradier.enabled) {
+          try { spotPrice = (await tradier.getQuote(upper)).price; } catch { /* fallback */ }
+        }
+        if (!spotPrice && alpaca.enabled) {
+          try { spotPrice = (await alpaca.getSnapshot(upper)).price; } catch { /* fallback */ }
+        }
+        if (!spotPrice) {
+          const pf = await priceFetcher.getCurrentPrice(upper);
+          if (!pf.error) spotPrice = pf.price;
+        }
+
+        if (contracts.length > 0 && spotPrice) {
+          const gexData = this.calculateDetailedGEXFromAlpaca(contracts, spotPrice, targetExp);
+          // Convert detailed format to simple format for chart/flip
+          const simpleGEX = {
+            strikes: gexData.strikes.map(s => s.strike),
+            gex: gexData.strikes.map(s => s['netGEX$']),
+            totalGEX: gexData['totalNetGEX$'],
+            maxGEX: gexData.strikes.reduce((best, s) => s['netGEX$'] > (best.value || -Infinity) ? { strike: s.strike, value: s['netGEX$'] } : best, { strike: 0, value: -Infinity }),
+            minGEX: gexData.strikes.reduce((best, s) => s['netGEX$'] < (best.value || Infinity) ? { strike: s.strike, value: s['netGEX$'] } : best, { strike: 0, value: Infinity }),
+          };
+
+          if (simpleGEX.strikes.length > 0) {
+            const flip = this.findGammaFlip(simpleGEX, spotPrice);
+            const chartBuffer = await this.generateChart(simpleGEX, spotPrice, upper, flip.flipStrike);
+            console.log(`[Gamma] ${upper}: Databento OPRA OK — ${contracts.length} contracts, exp ${targetExp}`);
+            return { ticker: upper, spotPrice, expiration: targetExp, gexData: simpleGEX, flip, chartBuffer, source: 'Databento' };
+          }
+        }
+        console.log(`[Gamma] Databento returned insufficient data for ${upper}, falling back`);
+      } catch (err) {
+        console.warn(`[Gamma] Databento failed for ${upper}: ${err.message}, falling back`);
+      }
+    }
+
+    // ── Try Tradier next (ORATS real greeks) ──
+    if (tradier && tradier.enabled) {
+      try {
+        console.log(`[Gamma] Trying Tradier for ${upper} (pref: ${expirationPref})...`);
+        const targetExp = this._computeTargetDate(expirationPref);
+        const contracts = await tradier.getOptionsWithGreeks(upper, targetExp);
+
+        let spotPrice = null;
+        try { spotPrice = (await tradier.getQuote(upper)).price; } catch { /* fallback */ }
+        if (!spotPrice) {
+          const pf = await priceFetcher.getCurrentPrice(upper);
+          if (!pf.error) spotPrice = pf.price;
+        }
+
+        if (contracts.length > 0 && spotPrice) {
+          const gexData = this.calculateDetailedGEXFromAlpaca(contracts, spotPrice, targetExp);
+          const simpleGEX = {
+            strikes: gexData.strikes.map(s => s.strike),
+            gex: gexData.strikes.map(s => s['netGEX$']),
+            totalGEX: gexData['totalNetGEX$'],
+            maxGEX: gexData.strikes.reduce((best, s) => s['netGEX$'] > (best.value || -Infinity) ? { strike: s.strike, value: s['netGEX$'] } : best, { strike: 0, value: -Infinity }),
+            minGEX: gexData.strikes.reduce((best, s) => s['netGEX$'] < (best.value || Infinity) ? { strike: s.strike, value: s['netGEX$'] } : best, { strike: 0, value: Infinity }),
+          };
+
+          if (simpleGEX.strikes.length > 0) {
+            const flip = this.findGammaFlip(simpleGEX, spotPrice);
+            const chartBuffer = await this.generateChart(simpleGEX, spotPrice, upper, flip.flipStrike);
+            console.log(`[Gamma] ${upper}: Tradier OK — ${contracts.length} contracts, exp ${targetExp}`);
+            return { ticker: upper, spotPrice, expiration: targetExp, gexData: simpleGEX, flip, chartBuffer, source: 'Tradier' };
+          }
+        }
+        console.log(`[Gamma] Tradier returned insufficient data for ${upper}, falling back`);
+      } catch (err) {
+        console.warn(`[Gamma] Tradier failed for ${upper}: ${err.message}, falling back`);
+      }
+    }
+
+    // ── Try Alpaca next (pre-calculated greeks) ──
     if (alpaca.enabled) {
       try {
         console.log(`[Gamma] Trying Alpaca for ${upper} (pref: ${expirationPref})...`);
@@ -1048,7 +1164,7 @@ class GammaService {
       `🔴 **Put Wall (min GEX):** \`$${minGEX.strike}\` (${fmt(minGEX.value)})`,
       ``,
       `_Call wall = magnet/resistance | Put wall = support | Flip = regime boundary_`,
-      `_Data: ${result.source || 'Yahoo'}_`,
+      `_Data: ${result.source === 'Databento' ? 'Databento OPRA + ORATS greeks' : result.source === 'Tradier' ? 'Tradier (ORATS real greeks)' : result.source || 'Yahoo'}_`,
     ];
 
     return lines.join('\n');

@@ -414,6 +414,107 @@ async function fetchSPYPrice() {
   }
 }
 
+/**
+ * Fetch real-time 0DTE options context from Databento OPRA (institutional data).
+ * Provides: GEX regime, call/put walls, gamma flip, top OI strikes.
+ */
+async function fetchOptionsContext(ticker = 'SPY') {
+  const cached = getCached(`options_ctx_${ticker}`);
+  if (cached) return cached;
+
+  try {
+    let databento;
+    try { databento = require('./databento'); } catch { databento = null; }
+    if (!databento || !databento.enabled) return '';
+
+    const today = new Date().toISOString().slice(0, 10);
+    const contracts = await databento.getOptionsWithGreeks(ticker, today);
+    if (!contracts || contracts.length === 0) return '';
+
+    // Summarize key metrics for the AI prompt
+    let totalCallOI = 0, totalPutOI = 0, totalCallGEX = 0, totalPutGEX = 0;
+    const strikeGEX = new Map();
+
+    // Get a spot price estimate from the contracts
+    const atm = contracts.filter(c => c.bid > 0 && c.ask > 0);
+    let spotEst = 0;
+    if (atm.length > 0) {
+      // Use Tradier for spot price
+      try {
+        const tradier = require('./tradier');
+        if (tradier.enabled) spotEst = (await tradier.getQuote(ticker)).price;
+      } catch { /* skip */ }
+    }
+    if (!spotEst) {
+      const pf = await priceFetcher.getCurrentPrice(ticker);
+      spotEst = pf.error ? 0 : pf.price;
+    }
+    if (!spotEst) return '';
+
+    for (const c of contracts) {
+      if (!c.strike || !c.openInterest) continue;
+      const gex = (c.gamma || 0) * c.openInterest * 100 * spotEst;
+      if (c.type === 'call') {
+        totalCallOI += c.openInterest;
+        totalCallGEX += gex;
+      } else {
+        totalPutOI += c.openInterest;
+        totalPutGEX -= gex;
+      }
+      const prev = strikeGEX.get(c.strike) || 0;
+      strikeGEX.set(c.strike, prev + (c.type === 'call' ? gex : -gex));
+    }
+
+    const pcRatio = totalCallOI > 0 ? (totalPutOI / totalCallOI).toFixed(2) : 'N/A';
+    const netGEX = totalCallGEX + totalPutGEX;
+    const regime = netGEX > 0 ? 'LONG GAMMA (dealers suppress moves)' : 'SHORT GAMMA (dealers amplify moves)';
+
+    // Find call wall (highest positive GEX) and put wall (most negative GEX)
+    let callWall = { strike: 0, gex: 0 }, putWall = { strike: 0, gex: 0 };
+    for (const [strike, gex] of strikeGEX) {
+      if (gex > callWall.gex) callWall = { strike, gex };
+      if (gex < putWall.gex) putWall = { strike, gex };
+    }
+
+    const fmtGEX = (v) => {
+      const a = Math.abs(v);
+      return (v < 0 ? '-' : '') + (a >= 1e9 ? `$${(a/1e9).toFixed(1)}B` : a >= 1e6 ? `$${(a/1e6).toFixed(1)}M` : a >= 1e3 ? `$${(a/1e3).toFixed(0)}K` : `$${a.toFixed(0)}`);
+    };
+
+    const ctxLines = [
+      `=== 0DTE OPTIONS CONTEXT (Databento OPRA — institutional data) ===`,
+      `Spot: $${spotEst.toFixed(2)} | Today's exp: ${today}`,
+      `Call OI: ${totalCallOI.toLocaleString()} | Put OI: ${totalPutOI.toLocaleString()} | P/C ratio: ${pcRatio}`,
+      `Net GEX: ${fmtGEX(netGEX)} → ${regime}`,
+      `Call Wall: $${callWall.strike} (${fmtGEX(callWall.gex)}) | Put Wall: $${putWall.strike} (${fmtGEX(putWall.gex)})`,
+      `Contracts: ${contracts.length} (0DTE)`,
+    ];
+
+    // Add order flow data if available (large block detection)
+    try {
+      const flow = await databento.getOrderFlow(ticker, 15);
+      if (flow && flow.tradeCount > 0) {
+        ctxLines.push(`--- Order Flow (last 15min) ---`);
+        ctxLines.push(`${flow.tradeCount} trades | Net: ${fmtGEX(flow.netFlow)} → ${flow.flowDirection}`);
+        ctxLines.push(`Call premium: ${fmtGEX(flow.callPremium)} | Put premium: ${fmtGEX(flow.putPremium)}`);
+        if (flow.largeBlocks.length > 0) {
+          ctxLines.push(`Large blocks: ${flow.largeBlocks.length}`);
+          for (const b of flow.largeBlocks.slice(0, 3)) {
+            ctxLines.push(`  ${b.side.toUpperCase()} ${b.size}x $${b.strike} ${b.type} @ $${b.price.toFixed(2)}`);
+          }
+        }
+      }
+    } catch { /* order flow is optional */ }
+
+    const ctx = ctxLines.join('\n');
+    setCache(`options_ctx_${ticker}`, ctx);
+    return ctx;
+  } catch (err) {
+    log.warn(`Options context fetch failed: ${err.message}`);
+    return '';
+  }
+}
+
 async function fetchFundamentals(ticker = 'SPY') {
   const cached = getCached(`fundamentals_${ticker}`);
   if (cached) return cached;
@@ -895,17 +996,18 @@ async function handleWebhookAlert(message) {
 
   // ── Step 2: Async processing ──
   try {
-    // Fetch price + news + fundamentals in parallel (all cached 60s)
-    const [priceData, newsData, fundamentals] = await Promise.all([
+    // Fetch price + news + fundamentals + options context in parallel (all cached 60s)
+    const [priceData, newsData, fundamentals, optionsCtx] = await Promise.all([
       fetchSPYPrice(),
       fetchSPYNews(),
       fetchFundamentals(alert.ticker || 'SPY'),
+      fetchOptionsContext(alert.ticker || 'SPY'),
     ]);
 
-    // Enrich news with fundamentals from AInvest if available
-    const enrichedNews = fundamentals
-      ? `${newsData}\n\n=== FUNDAMENTALS (AInvest) ===\n${fundamentals}`
-      : newsData;
+    // Enrich news with fundamentals + real-time options data
+    let enrichedNews = newsData;
+    if (fundamentals) enrichedNews += `\n\n=== FUNDAMENTALS (AInvest) ===\n${fundamentals}`;
+    if (optionsCtx) enrichedNews += `\n\n${optionsCtx}`;
 
     // Run fast Ollama analysis
     const analysis = await runFastAnalysis(alert, priceData, enrichedNews);
@@ -1026,20 +1128,21 @@ async function handleHttpAlert(channel, body) {
   // ── Step 1: Fetch data + AI analysis (before posting anything) ──
   let analysis, chartUrl, priceData;
   try {
-    // Fetch all data in parallel (including fundamentals from AInvest)
-    const [price, news, fundamentals, chart] = await Promise.all([
+    // Fetch all data in parallel (including fundamentals + options context from Databento)
+    const [price, news, fundamentals, optionsCtx, chart] = await Promise.all([
       fetchSPYPrice(),
       fetchSPYNews(),
       fetchFundamentals(alert.ticker || 'SPY'),
+      fetchOptionsContext(alert.ticker || 'SPY'),
       generateChartUrl(alert.ticker || 'SPY').catch(() => null),
     ]);
     priceData = price;
     chartUrl = chart;
 
-    // Append fundamentals to news context if available
-    const enrichedNews = fundamentals
-      ? `${news}\n\n=== FUNDAMENTALS (AInvest) ===\n${fundamentals}`
-      : news;
+    // Enrich news with fundamentals + real-time options data
+    let enrichedNews = news;
+    if (fundamentals) enrichedNews += `\n\n=== FUNDAMENTALS (AInvest) ===\n${fundamentals}`;
+    if (optionsCtx) enrichedNews += `\n\n${optionsCtx}`;
 
     // Run AI analysis with all the data
     analysis = await runFastAnalysis(alert, priceData, enrichedNews);

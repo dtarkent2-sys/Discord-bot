@@ -143,6 +143,20 @@ function startDashboard() {
     }
   });
 
+  // Options order flow (Databento OPRA tick-level trade data)
+  app.get('/api/flow/:ticker', async (req, res) => {
+    try {
+      const db = require('../services/databento');
+      if (!db.enabled) return res.json({ enabled: false, error: 'Databento not configured' });
+      const ticker = req.params.ticker.toUpperCase().replace(/[^A-Z0-9.]/g, '');
+      const minutes = Math.min(Math.max(parseInt(req.query.minutes) || 15, 1), 60);
+      const flow = await db.getOrderFlow(ticker, minutes);
+      res.json(flow);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Recent audit log entries (JSON)
   app.get('/api/audit', (req, res) => {
     const count = Math.min(parseInt(req.query.count) || 50, 200);
