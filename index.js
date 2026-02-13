@@ -41,7 +41,7 @@ const sentiment = require('./src/services/sentiment');
 const reactions = require('./src/services/reactions');
 const images = require('./src/services/images');
 const stats = require('./src/services/stats');
-const { handleCommand } = require('./src/commands/handlers');
+const { handleCommand, handleButtonInteraction } = require('./src/commands/handlers');
 const { registerCommands } = require('./src/commands/register');
 const AutonomousBehaviorEngine = require('./src/services/autonomous');
 const { handlePrefixCommand } = require('./src/commands/prefix');
@@ -147,6 +147,19 @@ client.once(Events.ClientReady, async (c) => {
 
 // ── Slash Command Handler ────────────────────────────────────────────
 client.on(Events.InteractionCreate, async (interaction) => {
+  // ── Button interactions (e.g. GEX heatmap refresh) ──
+  if (interaction.isButton()) {
+    try {
+      await handleButtonInteraction(interaction);
+    } catch (err) {
+      log.error('Button interaction error:', err);
+      if (!interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: 'Button action failed.', ephemeral: true }).catch(() => {});
+      }
+    }
+    return;
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   try {

@@ -90,4 +90,10 @@ module.exports = {
   s3AccessKeyId: process.env.S3_ACCESS_KEY_ID || process.env.BUCKET_ACCESS_KEY_ID || '',
   s3SecretAccessKey: process.env.S3_SECRET_ACCESS_KEY || process.env.BUCKET_SECRET_ACCESS_KEY || '',
   backupRetentionDays: parseInt(process.env.BACKUP_RETENTION_DAYS, 10) || 30,
+
+  // Dashboard public URL (auto-detected from Railway, or set manually)
+  // Used for clickable links in Discord messages (e.g. interactive gamma heat map)
+  dashboardUrl: process.env.DASHBOARD_URL
+    || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : '')
+    || (process.env.RAILWAY_STATIC_URL || ''),
 };
