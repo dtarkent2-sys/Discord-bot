@@ -207,6 +207,7 @@ class PublicService {
   /**
    * Get option chain with greeks enriched — the primary method for the options engine.
    * Fetches the chain first, then batch-fetches greeks for all contracts.
+   * Also patches OI via the quotes endpoint if chain OI is missing (common issue).
    *
    * @param {string} symbol
    * @param {string} expirationDate
@@ -237,8 +238,76 @@ class PublicService {
       }
     }
 
+    // Step 4: Patch OI via quotes endpoint if chain returned zeros
+    // (Public.com chain endpoint often omits OI — quotes endpoint has it)
+    const missingOI = contracts.filter(c => !c.openInterest && c.symbol);
+    if (missingOI.length > contracts.length * 0.3) {
+      // More than 30% missing OI — fetch via quotes
+      try {
+        const oiMap = await this._fetchOIviaQuotes(osiSymbols);
+        let patched = 0;
+        for (const contract of contracts) {
+          if (!contract.openInterest && oiMap.has(contract.symbol)) {
+            contract.openInterest = oiMap.get(contract.symbol);
+            patched++;
+          }
+        }
+        if (patched > 0) {
+          console.log(`[Public] ${symbol}: patched OI for ${patched} contracts via quotes endpoint`);
+        }
+      } catch (err) {
+        console.warn(`[Public] OI quotes fallback failed: ${err.message}`);
+      }
+    }
+
     console.log(`[Public] ${symbol}: enriched ${enriched}/${contracts.length} contracts with greeks`);
     return contracts;
+  }
+
+  // ── OI via Quotes (fallback) ──────────────────────────────────────
+
+  /**
+   * Fetch openInterest for option symbols via the quotes endpoint.
+   * The option-chain endpoint sometimes returns 0 for OI; the quotes endpoint
+   * is more reliable. Discovered via community testing.
+   *
+   * @param {string[]} osiSymbols
+   * @returns {Promise<Map<string, number>>} symbol → openInterest
+   */
+  async _fetchOIviaQuotes(osiSymbols) {
+    const accountId = config.publicAccountId;
+    const oiMap = new Map();
+    const batchSize = 80;
+
+    for (let i = 0; i < osiSymbols.length; i += batchSize) {
+      const batch = osiSymbols.slice(i, i + batchSize);
+      const instruments = batch.map(sym => ({ symbol: sym, type: 'OPTION' }));
+
+      try {
+        const data = await this._post(
+          `/userapigateway/marketdata/${accountId}/quotes`,
+          { instruments },
+          15000
+        );
+
+        for (const q of (data.quotes || [])) {
+          const sym = q.instrument?.symbol;
+          if (!sym) continue;
+
+          let oi = parseInt(q.openInterest) || 0;
+          // Fallback: use volume as proxy if OI still zero
+          if (oi <= 0) {
+            const vol = parseInt(q.volume) || 0;
+            if (vol > 0) oi = vol;
+          }
+          if (oi > 0) oiMap.set(sym, oi);
+        }
+      } catch (err) {
+        console.warn(`[Public] OI quotes batch error: ${err.message}`);
+      }
+    }
+
+    return oiMap;
   }
 
   // ── Parsing / Normalization ─────────────────────────────────────────
