@@ -172,6 +172,29 @@ function startDashboard() {
     }
   });
 
+  // HFT signals — book skew, VWAP, aggression, composite conviction
+  app.get('/api/signal/:ticker', (req, res) => {
+    try {
+      const live = require('../services/databento-live');
+      const ticker = req.params.ticker.toUpperCase().replace(/[^A-Z0-9.]/g, '');
+      const signal = live.getSignal(ticker);
+      res.json(signal || { error: 'No signal data yet (market may be closed)' });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Institutional sweep orders (intermarket sweeps detected from live OPRA stream)
+  app.get('/api/sweeps', (req, res) => {
+    try {
+      const live = require('../services/databento-live');
+      const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+      res.json({ sweeps: live.getSweeps(limit) });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // Recent audit log entries (JSON)
   app.get('/api/audit', (req, res) => {
     const count = Math.min(parseInt(req.query.count) || 50, 200);
