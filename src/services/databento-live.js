@@ -187,44 +187,66 @@ function parseOhlcv(buf, off) {
   };
 }
 
-function parseInstrumentDef(buf, off) {
+/**
+ * Parse InstrumentDefMsg. The struct layout differs between DBN v1 (22-byte
+ * symbol strings) and v2+ (71-byte strings). The numeric prefix fields are at
+ * identical offsets in both versions, so we read those safely, then extract
+ * raw_symbol at offset 196 (same start in both) and derive all enrichment
+ * fields from the OCC symbol format (underlying, strike, type, expiration).
+ */
+function parseInstrumentDef(buf, off, recordSize, dbnVersion) {
   const hd = parseRecordHeader(buf, off);
-  // InstrumentDefMsg is 520 bytes — extract the fields we need
+
+  // Numeric fields in the fixed prefix — same offset in v1 and v2
   const result = {
     type: 'definition',
     ...hd,
     tsRecv: buf.readBigUInt64LE(off + 16),
     minPriceIncrement: toPrice(buf.readBigInt64LE(off + 24)),
     expiration: buf.readBigUInt64LE(off + 40),
-    strikePrice: toPrice(buf.readBigInt64LE(off + 104)),
-    rawInstrumentId: Number(buf.readBigUInt64LE(off + 112)),
-    contractMultiplier: buf.readInt32LE(off + 176),
-    instrumentClass: String.fromCharCode(buf.readUInt8(off + 487)),
+    contractMultiplier: recordSize >= 160 ? buf.readInt32LE(off + 156) : 100,
   };
 
-  // Extract raw_symbol (71 bytes at offset 238, null-terminated)
-  const rawSymBuf = buf.subarray(off + 238, off + 238 + 71);
-  const nullIdx = rawSymBuf.indexOf(0);
-  result.rawSymbol = rawSymBuf.subarray(0, nullIdx >= 0 ? nullIdx : 71).toString('ascii').trim();
-
-  // Extract underlying (21 bytes at offset 391, null-terminated)
-  const underBuf = buf.subarray(off + 391, off + 391 + 21);
-  const nullIdx2 = underBuf.indexOf(0);
-  result.underlying = underBuf.subarray(0, nullIdx2 >= 0 ? nullIdx2 : 21).toString('ascii').trim();
-
-  // Extract exchange (5 bytes at offset 330)
-  const exchBuf = buf.subarray(off + 330, off + 330 + 5);
-  const nullIdx3 = exchBuf.indexOf(0);
-  result.exchange = exchBuf.subarray(0, nullIdx3 >= 0 ? nullIdx3 : 5).toString('ascii').trim();
-
-  // Derive call/put from raw_symbol (OCC format)
-  if (result.rawSymbol.length > 15) {
-    const cpChar = result.rawSymbol.charAt(result.rawSymbol.length - 9);
-    result.optionType = cpChar === 'C' ? 'call' : cpChar === 'P' ? 'put' : null;
+  // raw_symbol starts at offset 196 in both v1 and v2 — only length differs
+  const symLen = dbnVersion === 1 ? 22 : 71;
+  if (recordSize >= 196 + symLen) {
+    const rawSymBuf = buf.subarray(off + 196, off + 196 + symLen);
+    const nullIdx = rawSymBuf.indexOf(0);
+    result.rawSymbol = rawSymBuf.subarray(0, nullIdx >= 0 ? nullIdx : symLen).toString('ascii').trim();
+  } else {
+    result.rawSymbol = '';
   }
 
-  // Convert expiration from nanoseconds to YYYY-MM-DD
-  if (result.expiration && result.expiration !== 0xFFFFFFFFFFFFFFFFn) {
+  // Parse OCC symbol format: "SPY   260213C00605000" (21 chars)
+  // [0-5] underlying (space-padded), [6-11] YYMMDD, [12] C/P, [13-20] strike*1000
+  if (result.rawSymbol.length >= 16) {
+    const sym = result.rawSymbol;
+    // Find where the date starts (first digit after the alpha padding)
+    let dateStart = 0;
+    for (let i = 0; i < Math.min(sym.length, 6); i++) {
+      if (sym[i] >= '0' && sym[i] <= '9') { dateStart = i; break; }
+      dateStart = i + 1;
+    }
+    result.underlying = sym.slice(0, dateStart).trim();
+
+    if (sym.length >= dateStart + 13) {
+      const dateStr = sym.slice(dateStart, dateStart + 6);
+      const cpChar = sym.charAt(dateStart + 6);
+      const strikeStr = sym.slice(dateStart + 7);
+
+      result.optionType = cpChar === 'C' ? 'call' : cpChar === 'P' ? 'put' : null;
+      result.strikePrice = parseInt(strikeStr, 10) / 1000;
+
+      // YYMMDD → YYYY-MM-DD
+      const yy = parseInt(dateStr.slice(0, 2), 10);
+      const mm = dateStr.slice(2, 4);
+      const dd = dateStr.slice(4, 6);
+      result.expirationDate = `20${yy}-${mm}-${dd}`;
+    }
+  }
+
+  // Fallback: use expiration timestamp if OCC parse didn't yield a date
+  if (!result.expirationDate && result.expiration && result.expiration !== 0xFFFFFFFFFFFFFFFFn) {
     const ms = Number(result.expiration / 1_000_000n);
     result.expirationDate = new Date(ms).toISOString().slice(0, 10);
   }
@@ -272,6 +294,7 @@ class DatabentoLive extends EventEmitter {
     this._lsgVersion = null;
     this._metadataParsed = false;
     this._metadataLength = 0;
+    this._dbnVersion = 2;
     this._tsOut = false;
     this._symbolCstrLen = 71;
 
@@ -567,15 +590,27 @@ class DatabentoLive extends EventEmitter {
     const totalMetaBytes = 8 + metadataLen;
     if (this._buffer.length < totalMetaBytes) return;
 
-    // Parse key metadata fields (100 bytes fixed at offset 8)
+    // Parse key metadata fields — layout differs between DBN v1 and v2+
     const metaBuf = this._buffer.subarray(8, 8 + metadataLen);
     const dataset = metaBuf.subarray(0, 16).toString('ascii').replace(/\0/g, '').trim();
     const schema = metaBuf.readUInt16LE(16);
-    const tsOut = metaBuf.readUInt8(44);
-    const symbolCstrLen = metaBuf.readUInt16LE(45);
 
+    let tsOut, symbolCstrLen;
+    if (version === 1) {
+      // DBN v1: has 8-byte record_count at offset 34, shifts stype/tsOut down
+      // tsOut is at offset 52, no symbol_cstr_len field (default 22)
+      tsOut = metaBuf.readUInt8(52);
+      symbolCstrLen = 22;
+    } else {
+      // DBN v2+: tsOut at offset 44, symbol_cstr_len at offset 45
+      tsOut = metaBuf.readUInt8(44);
+      symbolCstrLen = metaBuf.readUInt16LE(45);
+      if (symbolCstrLen === 0 || symbolCstrLen === 0xFFFF) symbolCstrLen = 71;
+    }
+
+    this._dbnVersion = version;
     this._tsOut = tsOut === 1;
-    this._symbolCstrLen = symbolCstrLen || 71;
+    this._symbolCstrLen = symbolCstrLen;
 
     console.log(`[DatabentoLive] DBN v${version} metadata: dataset=${dataset}, symbolLen=${this._symbolCstrLen}, tsOut=${this._tsOut}`);
 
@@ -645,10 +680,10 @@ class DatabentoLive extends EventEmitter {
       }
 
       case RTYPE.DEFINITION: {
-        if (size >= 520) {
-          const def = parseInstrumentDef(buf, off);
+        // v1 InstrumentDef is ~332 bytes, v2+ is ~520 bytes
+        if (size >= 220) {
+          const def = parseInstrumentDef(buf, off, size, this._dbnVersion);
           this._stats.defsReceived++;
-          // Store in local instrument cache
           this._instruments.set(def.instrumentId, def);
           this.emit('definition', def);
         }
