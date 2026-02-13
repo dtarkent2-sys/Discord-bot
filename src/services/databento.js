@@ -44,9 +44,10 @@ const DEF_CACHE_TTL = 30 * 60 * 1000; // 30 min
 const _dataCache = new Map();
 const DATA_CACHE_TTL = 60 * 1000; // 60s default (overridable via config)
 
-// Databento historical pipeline lag — data is typically available ~10 min after real-time.
-// Use 15 min buffer to avoid 422 "end after available_end" errors.
-const HIST_LAG_MS = 15 * 60 * 1000;
+// Databento historical pipeline lag — data is typically available ~25-30 min after real-time.
+// Use 35 min buffer to avoid 422 "end after available_end" errors.
+// Observed lag: OPRA.PILLAR data available up to 14:50 at 15:18 UTC = 28 min gap.
+const HIST_LAG_MS = 35 * 60 * 1000;
 
 class DatabentoService {
   constructor() {

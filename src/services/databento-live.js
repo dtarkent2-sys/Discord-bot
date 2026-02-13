@@ -356,9 +356,13 @@ class DatabentoLive extends EventEmitter {
   /**
    * Add a subscription. Call before connect().
    * Symbols are auto-batched in chunks of 500 per the LSG protocol.
+   * @param {string} schema - e.g. 'trades', 'definition', 'statistics'
+   * @param {string} stypeIn - e.g. 'parent'
+   * @param {string[]} symbols - e.g. ['SPY.OPT']
+   * @param {number} [start] - 0 = replay from session start (gets all accumulated data)
    */
-  subscribe(schema, stypeIn, symbols) {
-    this._subscriptions.push({ schema, stypeIn, symbols });
+  subscribe(schema, stypeIn, symbols, start) {
+    this._subscriptions.push({ schema, stypeIn, symbols, start });
     return this;
   }
 
@@ -553,12 +557,15 @@ class DatabentoLive extends EventEmitter {
 
   _sendSubscriptions() {
     if (this._subscriptions.length === 0) {
-      // Default: subscribe to everything Billy needs for SPY + QQQ options
+      // Default: subscribe to everything Billy needs for SPY + QQQ + IWM options
+      // start=0 for definitions + statistics replays all data from session start
+      // (gets full instrument universe + OI published pre-market before 9:30 ET)
+      const syms = ['SPY.OPT', 'QQQ.OPT', 'IWM.OPT'];
       this._subscriptions = [
-        { schema: 'trades', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'cbbo-1s', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'statistics', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'definition', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
+        { schema: 'trades', stypeIn: 'parent', symbols: syms },
+        { schema: 'cbbo-1s', stypeIn: 'parent', symbols: syms },
+        { schema: 'statistics', stypeIn: 'parent', symbols: syms, start: 0 },
+        { schema: 'definition', stypeIn: 'parent', symbols: syms, start: 0 },
       ];
     }
 
@@ -569,7 +576,10 @@ class DatabentoLive extends EventEmitter {
       for (let i = 0; i < allSymbols.length; i += SYMBOL_BATCH_SIZE) {
         const chunk = allSymbols.slice(i, i + SYMBOL_BATCH_SIZE);
         const isLast = (i + SYMBOL_BATCH_SIZE >= allSymbols.length) ? 1 : 0;
-        const msg = `schema=${sub.schema}|stype_in=${sub.stypeIn}|symbols=${chunk.join(',')}|is_last=${isLast}\n`;
+        let msg = `schema=${sub.schema}|stype_in=${sub.stypeIn}|symbols=${chunk.join(',')}`;
+        // start=0 replays all data from the current session (definitions + OI history)
+        if (sub.start !== undefined) msg += `|start=${sub.start}`;
+        msg += `|is_last=${isLast}\n`;
         this._socket.write(msg);
       }
       console.log(`[DatabentoLive] Subscribed: ${sub.schema} → ${allSymbols.join(',')}`);
@@ -799,10 +809,15 @@ class DatabentoLive extends EventEmitter {
 
   /**
    * Check if we have enough live data to build a meaningful chain.
-   * Need at least instrument definitions + some OI data.
+   * With start=0 subscription, definitions + OI replay from session start,
+   * so data accumulates quickly after connection.
    */
   hasDataFor(ticker) {
     if (!this.connected) return false;
+    // Allow at least 10 seconds for the session replay to arrive
+    const connectedAt = this._stats.connectedAt;
+    if (connectedAt && (Date.now() - connectedAt.getTime()) < 10000) return false;
+
     const upper = ticker.toUpperCase();
     let defCount = 0;
     let oiCount = 0;
@@ -812,8 +827,10 @@ class DatabentoLive extends EventEmitter {
         if (this._oi.has(instrId)) oiCount++;
       }
     }
-    // Need at least 50 definitions and some OI data
-    return defCount >= 50 && oiCount >= 10;
+    // With start=0 replay we get the full instrument universe quickly.
+    // Need at least 20 definitions (some OI may be sparse during off-hours).
+    // If we have definitions but no OI, still allow it — gamma can be estimated from quotes alone.
+    return defCount >= 20 && (oiCount >= 5 || defCount >= 100);
   }
 }
 
@@ -1228,7 +1245,7 @@ module.exports = {
   flow: flowTracker,
   connect: () => liveClient.connect(),
   disconnect: () => liveClient.disconnect(),
-  subscribe: (schema, stypeIn, symbols) => liveClient.subscribe(schema, stypeIn, symbols),
+  subscribe: (schema, stypeIn, symbols, start) => liveClient.subscribe(schema, stypeIn, symbols, start),
   getStatus: () => liveClient.getStatus(),
   getFlow: (ticker) => flowTracker.getFlow(ticker),
   getSignal: (ticker) => signalEngine.getSignal(ticker),
