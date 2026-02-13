@@ -2219,39 +2219,61 @@ async function handleAlgo(interaction) {
 
 async function handleMLPredict(interaction) {
   if (!mlPredictor.enabled) {
-    return interaction.reply({ content: 'ML Predictor requires a Databento API key (`DATABENTO_API_KEY`).', flags: MessageFlags.Ephemeral });
+    return interaction.reply({ content: 'ML Predictor requires a Databento API key (`DATABENTO_API_KEY`) and Python dependencies (`pip install -r ml/requirements.txt`).', flags: MessageFlags.Ephemeral });
   }
 
   await interaction.deferReply();
 
   const product = interaction.options.getString('product');
-  const markout = interaction.options.getInteger('markout') || 300; // 300 bars = 5 min forward
-  const dateStr = interaction.options.getString('date');
+  const markout = interaction.options.getInteger('markout') || 300;
+  const modelType = interaction.options.getString('model') || 'both';
+  const days = interaction.options.getInteger('days');
+  const startDate = interaction.options.getString('start_date');
+  const endDate = interaction.options.getString('end_date');
+  const dateStr = interaction.options.getString('date'); // deprecated
+
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  const maxDays = parseInt(process.env.ML_MAX_DAYS, 10) || 180;
 
   try {
-    const options = { markout };
-    if (dateStr) {
-      // Validate date format
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-        return interaction.editReply('Invalid date format. Use YYYY-MM-DD (e.g. 2025-12-06).');
-      }
-      options.start = `${dateStr}T14:30:00.000000000Z`;
-      options.end = `${dateStr}T21:00:00.000000000Z`;
+    const options = { markout, model: modelType };
+
+    // Validate date formats
+    if (startDate) {
+      if (!datePattern.test(startDate)) return interaction.editReply('Invalid start_date format. Use YYYY-MM-DD.');
+      options.startDate = startDate;
+    }
+    if (endDate) {
+      if (!datePattern.test(endDate)) return interaction.editReply('Invalid end_date format. Use YYYY-MM-DD.');
+      options.endDate = endDate;
+    }
+    if (startDate && endDate && startDate > endDate) {
+      return interaction.editReply(`start_date (${startDate}) must be before end_date (${endDate}).`);
+    }
+    if (days) {
+      if (days > maxDays) return interaction.editReply(`days=${days} exceeds maximum (${maxDays}). Set ML_MAX_DAYS env var to override.`);
+      options.days = days;
+    }
+    if (dateStr && !startDate && !endDate && !days) {
+      if (!datePattern.test(dateStr)) return interaction.editReply('Invalid date format. Use YYYY-MM-DD.');
+      options.date = dateStr;
+    }
+    // Validate date range span
+    if (startDate && endDate) {
+      const span = (new Date(endDate) - new Date(startDate)) / 86400000;
+      if (span > maxDays) return interaction.editReply(`Date range spans ${Math.round(span)} days, exceeds max ${maxDays}.`);
     }
 
     const result = await mlPredictor.runPrediction(product, options);
-
-    // Format text summary
     const summary = mlPredictor.formatResults(result);
 
-    // Render PnL chart
     const replyPayload = { content: summary };
     try {
-      const chartBuffer = await mlPredictor.renderPnLChart(result);
+      const chartBuffer = await mlPredictor.getChartBuffer(result);
       const attachment = new AttachmentBuilder(chartBuffer, { name: `ml-predict-${product}.png` });
       replyPayload.files = [attachment];
     } catch (chartErr) {
-      console.warn('[ML-Predict] Chart rendering failed:', chartErr.message);
+      console.warn('[ML-Predict] Chart not available:', chartErr.message);
       replyPayload.content += '\n\n*(Chart rendering unavailable)*';
     }
 

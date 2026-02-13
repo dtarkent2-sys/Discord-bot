@@ -1,7 +1,9 @@
-# System packages required by the `canvas` npm module (chartjs-node-canvas).
+# System packages required by the `canvas` npm module (chartjs-node-canvas)
+# and the Python ML predictor (ml/predictor.py).
 # Without these, fontconfig cannot load its default config and chart rendering fails.
 [phases.setup]
 aptPkgs = [
+  # Canvas / chart rendering (Node.js chartjs-node-canvas)
   "fontconfig",
   "libfontconfig1",
   "libcairo2",
@@ -12,4 +14,13 @@ aptPkgs = [
   "librsvg2-dev",
   "libpixman-1-0",
   "fonts-dejavu-core",
+  # Python 3 + pip for ML predictor (databento, scikit-learn, matplotlib)
+  "python3",
+  "python3-pip",
+  "python3-venv",
 ]
+
+# Install Python ML dependencies after Node.js setup
+[phases.python]
+dependsOn = ["setup"]
+cmds = ["pip install --break-system-packages -r ml/requirements.txt"]

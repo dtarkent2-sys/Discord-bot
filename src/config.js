@@ -64,6 +64,9 @@ module.exports = {
   databentoApiKey: process.env.DATABENTO_API_KEY || '',
   databentoLive: (process.env.DATABENTO_LIVE || '').toLowerCase() === 'true', // Enable live TCP streaming ($199/mo OPRA subscription required)
 
+  // ML Predictor — max backtest range in calendar days (default 180)
+  mlMaxDays: parseInt(process.env.ML_MAX_DAYS, 10) || 180,
+
   // Tradier API (options chain with ORATS real greeks — used for greeks alongside Databento)
   tradierApiKey: process.env.TRADIER_API_KEY || '',
   tradierSandbox: (process.env.TRADIER_SANDBOX || 'true').toLowerCase() === 'true',
