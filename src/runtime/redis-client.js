@@ -78,15 +78,15 @@ function createRedisClient(redisUrl) {
         });
       }
 
-      // Consume the front pending entry. If it timed out (dead), discard silently.
+      // Consume the front pending entry. If it timed out (dead), discard the
+      // response silently — do NOT loop to the next entry, as that would assign
+      // this response to a different command and corrupt the RESP pipeline.
       function settle(val, isError) {
-        while (pending.length > 0) {
-          const entry = pending.shift();
-          if (entry.dead) continue; // Response for a timed-out command — discard
-          if (isError) entry.reject(val);
-          else entry.resolve(val);
-          return;
-        }
+        if (pending.length === 0) return;
+        const entry = pending.shift();
+        if (entry.dead) return; // Response for a timed-out command — discard
+        if (isError) entry.reject(val);
+        else entry.resolve(val);
       }
 
       function parseResponse(data) {

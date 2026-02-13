@@ -32,10 +32,9 @@ async function initRedisStorage() {
 
     // Hydrate every Storage instance sequentially (not pipelined) so the
     // minimal RESP parser processes one response at a time.
-    // Timeout after 30s so a stuck Redis can never block Discord login.
-    // Each individual store uses a 3s command timeout (via _loadFromRedis)
-    // so one slow store can't eat the entire budget.
-    const deadline = Date.now() + 30_000;
+    // Timeout after 45s so a stuck Redis can never block Discord login
+    // but all 16 stores get a fair shot even if a few are slow.
+    const deadline = Date.now() + 45_000;
     let hydrated = 0;
     for (const inst of _instances) {
       if (Date.now() > deadline) {
@@ -79,7 +78,7 @@ class Storage {
   async _loadFromRedis() {
     if (!_redisReady) return;
     try {
-      const raw = await _redis.sendCommand('GET', this.redisKey, { timeout: 3000 });
+      const raw = await _redis.sendCommand('GET', this.redisKey);
       if (raw) {
         try {
           this.data = JSON.parse(raw);
