@@ -48,7 +48,9 @@ function _estimateIV(midPrice, spotPrice, strike, T, isCall) {
     const bsPrice = _bsPrice(spotPrice, strike, RISK_FREE_RATE, sigma, T, isCall);
     const vega = _bsVega(spotPrice, strike, RISK_FREE_RATE, sigma, T);
     if (vega < 1e-10) break;
-    sigma = sigma - (bsPrice - midPrice) / vega;
+    const newSigma = sigma - (bsPrice - midPrice) / vega;
+    if (!isFinite(newSigma)) { sigma = 0.25; break; }
+    sigma = newSigma;
     if (sigma <= 0.01) { sigma = 0.25; break; }
     if (sigma > 5) { sigma = 0.25; break; }
   }

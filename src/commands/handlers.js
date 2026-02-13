@@ -30,6 +30,7 @@ const yoloMode = require('../services/yolo-mode');
 const channelHistory = require('../services/channel-history');
 let algoTrading = null;
 try { algoTrading = require('../services/algo-trading'); } catch { /* algo-trading not available */ }
+const mlPredictor = require('../services/ml-predictor');
 const { AttachmentBuilder, MessageFlags, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -116,6 +117,8 @@ async function handleCommand(interaction) {
       return handleIngest(interaction);
     case 'algo':
       return handleAlgo(interaction);
+    case 'mlpredict':
+      return handleMLPredict(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -2209,6 +2212,54 @@ async function handleAlgo(interaction) {
   } catch (err) {
     console.error(`[Algo] Error:`, err);
     await interaction.editReply(`**Algo Trading**\n❌ ${err.message}`).catch(() => {});
+  }
+}
+
+// ── ML Predictor ───────────────────────────────────────────────────────
+
+async function handleMLPredict(interaction) {
+  if (!mlPredictor.enabled) {
+    return interaction.reply({ content: 'ML Predictor requires a Databento API key (`DATABENTO_API_KEY`).', flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferReply();
+
+  const product = interaction.options.getString('product');
+  const markout = interaction.options.getInteger('markout') || 300; // 300 bars = 5 min forward
+  const dateStr = interaction.options.getString('date');
+
+  try {
+    const options = { markout };
+    if (dateStr) {
+      // Validate date format
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        return interaction.editReply('Invalid date format. Use YYYY-MM-DD (e.g. 2025-12-06).');
+      }
+      options.start = `${dateStr}T14:30:00.000000000Z`;
+      options.end = `${dateStr}T21:00:00.000000000Z`;
+    }
+
+    const result = await mlPredictor.runPrediction(product, options);
+
+    // Format text summary
+    const summary = mlPredictor.formatResults(result);
+
+    // Render PnL chart
+    const replyPayload = { content: summary };
+    try {
+      const chartBuffer = await mlPredictor.renderPnLChart(result);
+      const attachment = new AttachmentBuilder(chartBuffer, { name: `ml-predict-${product}.png` });
+      replyPayload.files = [attachment];
+    } catch (chartErr) {
+      console.warn('[ML-Predict] Chart rendering failed:', chartErr.message);
+      replyPayload.content += '\n\n*(Chart rendering unavailable)*';
+    }
+
+    await interaction.editReply(replyPayload);
+  } catch (err) {
+    console.error(`[ML-Predict] Error for ${product}:`, err);
+    const msg = err.message.length > 500 ? err.message.slice(0, 500) + '...' : err.message;
+    await interaction.editReply(`ML prediction failed for **${product}**: ${msg}`);
   }
 }
 

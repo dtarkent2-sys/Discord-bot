@@ -76,7 +76,7 @@ const DEFAULT_CONFIG = {
   options_min_delta: 0.15,              // min option delta for contract selection (widened for 0DTE)
   options_max_delta: 0.75,              // max option delta for contract selection (widened for late-day 0DTE)
   options_max_spread_pct: 0.10,         // max bid-ask spread as % of mid price
-  options_underlyings: ['SPY', 'QQQ'],  // default underlyings to scan
+  options_underlyings: ['SPY', 'QQQ', 'AAPL', 'TSLA', 'NVDA', 'AMD', 'META', 'AMZN', 'MSFT', 'GOOGL', 'IWM', 'NFLX', 'COIN'],  // default underlyings to scan
   options_cooldown_minutes: 5,          // cooldown between options trades on same underlying
   options_min_open_interest: 500,       // min open interest for contract selection — filters out illiquid contracts
 };
