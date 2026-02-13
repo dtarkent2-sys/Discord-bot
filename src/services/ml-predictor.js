@@ -95,12 +95,27 @@ class MLPredictor {
   /**
    * Fetch MBP-10 data from Databento Historical API.
    * Returns raw JSON records (one per book update event).
+   *
+   * MBP-10 is extremely high-volume (thousands of events/sec for ES).
+   * We use a record limit + streaming to keep memory/time bounded.
+   *
+   * @param {string} product - Futures product symbol
+   * @param {string} start - Start timestamp
+   * @param {string} end - End timestamp
+   * @param {object} [fetchOpts]
+   * @param {number} [fetchOpts.limit=100000] - Max records from API
+   * @param {number} [fetchOpts.timeoutMs=300000] - HTTP timeout (5 min)
+   * @param {number} [fetchOpts.maxRecords=100000] - Stop parsing after this many
    */
-  async _fetchMBP10(product, start, end, timeoutMs = 120000) {
+  async _fetchMBP10(product, start, end, fetchOpts = {}) {
     if (!this.enabled) throw new Error('Databento API key not configured');
 
     const meta = PRODUCTS[product.toUpperCase()];
     if (!meta) throw new Error(`Unknown product: ${product}. Supported: ${Object.keys(PRODUCTS).join(', ')}`);
+
+    const limit = fetchOpts.limit || 100000;
+    const timeoutMs = fetchOpts.timeoutMs || 300000; // 5 min
+    const maxRecords = fetchOpts.maxRecords || 100000;
 
     // Ensure timestamps have nanosecond precision + UTC suffix
     start = _ensureNanoTimestamp(start);
@@ -116,10 +131,11 @@ class MLPredictor {
       compression: 'none',
       start,
       end,
+      limit: String(limit),
     };
 
     const body = new URLSearchParams(params);
-    console.log(`[ML-Predictor] Fetching MBP-10 for ${product} from ${start} to ${end}`);
+    console.log(`[ML-Predictor] Fetching MBP-10 for ${product} from ${start} to ${end} (limit=${limit})`);
 
     const res = await fetch(url, {
       method: 'POST',
@@ -136,15 +152,46 @@ class MLPredictor {
       throw new Error(`Databento API ${res.status}: ${text.slice(0, 500)}`);
     }
 
-    const text = await res.text();
+    // Stream the response line-by-line to avoid buffering hundreds of MB.
+    // Databento returns JSON Lines (one JSON object per line).
     const records = [];
-    for (const line of text.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      // Keep the last (possibly incomplete) line in the buffer
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          records.push(JSON.parse(trimmed));
+        } catch {
+          // Skip malformed lines
+        }
+        if (records.length >= maxRecords) break;
+      }
+
+      if (records.length >= maxRecords) {
+        // Cancel the rest of the stream — we have enough data
+        reader.cancel().catch(() => {});
+        break;
+      }
+    }
+
+    // Process any remaining data in the buffer
+    if (buffer.trim() && records.length < maxRecords) {
       try {
-        records.push(JSON.parse(trimmed));
+        records.push(JSON.parse(buffer.trim()));
       } catch {
-        // Skip malformed lines
+        // Skip
       }
     }
 
@@ -460,13 +507,15 @@ class MLPredictor {
     const markout = options.markout || 500;
     const trainSplit = options.trainSplit || 0.66;
 
-    // Default: use yesterday's regular trading hours (or a recent trading day)
-    // Databento requires nanosecond-precision UTC timestamps
+    // Default: 2-hour window during active trading (10:00-12:00 ET).
+    // MBP-10 is extremely high-volume — a full session would be millions of
+    // records.  2 hours of ES gives ~5,000-15,000 trades, plenty for ML.
+    // Databento requires nanosecond-precision UTC timestamps.
     let { start, end } = options;
     if (!start || !end) {
       const d = _lastTradingDay();
-      start = `${d}T14:30:00.000000000Z`;  // 9:30 AM ET = 14:30 UTC
-      end = `${d}T21:00:00.000000000Z`;    // 4:00 PM ET = 21:00 UTC
+      start = `${d}T15:00:00.000000000Z`;  // 10:00 AM ET = 15:00 UTC
+      end = `${d}T17:00:00.000000000Z`;    // 12:00 PM ET = 17:00 UTC
     }
 
     // Check cache
