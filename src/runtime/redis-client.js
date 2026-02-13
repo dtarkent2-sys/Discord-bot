@@ -39,7 +39,19 @@ function createRedisClient(redisUrl) {
         while (pending.length > 0) pending.shift().reject(err);
       }
 
+      /**
+       * Send a Redis command.  Accepts an optional trailing options object:
+       *   sendCommand('GET', 'key', { timeout: 5000 })
+       * Default timeout is 10 000 ms.
+       */
       function sendCommand(...args) {
+        // Pop options object if present
+        let timeoutMs = 10_000;
+        if (args.length > 0 && typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null && !Array.isArray(args[args.length - 1])) {
+          const opts = args.pop();
+          if (opts.timeout) timeoutMs = opts.timeout;
+        }
+
         return new Promise((res, rej) => {
           const parts = [`*${args.length}`];
           for (const arg of args) {
@@ -59,8 +71,8 @@ function createRedisClient(redisUrl) {
           };
           const timer = setTimeout(() => {
             entry.dead = true;
-            if (!settled) { settled = true; rej(new Error('Redis command timeout (10s)')); }
-          }, 10_000);
+            if (!settled) { settled = true; rej(new Error(`Redis command timeout (${timeoutMs / 1000}s)`)); }
+          }, timeoutMs);
           pending.push(entry);
           socket.write(parts.join('\r\n') + '\r\n');
         });
