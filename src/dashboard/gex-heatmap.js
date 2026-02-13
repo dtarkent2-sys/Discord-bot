@@ -509,7 +509,8 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
   const sourcesToTry = [];
   if (live && live.hasDataFor(ticker)) sourcesToTry.push('DatabentoLive');
   // Skip Databento Historical if live stream is connected — same data but lagged and slow
-  if (databento.enabled && !(live && live.connected)) sourcesToTry.push('Databento');
+  const liveConnected = live && live.client && live.client.connected;
+  if (databento.enabled && !liveConnected) sourcesToTry.push('Databento');
   if (tradier.enabled) sourcesToTry.push('Tradier');
   if (publicService.enabled) sourcesToTry.push('Public.com');
   sourcesToTry.push('Yahoo');
@@ -664,13 +665,17 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
       }
     }
 
-    if (expirationResults.length > 0) {
+    // Require a minimum number of strikes to consider a source usable —
+    // DatabentoLive often has sparse OI early in the session which produces
+    // a nearly-empty heatmap. Fall back to a richer source instead.
+    const MIN_STRIKES = 10;
+    if (expirationResults.length > 0 && allStrikes.size >= MIN_STRIKES) {
       source = trySource;
-      console.log(`[GEXHeatmap] Using ${trySource} for ${ticker} (${expirationResults.length} expirations with data)`);
+      console.log(`[GEXHeatmap] Using ${trySource} for ${ticker} (${expirationResults.length} expirations, ${allStrikes.size} strikes)`);
       break; // Success — use this source
     }
 
-    console.warn(`[GEXHeatmap] ${trySource} had expirations but produced no usable chain data, falling back...`);
+    console.warn(`[GEXHeatmap] ${trySource} had expirations but insufficient data (${expirationResults.length} exps, ${allStrikes.size} strikes), falling back...`);
   }
 
   if (expirationResults.length === 0) throw new Error(`No options data for ${ticker}`);
