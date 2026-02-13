@@ -519,6 +519,7 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
   let expirationResults = [];
   let allStrikes = new Set();
   let futureExpDates = [];
+  let bestFallback = null; // Track best data if no source meets MIN_STRIKES
 
   for (const trySource of sourcesToTry) {
     // ── Get available expirations for this source ──
@@ -657,7 +658,9 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
           totalGEX = detailed['totalNetGEX$'];
         }
 
-        expirationResults.push({ date: expDate, strikeGEX: strikeGEXMap, totalGEX });
+        if (Object.keys(strikeGEXMap).length > 0) {
+          expirationResults.push({ date: expDate, strikeGEX: strikeGEXMap, totalGEX });
+        }
       } catch (err) {
         console.warn(`[GEXHeatmap API] Skipping ${expDate}: ${err.message}`);
         // If we hit a timeout, don't waste time on remaining expirations for this source
@@ -675,7 +678,22 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
       break; // Success — use this source
     }
 
+    // Track best fallback in case no source meets MIN_STRIKES
+    if (expirationResults.length > 0 && allStrikes.size > 0 &&
+        (!bestFallback || allStrikes.size > bestFallback.allStrikes.size)) {
+      bestFallback = { source: trySource, expirationResults: [...expirationResults], allStrikes: new Set(allStrikes), futureExpDates: [...futureExpDates] };
+    }
+
     console.warn(`[GEXHeatmap] ${trySource} had expirations but insufficient data (${expirationResults.length} exps, ${allStrikes.size} strikes), falling back...`);
+  }
+
+  // If no source met MIN_STRIKES but we have some data, use the best available
+  if (!source && bestFallback) {
+    source = bestFallback.source;
+    expirationResults = bestFallback.expirationResults;
+    allStrikes = bestFallback.allStrikes;
+    futureExpDates = bestFallback.futureExpDates;
+    console.warn(`[GEXHeatmap] No source met MIN_STRIKES, using best fallback: ${source} (${expirationResults.length} exps, ${allStrikes.size} strikes)`);
   }
 
   if (expirationResults.length === 0) throw new Error(`No options data for ${ticker}`);

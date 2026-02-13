@@ -179,6 +179,7 @@ class GammaHeatmapService {
     let source = null;
     let expirationData = [];
     let allStrikes = new Set();
+    let bestFallback = null; // Track best data if no source meets MIN_STRIKES
 
     for (const trySource of sourcesToTry) {
       // ── Get available expirations for this source ──
@@ -297,7 +298,9 @@ class GammaHeatmapService {
             totalGEX = detailed['totalNetGEX$'];
           }
 
-          expirationData.push({ date: expDate, strikeGEX, totalGEX });
+          if (strikeGEX.size > 0) {
+            expirationData.push({ date: expDate, strikeGEX, totalGEX });
+          }
         } catch (err) {
           console.warn(`[GammaHeatmap] Skipping ${expDate}: ${err.message}`);
           // If we hit a timeout, don't waste time on remaining expirations for this source
@@ -315,7 +318,21 @@ class GammaHeatmapService {
         break; // Success — use this source
       }
 
+      // Track best fallback in case no source meets MIN_STRIKES
+      if (expirationData.length > 0 && allStrikes.size > 0 &&
+          (!bestFallback || allStrikes.size > bestFallback.allStrikes.size)) {
+        bestFallback = { source: trySource, expirationData: [...expirationData], allStrikes: new Set(allStrikes) };
+      }
+
       console.warn(`[GammaHeatmap] ${trySource} had expirations but insufficient data (${expirationData.length} exps, ${allStrikes.size} strikes), falling back...`);
+    }
+
+    // If no source met MIN_STRIKES but we have some data, use the best available
+    if (!source && bestFallback) {
+      source = bestFallback.source;
+      expirationData = bestFallback.expirationData;
+      allStrikes = bestFallback.allStrikes;
+      console.warn(`[GammaHeatmap] No source met MIN_STRIKES, using best fallback: ${source} (${expirationData.length} exps, ${allStrikes.size} strikes)`);
     }
 
     if (expirationData.length === 0) {
