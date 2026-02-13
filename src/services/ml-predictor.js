@@ -20,6 +20,21 @@ const ML_SCRIPT = path.join(__dirname, '..', '..', 'ml', 'predictor.py');
 const _resultCache = new Map();
 const RESULT_CACHE_TTL = 5 * 60 * 1000;
 
+/** Extract the last JSON object from stdout (handles stray print output from gdown etc.) */
+function _extractJson(raw) {
+  const trimmed = raw.trim();
+  // Fast path: entire output is JSON
+  if (trimmed.startsWith('{')) return trimmed;
+  // Find the last line that starts with '{'
+  const lines = trimmed.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trimStart().startsWith('{')) {
+      return lines.slice(i).join('\n');
+    }
+  }
+  return trimmed; // fallback — let JSON.parse throw the real error
+}
+
 class MLPredictor {
   get enabled() {
     // No API key needed — uses local parquet data
@@ -99,7 +114,9 @@ class MLPredictor {
           return;
         }
         try {
-          resolve(JSON.parse(stdout.trim()));
+          // Find the last JSON object in stdout (in case gdown or other libs leak to stdout)
+          const jsonStr = _extractJson(stdout);
+          resolve(JSON.parse(jsonStr));
         } catch (parseErr) {
           reject(new Error(`Failed to parse Python output: ${parseErr.message}\nstdout: ${stdout.slice(0, 500)}`));
         }
