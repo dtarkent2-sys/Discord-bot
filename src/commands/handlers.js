@@ -2125,8 +2125,8 @@ async function handleMLPredict(interaction) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
         return interaction.editReply('Invalid date format. Use YYYY-MM-DD (e.g. 2025-12-06).');
       }
-      options.start = `${dateStr}T14:30:00`;
-      options.end = `${dateStr}T21:00:00`;
+      options.start = `${dateStr}T14:30:00.000000000Z`;
+      options.end = `${dateStr}T21:00:00.000000000Z`;
     }
 
     const result = await mlPredictor.runPrediction(product, options);

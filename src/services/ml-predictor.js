@@ -102,6 +102,10 @@ class MLPredictor {
     const meta = PRODUCTS[product.toUpperCase()];
     if (!meta) throw new Error(`Unknown product: ${product}. Supported: ${Object.keys(PRODUCTS).join(', ')}`);
 
+    // Ensure timestamps have nanosecond precision + UTC suffix
+    start = _ensureNanoTimestamp(start);
+    end = _ensureNanoTimestamp(end);
+
     const url = `${HIST_BASE}/v${API_VERSION}/timeseries.get_range`;
     const params = {
       dataset: meta.dataset,
@@ -457,11 +461,12 @@ class MLPredictor {
     const trainSplit = options.trainSplit || 0.66;
 
     // Default: use yesterday's regular trading hours (or a recent trading day)
+    // Databento requires nanosecond-precision UTC timestamps
     let { start, end } = options;
     if (!start || !end) {
       const d = _lastTradingDay();
-      start = `${d}T14:30:00`;  // 9:30 AM ET = 14:30 UTC
-      end = `${d}T21:00:00`;    // 4:00 PM ET = 21:00 UTC
+      start = `${d}T14:30:00.000000000Z`;  // 9:30 AM ET = 14:30 UTC
+      end = `${d}T21:00:00.000000000Z`;    // 4:00 PM ET = 21:00 UTC
     }
 
     // Check cache
@@ -776,6 +781,23 @@ function _lastTradingDay() {
   if (day === 0) d.setDate(d.getDate() - 2); // Sunday -> Friday
   if (day === 6) d.setDate(d.getDate() - 1); // Saturday -> Friday
   return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Ensure a timestamp has nanosecond precision and UTC suffix.
+ * Databento requires format like: 2023-12-06T14:30:00.000000000Z
+ */
+function _ensureNanoTimestamp(ts) {
+  if (!ts) return ts;
+  // Already has nanosecond precision
+  if (/\.\d{9}Z$/.test(ts)) return ts;
+  // Has some fractional seconds - normalize to 9 digits
+  if (/\.\d+Z?$/.test(ts)) {
+    const base = ts.replace(/Z$/, '').replace(/\.(\d+)$/, (_, frac) => '.' + frac.padEnd(9, '0'));
+    return base + 'Z';
+  }
+  // No fractional seconds - add .000000000Z
+  return ts.replace(/Z$/, '') + '.000000000Z';
 }
 
 /**
