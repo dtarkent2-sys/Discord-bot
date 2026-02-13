@@ -310,6 +310,11 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
     }
   }
 
+  // Reverse so highest strike is on top (trader convention: calls on top, puts on bottom)
+  selectedStrikes.reverse();
+  grid.reverse();
+  profile.reverse();
+
   return {
     ticker,
     spotPrice,

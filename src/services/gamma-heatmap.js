@@ -185,7 +185,8 @@ class GammaHeatmapService {
 
     const startIdx = Math.max(0, spotIdx - strikeRange);
     const endIdx = Math.min(sortedStrikes.length, spotIdx + strikeRange + 1);
-    const selectedStrikes = sortedStrikes.slice(startIdx, endIdx);
+    // Reverse so highest strike is on top (trader convention: calls on top, puts on bottom)
+    const selectedStrikes = sortedStrikes.slice(startIdx, endIdx).reverse();
 
     if (selectedStrikes.length === 0) {
       throw new Error('No strikes near the current price.');
