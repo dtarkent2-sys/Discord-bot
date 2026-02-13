@@ -581,9 +581,24 @@ class OptionsEngine {
       // Use spot from GEX if available, otherwise last close from bars
       const refPrice = spot || bars[bars.length - 1].close;
       intradayTech = this._computeIntradayTechnicals(bars, refPrice);
-      this._log('tech', `${underlying}: RSI=${intradayTech.rsi?.toFixed(1) || 'N/A'}, MACD hist=${intradayTech.macd?.histogram?.toFixed(3) || 'N/A'}, momentum=${intradayTech.momentum?.toFixed(2) || '0.00'}%, VWAP=$${intradayTech.vwap?.toFixed(2) || 'N/A'}, vol=${intradayTech.volumeTrend?.toFixed(1) || '1.0'}x`);
+      this._log('tech', `${underlying}: RSI=${intradayTech.rsi?.toFixed(1) || 'N/A'}, MACD hist=${intradayTech.macd?.histogram?.toFixed(3) || 'N/A'}, momentum=${intradayTech.momentum?.toFixed(2) || '0.00'}%, VWAP=$${intradayTech.vwap?.toFixed(2) || 'N/A'}, vol=${intradayTech.volumeTrend?.toFixed(1) || '1.0'}x, sigma=${intradayTech.todayMoveSigma?.toFixed(2) || '?'}, chop=${intradayTech.choppiness?.toFixed(2) || '?'}`);
     } catch (err) {
       this._log('tech', `${underlying}: intraday data error — ${err.message}`);
+      this._markScanned(cooldownKey);
+      return null;
+    }
+
+    // 2b. Volatility regime gate (thetagang-inspired)
+    // Skip flat days where 0DTE scalps get killed by theta decay
+    if (intradayTech.todayMoveSigma < 0.5 && intradayTech.dailySigma > 0) {
+      this._log('scan', `${underlying}: flat day — move ${intradayTech.todayMoveSigma.toFixed(2)}σ < 0.5σ threshold — skipping`);
+      this._markScanned(cooldownKey);
+      return null;
+    }
+
+    // Skip very choppy markets where momentum scalps get whipsawed
+    if (intradayTech.choppiness > 4) {
+      this._log('scan', `${underlying}: choppy regime — choppiness ${intradayTech.choppiness.toFixed(2)} > 4.0 threshold — skipping`);
       this._markScanned(cooldownKey);
       return null;
     }
@@ -740,6 +755,34 @@ class OptionsEngine {
     const nearestSupport = recentLows.length > 0 ? Math.min(...recentLows) : (currentPrice || 0);
     const nearestResistance = recentHighs.length > 0 ? Math.max(...recentHighs) : (currentPrice || 0);
 
+    // ── Volatility regime (inspired by thetagang sigma threshold) ──
+    // Compute historical intraday volatility and today's move in sigma units.
+    // If today's move is < 0.5 sigma, the market is flat — bad for scalps.
+    const logReturns = [];
+    for (let i = 1; i < closes.length; i++) {
+      if (closes[i - 1] > 0) logReturns.push(Math.log(closes[i] / closes[i - 1]));
+    }
+    const stddev = logReturns.length > 5
+      ? Math.sqrt(logReturns.reduce((s, r) => s + r * r, 0) / logReturns.length)
+      : 0;
+    const todayMove = closes.length >= 2
+      ? Math.abs(Math.log(closes[closes.length - 1] / closes[0]))
+      : 0;
+    const todayMoveSigma = stddev > 0 ? todayMove / stddev : 0;
+
+    // ── Choppiness index (from thetagang regime detection) ──
+    // High choppiness = mean-reverting/choppy (bad for momentum scalps)
+    // Low choppiness = trending (good for scalps)
+    // Formula: total_volatility / net_displacement
+    const chopWindow = Math.min(20, logReturns.length);
+    let choppiness = 1;
+    if (chopWindow >= 5) {
+      const windowReturns = logReturns.slice(-chopWindow);
+      const totalVol = Math.sqrt(windowReturns.reduce((s, r) => s + r * r, 0));
+      const netDisp = Math.abs(windowReturns.reduce((s, r) => s + r, 0));
+      choppiness = netDisp > 0 ? totalVol / netDisp : 5; // high = choppy
+    }
+
     return {
       price: currentPrice,
       rsi,
@@ -753,6 +796,10 @@ class OptionsEngine {
       nearestResistance,
       bars,
       priceAboveVWAP: currentPrice > vwap,
+      // Volatility regime fields
+      dailySigma: stddev,
+      todayMoveSigma,
+      choppiness, // < 2 = trending, > 3 = choppy
     };
   }
 
@@ -869,6 +916,28 @@ class OptionsEngine {
       reasons.push(`Volume surging ${tech.volumeTrend.toFixed(1)}x (+0.5 direction confirm)`);
     }
 
+    // ── VOLATILITY REGIME (thetagang-inspired) ──
+    // Strong intraday move = momentum is real, boost conviction
+    if (tech.todayMoveSigma >= 2.0) {
+      const dirBoost = tech.momentum > 0 ? 'bull' : 'bear';
+      if (dirBoost === 'bull') bullPoints += 1;
+      else bearPoints += 1;
+      reasons.push(`Strong move ${tech.todayMoveSigma.toFixed(1)}σ (+1 ${dirBoost})`);
+    }
+
+    // Low choppiness = trending cleanly, boost conviction
+    if (tech.choppiness < 1.5) {
+      const trendDir = tech.momentum > 0 ? 'bull' : 'bear';
+      if (trendDir === 'bull') bullPoints += 1;
+      else bearPoints += 1;
+      reasons.push(`Clean trend (chop=${tech.choppiness.toFixed(1)}) (+1 ${trendDir})`);
+    } else if (tech.choppiness > 3.0) {
+      // High choppiness = choppy, reduce both sides
+      bullPoints = Math.max(0, bullPoints - 0.5);
+      bearPoints = Math.max(0, bearPoints - 0.5);
+      reasons.push(`Choppy market (chop=${tech.choppiness.toFixed(1)}) (-0.5 both)`);
+    }
+
     // Calculate total and direction
     const total = bullPoints + bearPoints;
     const direction = bullPoints > bearPoints ? 'bullish' : 'bearish';
@@ -911,6 +980,8 @@ class OptionsEngine {
       `VWAP: $${tech.vwap?.toFixed(2) || 'N/A'} (price ${tech.priceAboveVWAP ? 'ABOVE' : 'BELOW'})`,
       `ATR: $${tech.atr?.toFixed(2) || 'N/A'} | Momentum(5-bar): ${tech.momentum?.toFixed(2) || '0.00'}%`,
       `Volume: ${tech.volumeTrend?.toFixed(1) || '1.0'}x average`,
+      `Today's Move: ${tech.todayMoveSigma?.toFixed(2) || '?'}σ (${tech.todayMoveSigma >= 1.5 ? 'STRONG' : tech.todayMoveSigma >= 0.5 ? 'moderate' : 'FLAT'})`,
+      `Choppiness: ${tech.choppiness?.toFixed(2) || '?'} (${tech.choppiness < 1.5 ? 'TRENDING' : tech.choppiness > 3.0 ? 'CHOPPY' : 'mixed'})`,
       `Support: $${tech.nearestSupport?.toFixed(2) || 'N/A'} | Resistance: $${tech.nearestResistance?.toFixed(2) || 'N/A'}`,
       ``,
       `═══ GAMMA SQUEEZE STATUS ═══`,
@@ -1081,7 +1152,9 @@ class OptionsEngine {
         return null;
       }
 
-      // Score each candidate
+      // Score each candidate (thetagang-inspired: prefer highest delta within
+      // range = most premium for momentum plays, tight spread, high liquidity)
+      const TARGET_DELTA = 0.40; // sweet spot for 0DTE momentum scalps
       const scored = candidates.map(opt => {
         const bid = opt.bid || 0;
         const ask = opt.ask || 0;
@@ -1091,27 +1164,39 @@ class OptionsEngine {
         const volume = opt.volume || 0;
         const oi = opt.openInterest || 0;
 
-        // Score: favor tight spread, good delta, high OI, decent volume
         let score = 0;
-        if (spread < 0.05) score += 3;
+
+        // ── Spread quality (tight spread = better fills, less slippage) ──
+        if (spread < 0.03) score += 4;
+        else if (spread < 0.05) score += 3;
         else if (spread < 0.10) score += 2;
         else if (spread < 0.15) score += 1;
 
-        // Prefer delta around 0.35-0.45 (sweet spot)
-        if (absDelta >= 0.35 && absDelta <= 0.45) score += 2;
-        else if (absDelta >= 0.30 && absDelta <= 0.50) score += 1;
+        // ── Delta targeting (thetagang-style: prefer closest to target delta) ──
+        // Higher delta = more premium, more responsive to momentum
+        // Score inversely proportional to distance from target
+        const deltaDistance = Math.abs(absDelta - TARGET_DELTA);
+        if (deltaDistance < 0.05) score += 4;        // within 5% of target
+        else if (deltaDistance < 0.10) score += 3;
+        else if (deltaDistance < 0.15) score += 2;
+        else score += 1;
 
-        // Liquidity
-        if (oi > 1000) score += 2;
+        // Bonus for highest delta within range (like thetagang — maximize premium)
+        score += absDelta * 2; // 0.40 delta → +0.80, 0.30 → +0.60
+
+        // ── Liquidity (thetagang uses min OI as hard filter, we score it) ──
+        if (oi > 5000) score += 3;
+        else if (oi > 1000) score += 2;
         else if (oi > 500) score += 1;
         else if (oi > 100) score += 0.5;
-        if (volume > 100) score += 1;
+        if (volume > 500) score += 2;
+        else if (volume > 100) score += 1;
         else if (volume > 10) score += 0.5;
 
         return { ...opt, mid, spread, score };
       });
 
-      // Sort by score descending, then by spread ascending
+      // Sort by score descending, then by spread ascending (tightest spread as tiebreaker)
       scored.sort((a, b) => b.score - a.score || a.spread - b.spread);
 
       const best = scored[0];
