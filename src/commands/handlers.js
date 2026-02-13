@@ -26,7 +26,8 @@ const optionsEngine = require('../services/options-engine');
 const initiative = require('../services/initiative');
 const gammaSqueeze = require('../services/gamma-squeeze');
 const yoloMode = require('../services/yolo-mode');
-const { AttachmentBuilder, MessageFlags, PermissionsBitField } = require('discord.js');
+const channelHistory = require('../services/channel-history');
+const { AttachmentBuilder, MessageFlags, PermissionsBitField, ChannelType } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
 const { instrumentInteraction } = require('../utils/safe-send');
@@ -108,6 +109,8 @@ async function handleCommand(interaction) {
       return handleSqueeze(interaction);
     case 'yolo':
       return handleYolo(interaction);
+    case 'ingest':
+      return handleIngest(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -368,6 +371,9 @@ async function handleHelp(interaction) {
     '`/agent config` — View settings | `/agent set` — Change settings',
     '`/agent dangerous` — Toggle aggressive trading mode',
     '`/agent enable|disable|kill|reset|logs`',
+    '',
+    '**Memory**',
+    '`/ingest [#channel]` — Read channel history into long-term memory',
     '',
     '**Owner:** `!update` `!suggest` `!autoedit` `!rollback` `!selfheal`',
     'Mention me or DM me to chat! React 👍/👎 on replies so I learn.',
@@ -1587,10 +1593,10 @@ async function handleOptions(interaction) {
         if (!ticker) {
           await interaction.editReply(
             '**0DTE Options — Manual Trade**\n' +
-            'Specify an underlying to run the full options pipeline.\n\n' +
+            'Specify an underlying to run the full 0DTE scalp pipeline.\n\n' +
             '`/options trade ticker:SPY` — AI picks direction + contract\n' +
             '`/options trade ticker:QQQ direction:call` — force call direction\n' +
-            '`/options trade ticker:SPY direction:put strategy:swing` — force put + swing strategy'
+            '`/options trade ticker:SPY direction:put` — force put direction'
           );
           break;
         }
@@ -1874,6 +1880,121 @@ async function handleYolo(interaction) {
 
     default:
       return interaction.reply({ content: 'Unknown YOLO action.', flags: MessageFlags.Ephemeral });
+  }
+}
+
+// ── /ingest — Read channel history into memory ────────────────────────
+async function handleIngest(interaction) {
+  const hasAdminPerms = interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator);
+  const isOwner = config.botOwnerId && interaction.user.id === config.botOwnerId;
+  const isAuthorized = isOwner || hasAdminPerms;
+
+  if (!isAuthorized) {
+    return interaction.reply({
+      content: 'Channel ingestion is restricted to the bot owner or server administrators.',
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  await interaction.deferReply();
+
+  const targetChannel = interaction.options.getChannel('channel');
+  const limit = interaction.options.getInteger('limit') || 2000;
+
+  try {
+    if (targetChannel) {
+      // Single channel ingestion
+      if (!targetChannel.isTextBased() || targetChannel.type === ChannelType.GuildVoice) {
+        return interaction.editReply(`**${targetChannel.name}** is not a text channel.`);
+      }
+
+      await interaction.editReply(`**Channel Ingestion**\nReading #${targetChannel.name}... (up to ${limit} messages)\nThis may take a minute.`);
+
+      const result = await channelHistory.ingest(targetChannel, {
+        limit,
+        onProgress: async (processed, total) => {
+          if (processed % 200 === 0) {
+            await interaction.editReply(
+              `**Channel Ingestion**\nReading #${targetChannel.name}... ${processed}/${total} messages processed`
+            ).catch(() => {});
+          }
+        },
+      });
+
+      if (result.error) {
+        return interaction.editReply(`**Channel Ingestion Failed**\n${result.error}`);
+      }
+
+      await interaction.editReply(
+        `**Channel Ingestion Complete**\n` +
+        `Channel: #${targetChannel.name}\n` +
+        `Messages read: **${result.messagesProcessed}**\n` +
+        `Knowledge entries created: **${result.knowledgeEntries}**\n\n` +
+        `_Billy now remembers what was discussed in this channel._`
+      );
+    } else {
+      // All text channels
+      const guild = interaction.guild;
+      if (!guild) {
+        return interaction.editReply('This command must be used in a server.');
+      }
+
+      const textChannels = guild.channels.cache.filter(
+        ch => ch.isTextBased() && ch.type !== ChannelType.GuildVoice && ch.type !== ChannelType.GuildCategory
+      );
+
+      await interaction.editReply(
+        `**Channel Ingestion**\n` +
+        `Reading ${textChannels.size} text channels... (up to ${limit} messages each)\n` +
+        `This may take several minutes.`
+      );
+
+      let totalMessages = 0;
+      let totalKnowledge = 0;
+      const results = [];
+
+      for (const [, channel] of textChannels) {
+        try {
+          // Check if bot can read the channel
+          if (!channel.permissionsFor(interaction.guild.members.me)?.has('ViewChannel')) continue;
+
+          const result = await channelHistory.ingest(channel, { limit });
+          if (result.messagesProcessed > 0) {
+            results.push({ name: channel.name, ...result });
+            totalMessages += result.messagesProcessed;
+            totalKnowledge += result.knowledgeEntries;
+          }
+
+          await interaction.editReply(
+            `**Channel Ingestion**\n` +
+            `Progress: ${results.length}/${textChannels.size} channels\n` +
+            `Last: #${channel.name} (${result.messagesProcessed} messages)\n` +
+            `Total: ${totalMessages} messages → ${totalKnowledge} knowledge entries`
+          ).catch(() => {});
+        } catch (err) {
+          console.warn(`[Ingest] Error on #${channel.name}: ${err.message}`);
+        }
+      }
+
+      const summary = results
+        .filter(r => r.messagesProcessed > 0)
+        .sort((a, b) => b.messagesProcessed - a.messagesProcessed)
+        .slice(0, 10)
+        .map(r => `• #${r.name}: ${r.messagesProcessed} msgs → ${r.knowledgeEntries} entries`)
+        .join('\n');
+
+      await interaction.editReply(
+        `**Channel Ingestion Complete**\n` +
+        `Channels processed: **${results.length}**\n` +
+        `Total messages read: **${totalMessages}**\n` +
+        `Knowledge entries created: **${totalKnowledge}**\n\n` +
+        (summary ? `**Top channels:**\n${summary}\n\n` : '') +
+        `_Billy now remembers what was discussed across the server._`
+      );
+    }
+  } catch (err) {
+    console.error('[Ingest] Error:', err);
+    await interaction.editReply(`**Channel Ingestion Failed**\n${err.message}`);
   }
 }
 
