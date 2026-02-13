@@ -64,7 +64,7 @@ function getDatabentoLive() {
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
-const RISK_FREE_RATE = 0.045; // approximate 10Y yield
+const bs = require('../lib/black-scholes');
 
 const FONT_FAMILY = 'Inter';
 
@@ -374,74 +374,10 @@ class GammaService {
     }
   }
 
-  // ── Black-Scholes gamma ──────────────────────────────────────────────
+  // ── Black-Scholes gamma (delegates to shared lib/black-scholes.js) ──
 
-  _normalPDF(x) {
-    return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
-  }
-
-  _d1(S, K, r, sigma, T) {
-    return (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
-  }
-
-  /**
-   * Black-Scholes gamma for a single option.
-   * @param {number} S - spot price
-   * @param {number} K - strike price
-   * @param {number} sigma - implied volatility (decimal, e.g. 0.30 = 30%)
-   * @param {number} T - time to expiry in years
-   * @returns {number} gamma value
-   */
-  _bsGamma(S, K, sigma, T) {
-    if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
-    const d1 = this._d1(S, K, RISK_FREE_RATE, sigma, T);
-    return this._normalPDF(d1) / (S * sigma * Math.sqrt(T));
-  }
-
-  /** Abramowitz-Stegun CDF approximation */
-  _normalCDF(x) {
-    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
-    const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
-    const sign = x < 0 ? -1 : 1;
-    const t = 1 / (1 + p * Math.abs(x));
-    const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x / 2);
-    return 0.5 * (1 + sign * y);
-  }
-
-  /** Black-Scholes option price */
-  _bsPrice(S, K, r, sigma, T, isCall) {
-    const d1v = this._d1(S, K, r, sigma, T);
-    const d2 = d1v - sigma * Math.sqrt(T);
-    const Nd1 = this._normalCDF(d1v);
-    const Nd2 = this._normalCDF(d2);
-    if (isCall) return S * Nd1 - K * Math.exp(-r * T) * Nd2;
-    return K * Math.exp(-r * T) * (1 - Nd2) - S * (1 - Nd1);
-  }
-
-  /** Black-Scholes vega */
-  _bsVega(S, K, r, sigma, T) {
-    const d1v = this._d1(S, K, r, sigma, T);
-    return S * this._normalPDF(d1v) * Math.sqrt(T);
-  }
-
-  /**
-   * Estimate IV from option mid-price using Brenner-Subrahmanyam + Newton-Raphson.
-   * Falls back to 25% default if estimation fails.
-   */
-  _estimateIV(midPrice, spotPrice, strike, T, isCall) {
-    if (midPrice <= 0 || T <= 0) return 0.25;
-    let sigma = Math.sqrt(2 * Math.PI / T) * midPrice / spotPrice;
-    if (sigma <= 0.01 || sigma > 5) sigma = 0.25;
-    for (let i = 0; i < 3; i++) {
-      const bsP = this._bsPrice(spotPrice, strike, RISK_FREE_RATE, sigma, T, isCall);
-      const vega = this._bsVega(spotPrice, strike, RISK_FREE_RATE, sigma, T);
-      if (vega < 1e-10) break;
-      sigma -= (bsP - midPrice) / vega;
-      if (sigma <= 0.01) { sigma = 0.25; break; }
-      if (sigma > 5) { sigma = 0.25; break; }
-    }
-    return Math.max(0.01, Math.min(sigma, 5));
-  }
+  _bsGamma(S, K, sigma, T) { return bs.bsGamma(S, K, sigma, T); }
+  _estimateIV(midPrice, spotPrice, strike, T, isCall) { return bs.estimateIV(midPrice, spotPrice, strike, T, isCall); }
 
   // ── GEX calculation ──────────────────────────────────────────────────
 
