@@ -206,6 +206,12 @@ function registerDashboardRoutes(app) {
         try { optionsStatus = await engine.getStatus(); } catch { /* skip */ }
       }
 
+      // Data sources status
+      let databento = null;
+      try { const db = require('../services/databento'); databento = db.enabled ? db.getStatus() : null; } catch { /* skip */ }
+      let tradier = null;
+      try { const t = require('../services/tradier'); tradier = t.enabled ? { enabled: true } : null; } catch { /* skip */ }
+
       res.json({
         bot: { ...summary, model: ai.getModel(), reactions: reactionStats },
         mood: moodSummary,
@@ -229,6 +235,10 @@ function registerDashboardRoutes(app) {
           dailyLoss: optionsStatus.dailyLoss,
           discipline: optionsStatus.discipline,
         } : null,
+        dataSources: {
+          databento,
+          tradier,
+        },
       });
     } catch (err) {
       res.status(500).json({ error: err.message });

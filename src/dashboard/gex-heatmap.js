@@ -12,6 +12,7 @@
  */
 
 const gamma = require('../services/gamma');
+const databento = require('../services/databento');
 const alpaca = require('../services/alpaca');
 const tradier = require('../services/tradier');
 const publicService = require('../services/public');
@@ -106,14 +107,29 @@ function registerGEXHeatmapRoutes(app) {
 // ── Data fetching ─────────────────────────────────────────────────────
 
 async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
-  // ── Data source priority: Tradier (ORATS) > Public.com > Yahoo (Black-Scholes) ──
+  // ── Data source priority: Databento (OPRA) > Tradier (ORATS) > Public.com > Yahoo ──
   let source = 'Yahoo';
 
   // 1. Get available expirations — try sources in order
   let allExpDates = null;
   let yahooExps = null;
 
-  // Try Tradier first (ORATS real greeks, clean API)
+  // Try Databento first (institutional OPRA feed, all 17 exchanges)
+  if (databento.enabled) {
+    try {
+      allExpDates = await databento.getOptionExpirations(ticker);
+      if (allExpDates.length > 0) {
+        source = 'Databento';
+      } else {
+        allExpDates = null;
+      }
+    } catch (err) {
+      console.warn(`[GEXHeatmap] Databento expirations failed: ${err.message}`);
+      allExpDates = null;
+    }
+  }
+
+  // Try Tradier next (ORATS real greeks, clean API)
   if (!allExpDates && tradier.enabled) {
     try {
       allExpDates = await tradier.getOptionExpirations(ticker);
@@ -165,8 +181,9 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
 
   // 2. Get spot price — try sources in order
   let spotPrice = null;
-  if (source === 'Tradier') {
+  if (source === 'Databento' || source === 'Tradier') {
     try {
+      // Databento OPRA is options-only — use Tradier for equity quotes
       const q = await tradier.getQuote(ticker);
       spotPrice = q.price;
     } catch { /* fallback */ }
@@ -203,10 +220,12 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
       let strikeGEXMap;
       let totalGEX;
 
-      if (source === 'Tradier' || source === 'Public.com') {
-        // ── Real greeks path: Tradier (ORATS) or Public.com ──
+      if (source === 'Databento' || source === 'Tradier' || source === 'Public.com') {
+        // ── Real data path: Databento (OPRA+ORATS), Tradier (ORATS), or Public.com ──
         let contracts;
-        if (source === 'Tradier') {
+        if (source === 'Databento') {
+          contracts = await databento.getOptionsWithGreeks(ticker, expDate);
+        } else if (source === 'Tradier') {
           contracts = await tradier.getOptionsWithGreeks(ticker, expDate);
         } else {
           contracts = await publicService.getOptionsWithGreeks(ticker, expDate);
@@ -1006,7 +1025,7 @@ function updateFooter() {
   const src = state.data.source || 'Yahoo';
   document.getElementById('footerLeft').textContent =
     'GEX = OI \\u00d7 Gamma \\u00d7 100 \\u00d7 Spot | Data: ' + src
-    + (src === 'Tradier' ? ' (ORATS real greeks)' : src === 'Public.com' ? ' (real greeks)' : ' (Black-Scholes est.)');
+    + (src === 'Databento' ? ' (OPRA + ORATS greeks)' : src === 'Tradier' ? ' (ORATS real greeks)' : src === 'Public.com' ? ' (real greeks)' : ' (Black-Scholes est.)');
   document.getElementById('footerRight').textContent =
     'Updated: ' + new Date(state.data.timestamp).toLocaleTimeString() + ' | '
     + state.data.expirations.length + ' expirations | '
