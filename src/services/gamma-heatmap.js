@@ -170,7 +170,8 @@ class GammaHeatmapService {
     const sourcesToTry = [];
     if (databentoLive && databentoLive.hasDataFor(upper)) sourcesToTry.push('DatabentoLive');
     // Skip Databento Historical if live stream is connected — same data but lagged and slow
-    if (databento.enabled && !(databentoLive && databentoLive.connected)) sourcesToTry.push('Databento');
+    const liveConnected = databentoLive && databentoLive.client && databentoLive.client.connected;
+    if (databento.enabled && !liveConnected) sourcesToTry.push('Databento');
     if (tradier.enabled) sourcesToTry.push('Tradier');
     if (publicService.enabled) sourcesToTry.push('Public.com');
     sourcesToTry.push('Yahoo');
@@ -304,13 +305,17 @@ class GammaHeatmapService {
         }
       }
 
-      if (expirationData.length > 0) {
+      // Require a minimum number of strikes to consider a source usable —
+      // DatabentoLive often has sparse OI early in the session which produces
+      // a nearly-empty heatmap. Fall back to a richer source instead.
+      const MIN_STRIKES = 10;
+      if (expirationData.length > 0 && allStrikes.size >= MIN_STRIKES) {
         source = trySource;
-        console.log(`[GammaHeatmap] Using ${trySource} for ${upper} (${expirationData.length} expirations with data)`);
+        console.log(`[GammaHeatmap] Using ${trySource} for ${upper} (${expirationData.length} expirations, ${allStrikes.size} strikes)`);
         break; // Success — use this source
       }
 
-      console.warn(`[GammaHeatmap] ${trySource} had expirations but produced no usable chain data, falling back...`);
+      console.warn(`[GammaHeatmap] ${trySource} had expirations but insufficient data (${expirationData.length} exps, ${allStrikes.size} strikes), falling back...`);
     }
 
     if (expirationData.length === 0) {
