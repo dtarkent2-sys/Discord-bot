@@ -32,6 +32,15 @@ EXPECTED_FILES = [
     "all_cash_flow.parquet",
 ]
 
+# Known Google Drive file IDs — avoids unreliable folder-page scraping.
+# Discovered from folder 1rMMeiT-O-z7zfW5htfL_8H188swUtUCj.
+GDRIVE_FILE_IDS = {
+    "all_balance_sheets.parquet": "1bLPnpBe6s5Df2ehalIrALkSMsMzI5CZc",
+    "all_cash_flow.parquet": "1oYRLvH_A8NwCkmBOphHXzvXwBLIF8ScN",
+    "all_income_statements.parquet": "18lv5CurVMkgFm0IA5RHCateKgYgcAe3c",
+    "all_prices_yahoo.parquet": "1HUOqrumZUZ_NagYZEj4FloAJSdVzR012",
+}
+
 
 def get_data_dir():
     return os.environ.get("ML_DATA_DIR", DEFAULT_DATA_DIR)
@@ -81,28 +90,54 @@ def ensure_data(data_dir=None):
 
 
 def _download_folder(folder_id, output_dir):
-    """Download only .parquet files from a Google Drive folder.
+    """Download .parquet files from Google Drive by their known file IDs.
 
-    Uses gdown's internal _parse_google_drive_file() to list the top-level
-    folder contents, filters to .parquet files, and downloads each one
-    individually. This avoids:
-      - The 50-file limit (gdown.download_folder recurses into subfolders
-        that contain hundreds of CSVs and hits the limit there)
-      - Downloading hundreds of unnecessary CSV files
+    Uses direct file-ID downloads (GDRIVE_FILE_IDS) which is completely
+    reliable — no folder-page scraping, no 50-file limit, no JS rendering
+    issues. Falls back to gdown's folder parser if a direct download fails.
     """
     try:
         import gdown
-        from gdown.download import _get_session
-        from gdown.download_folder import _parse_google_drive_file, _GoogleDriveFile
     except ImportError:
         raise ImportError("gdown not installed. Run: pip install gdown")
 
-    url = f"https://drive.google.com/drive/folders/{folder_id}?hl=en"
-    log(f"Listing files in Google Drive folder {folder_id}")
+    log(f"Downloading parquet files from Google Drive")
 
-    # Use gdown's own session and folder parser — it handles the JS-rendered
-    # Google Drive page by extracting the _DRIVE_ivd encoded data blob.
-    # gdown's folder download requires a browser-like user agent.
+    # Redirect stdout to stderr so gdown progress bars don't contaminate JSON
+    old_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        # Primary: download each file directly by its known Google Drive ID
+        failed = []
+        for file_name, file_id in GDRIVE_FILE_IDS.items():
+            dest = os.path.join(output_dir, file_name)
+            if os.path.exists(dest):
+                log(f"  {file_name} already exists, skipping")
+                continue
+            file_url = f"https://drive.google.com/uc?id={file_id}"
+            log(f"  Downloading {file_name} ({file_id})")
+            try:
+                result = gdown.download(file_url, dest, quiet=False)
+                if result is None:
+                    failed.append(file_name)
+                    log(f"  WARNING: {file_name} download returned None")
+            except Exception as e:
+                failed.append(file_name)
+                log(f"  WARNING: {file_name} download failed: {e}")
+
+        if failed:
+            log(f"Direct downloads failed for: {failed}, trying folder listing...")
+            _download_via_folder_listing(gdown, folder_id, output_dir, failed)
+    finally:
+        sys.stdout = old_stdout
+
+
+def _download_via_folder_listing(gdown, folder_id, output_dir, needed_files):
+    """Fallback: parse the folder page to discover file IDs dynamically."""
+    from gdown.download import _get_session
+    from gdown.download_folder import _parse_google_drive_file, _GoogleDriveFile
+
+    url = f"https://drive.google.com/drive/folders/{folder_id}?hl=en"
     user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36"
     sess = _get_session(proxy=None, use_cookies=False, user_agent=user_agent)
     res = sess.get(url)
@@ -111,35 +146,17 @@ def _download_folder(folder_id, output_dir):
 
     gdrive_file, id_name_type_iter = _parse_google_drive_file(url=url, content=res.text)
 
-    # Filter to only .parquet files at the top level (skip subfolders entirely)
-    parquet_files = [
-        (fid, fname) for fid, fname, ftype in id_name_type_iter
-        if ftype != _GoogleDriveFile.TYPE_FOLDER and fname.endswith(".parquet")
-    ]
-
-    if not parquet_files:
-        raise RuntimeError(
-            f"Could not find any .parquet files in Google Drive folder {folder_id}. "
-            f"Ensure the folder is public and contains parquet files."
-        )
-
-    log(f"Found {len(parquet_files)} parquet file(s): {[n for _, n in parquet_files]}")
-
-    # Download each parquet file individually — no 50-file limit, no recursion
-    # Redirect stdout to stderr so gdown progress doesn't contaminate JSON output
-    old_stdout = sys.stdout
-    sys.stdout = sys.stderr
-    try:
-        for file_id, file_name in parquet_files:
-            dest = os.path.join(output_dir, file_name)
-            if os.path.exists(dest):
-                log(f"  {file_name} already exists, skipping")
-                continue
-            file_url = f"https://drive.google.com/uc?id={file_id}"
-            log(f"  Downloading {file_name} ({file_id})")
-            gdown.download(file_url, dest, quiet=False)
-    finally:
-        sys.stdout = old_stdout
+    needed_set = set(needed_files)
+    for fid, fname, ftype in id_name_type_iter:
+        if ftype == _GoogleDriveFile.TYPE_FOLDER:
+            continue
+        if fname not in needed_set:
+            continue
+        dest = os.path.join(output_dir, fname)
+        if os.path.exists(dest):
+            continue
+        log(f"  Downloading {fname} ({fid}) via folder listing")
+        gdown.download(f"https://drive.google.com/uc?id={fid}", dest, quiet=False)
 
 
 def load_prices(data_dir=None, ticker=None):
