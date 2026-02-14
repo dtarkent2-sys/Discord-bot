@@ -26,6 +26,7 @@ const optionsEngine = require('../services/options-engine');
 const initiative = require('../services/initiative');
 const gammaSqueeze = require('../services/gamma-squeeze');
 const gammaHeatmap = require('../services/gamma-heatmap');
+const gammaSetups = require('../services/gamma-setups');
 const yoloMode = require('../services/yolo-mode');
 const channelHistory = require('../services/channel-history');
 let algoTrading = null;
@@ -122,6 +123,8 @@ async function handleCommand(interaction) {
       return handleMLPredict(interaction);
     case 'mlportfolio':
       return handleMLPortfolio(interaction);
+    case 'gammasetups':
+      return handleGammaSetups(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -357,7 +360,7 @@ async function handleHelp(interaction) {
     '`/ask` — Chat with AI | `/analyze` `/deepanalysis` — Stock analysis',
     '`/price` — Quick quote | `/technicals` — RSI, MACD, Bollinger',
     '`/macro` — Market regime | `/sectors` — Sector rotation | `/validea` — Guru scores',
-    '`/gex` — Gamma exposure | `/news` — Market news',
+    '`/gex` — Gamma exposure | `/gammasetups` — Find good gamma setups | `/news` — Market news',
     '`/research` — Agent Swarm research | `/screen` — Stock screener',
     '`/social` `/trending` — StockTwits | `/reddit` — Reddit sentiment',
     '`/watchlist` — Manage watchlist | `/sentiment` — Text analysis',
@@ -1843,6 +1846,60 @@ async function handleSqueeze(interaction) {
   }
 
   return interaction.reply({ content: 'Unknown squeeze action.', flags: MessageFlags.Ephemeral });
+}
+
+// ── /gammasetups — Scan for stocks with good gamma setups ─────────────
+async function handleGammaSetups(interaction) {
+  const action = interaction.options.getString('action');
+  const universe = interaction.options.getString('universe');
+  const ticker = interaction.options.getString('ticker');
+  const limit = interaction.options.getInteger('limit') || 10;
+
+  if (action === 'detail') {
+    if (!ticker) {
+      return interaction.reply({
+        content: 'Please provide a ticker for the detail view (e.g. `/gammasetups detail ticker:NVDA`).',
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    const sanitized = yahoo.sanitizeTicker(ticker);
+    if (!sanitized) {
+      return interaction.reply({ content: 'Invalid ticker symbol.', flags: MessageFlags.Ephemeral });
+    }
+
+    await interaction.deferReply();
+    try {
+      await interaction.editReply(`**${sanitized} — Gamma Setup Analysis**\nFetching multi-expiry GEX data...`);
+      const setup = await gammaSetups._analyzeSetup(sanitized);
+      if (!setup) {
+        return interaction.editReply(`**${sanitized}** — Insufficient options data to evaluate gamma setup.`);
+      }
+      const formatted = gammaSetups.formatDetailForDiscord(setup);
+      return interaction.editReply(formatted.slice(0, 2000));
+    } catch (err) {
+      console.error(`[GammaSetups] Detail error for ${sanitized}:`, err);
+      return interaction.editReply(`**${sanitized} — Gamma Setup**\nError: ${err.message || 'Unknown error'}`);
+    }
+  }
+
+  if (action === 'scan') {
+    await interaction.deferReply();
+    try {
+      const universeLabel = universe || 'default';
+      await interaction.editReply(
+        `**Gamma Setups Scanner**\nScanning \`${universeLabel}\` universe for stocks not too hedged by dealers...`
+      );
+      const result = await gammaSetups.scan({ universe: universe || 'default', limit });
+      const formatted = gammaSetups.formatForDiscord(result);
+      return interaction.editReply(formatted.slice(0, 2000));
+    } catch (err) {
+      console.error('[GammaSetups] Scan error:', err);
+      return interaction.editReply(`**Gamma Setups Scanner**\nError: ${err.message || 'Unknown error'}`);
+    }
+  }
+
+  return interaction.reply({ content: 'Unknown gammasetups action.', flags: MessageFlags.Ephemeral });
 }
 
 // ── /yolo — Autonomous self-improvement engine control ────────────────

@@ -625,6 +625,37 @@ const commands = [
         .setMinValue(0)
         .setMaxValue(999999)
     ),
+
+  // ── Gamma Setups Scanner ─────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName('gammasetups')
+    .setDescription('Scan for stocks with good gamma setups — not too hedged by dealers')
+    .addStringOption(opt =>
+      opt.setName('action')
+        .setDescription('Scan universe or get detail on one ticker')
+        .setRequired(true)
+        .addChoices(
+          { name: 'scan — find best gamma setups across a universe', value: 'scan' },
+          { name: 'detail — deep dive on one ticker', value: 'detail' },
+        )
+    )
+    .addStringOption(opt =>
+      opt.setName('universe')
+        .setDescription('Universe to scan: default, indices, tech, megacap — or comma-separated tickers')
+        .setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('ticker')
+        .setDescription('Single ticker for detail view (e.g. NVDA, SPY)')
+        .setRequired(false)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('limit')
+        .setDescription('Max results to return (default: 10)')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(25)
+    ),
 ];
 
 async function registerCommands() {
