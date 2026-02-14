@@ -46,26 +46,26 @@ def log(msg):
 
 # ── Preset Universes ─────────────────────────────────────────────────────
 
-# Static universes: curated from actual data inspection.
-# "auto" / "auto_50" are dynamic — discovered at runtime from the parquet.
+# US stock presets from per-symbol EOD parquets (Google Drive: eod_by_symbol/).
+# "mega" = 30 large-cap US stocks, "sp50" = 50 diversified large-caps.
+# "local" = dynamically load all locally-cached per-symbol parquets.
 UNIVERSES = {
-    "auto": None,      # Placeholder: auto-discover top 30 at runtime
-    "auto_50": None,   # Placeholder: auto-discover top 50 at runtime
-    "liquid_30": [
-        "SCLXW", "AIXN", "FORW", "WSC", "CORR", "VLRS", "FLNCF", "BOAS",
-        "ORN", "ADXSD", "ENERW", "APLS", "GAFL", "CMXHF", "VULMF", "SPXSY",
-        "NYMXF", "BRAG", "TLGPY", "FUAPF", "DBTX", "ICLK", "ALAB", "BCAB",
-        "VRMEW", "PIONF", "RAAQU", "IROQ", "AIRI", "ACBA",
+    "mega": [
+        "AAPL", "AMZN", "AVGO", "ADBE", "AMD", "ACN", "ABBV", "ABT",
+        "AMAT", "AMGN", "ANET", "AXP", "BA", "BAC", "BLK", "BMY",
+        "C", "CAT", "CMCSA", "COP", "COST", "CRM", "CRWD", "CSCO",
+        "CDNS", "CEG", "CI", "CME", "CMG", "COF",
     ],
-    "liquid_50": [
-        "SCLXW", "AIXN", "FORW", "WSC", "CORR", "VLRS", "FLNCF", "BOAS",
-        "ORN", "ADXSD", "ENERW", "APLS", "GAFL", "CMXHF", "VULMF", "SPXSY",
-        "NYMXF", "BRAG", "TLGPY", "FUAPF", "DBTX", "ICLK", "ALAB", "BCAB",
-        "VRMEW", "PIONF", "RAAQU", "IROQ", "AIRI", "ACBA", "GWLLF", "INSW",
-        "STJPF", "CPK", "EWCZ", "FCOB", "NCBDF", "FICVW", "SBBTF", "YNNHF",
-        "ALBY", "NZERF", "SJR", "INDHF", "OPAL", "BGRDF", "MXCHF", "KLYG",
-        "SGAMY", "VLTMF",
+    "sp50": [
+        "A", "AAPL", "ABBV", "ABT", "ACN", "ADBE", "ADI", "ADP",
+        "AFL", "AIG", "ALGN", "ALL", "AMAT", "AMD", "AMGN", "AMZN",
+        "ANET", "APD", "APH", "APTV", "AVGO", "AXP", "AZO",
+        "BA", "BAC", "BDX", "BK", "BKR", "BLK", "BMY", "BSX", "BX",
+        "C", "CAT", "CB", "CDNS", "CEG", "CHTR", "CI", "CL",
+        "CMCSA", "CME", "CMG", "CNC", "COF", "COP", "COST", "CPRT",
+        "CRM", "CRWD", "CSCO", "CSGP",
     ],
+    "local": None,  # Dynamic: load all locally-cached per-symbol parquets
 }
 
 
@@ -87,7 +87,7 @@ class BacktestConfig:
     )
 
     def __init__(self, **kw):
-        self.tickers = kw.get("tickers", "auto")
+        self.tickers = kw.get("tickers", "mega")
         self.start_date = kw.get("start_date")
         self.end_date = kw.get("end_date")
         self.days = kw.get("days")
@@ -129,7 +129,7 @@ class BacktestConfig:
 
     def resolve_tickers(self):
         """Resolve ticker spec to a list of ticker symbols.
-        Supports: preset name (liquid_30, auto, auto_50), comma-sep list, or list."""
+        Supports: preset name (mega, sp50, local), comma-sep list, or list."""
         tickers = self.tickers
         if isinstance(tickers, str):
             key = tickers.lower()
@@ -137,17 +137,16 @@ class BacktestConfig:
                 preset = UNIVERSES[key]
                 if preset is not None:
                     return list(preset)
-                # Dynamic discovery (auto / auto_50)
-                return self._discover_auto(key)
+                # Dynamic: load all locally-cached per-symbol parquets
+                return self._discover_local()
             return [t.strip().upper() for t in tickers.split(",") if t.strip()]
         return [t.upper() for t in tickers]
 
-    def _discover_auto(self, key):
-        """Run auto-discovery from the data file."""
-        from data_loader import discover_universe
-        top_n = 50 if "50" in key else 30
-        tickers, diag = discover_universe(data_dir=self.data_dir, top_n=top_n)
-        log(f"Auto-discovered {len(tickers)} tickers (preset={key})")
+    def _discover_local(self):
+        """Return all locally-cached per-symbol parquet tickers."""
+        from data_loader import list_available_eod_symbols
+        tickers = list_available_eod_symbols(data_dir=self.data_dir)
+        log(f"Local discovery: {len(tickers)} tickers available")
         return tickers
 
 
@@ -255,9 +254,8 @@ class DataProvider:
 
     def load(self, cfg: BacktestConfig):
         """Load all data for the given config."""
-        from data_loader import ensure_data, load_prices_bulk
+        from data_loader import load_eod_by_symbol
 
-        data_dir = ensure_data(cfg.data_dir)
         ticker_list = cfg.resolve_tickers()
 
         if not ticker_list:
@@ -265,8 +263,8 @@ class DataProvider:
         log(f"Universe: requested {len(ticker_list)} tickers: "
             f"{ticker_list[:15]}{'...' if len(ticker_list) > 15 else ''}")
 
-        # Bulk-load all tickers in ONE parquet read (~700MB read once, not N times)
-        raw_dict = load_prices_bulk(data_dir, tickers=ticker_list)
+        # Load per-symbol parquets (downloads from Google Drive on demand)
+        raw_dict = load_eod_by_symbol(data_dir=cfg.data_dir, tickers=ticker_list)
 
         price_dict = {}
         missing_report = {}
@@ -1358,14 +1356,13 @@ def run_full_backtest(**kwargs):
     if not active_tickers:
         raise ValueError("All tickers dropped due to absurd daily returns.")
 
-    MIN_ACTIVE_TICKERS = 10
+    MIN_ACTIVE_TICKERS = 25
     if len(active_tickers) < MIN_ACTIVE_TICKERS:
         raise ValueError(
             f"Insufficient universe: only {len(active_tickers)} active tickers "
             f"(need >={MIN_ACTIVE_TICKERS}). Loaded: {active_tickers}. "
             f"Dropped: {list(data.missing_report.keys())}. "
-            f"Try a larger or different ticker set, or use tickers='auto' "
-            f"for auto-discovery."
+            f"Try tickers='sp50' for a 50-stock universe."
         )
 
     # 2. Initialize clock with all dates
