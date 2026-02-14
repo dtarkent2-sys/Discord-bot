@@ -535,7 +535,7 @@ const commands = [
     .setDescription('ML portfolio walk-forward backtest — cross-sectional ranking + portfolio construction')
     .addStringOption(opt =>
       opt.setName('tickers')
-        .setDescription('Preset: auto, liquid_30, liquid_50, auto_50 — or comma-separated tickers')
+        .setDescription('Preset: mega, sp50, local — or comma-separated tickers')
         .setRequired(false)
     )
     .addIntegerOption(opt =>

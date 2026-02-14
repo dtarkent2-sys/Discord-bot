@@ -2,12 +2,14 @@
 Data loader for ML predictor — reads parquet files from local cache,
 auto-downloads from Google Drive on first use.
 
-Layout expected (matches user's Google Drive):
-  <data_dir>/
-    all_prices_yahoo.parquet    — EOD pricing for all tickers
-    all_balance_sheets.parquet  — Balance sheet fundamentals
-    all_income_statements.parquet — Income statements
-    all_cash_flow.parquet       — Cash flow statements
+Supports two data layouts:
+  1. Per-symbol parquets (preferred):
+     <data_dir>/eod_by_symbol/AAPL.parquet, MSFT.parquet, ...
+     Downloaded from Google Drive folder: 1WH3G0BKcaDtmpRaOutdgAsiPlMm5K1C2
+
+  2. Monolithic parquet (legacy):
+     <data_dir>/all_prices_yahoo.parquet
+     Downloaded from Google Drive folder: 1rMMeiT-O-z7zfW5htfL_8H188swUtUCj
 
 Env vars:
   ML_DATA_DIR       — Local directory with parquets (default: ml/data)
@@ -18,12 +20,14 @@ import os
 import sys
 import json
 import glob
+import re
 
 def log(msg):
     print(f"[DataLoader] {msg}", file=sys.stderr, flush=True)
 
 DEFAULT_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DEFAULT_GDRIVE_FOLDER_ID = "1rMMeiT-O-z7zfW5htfL_8H188swUtUCj"
+EOD_FOLDER_ID = "1WH3G0BKcaDtmpRaOutdgAsiPlMm5K1C2"
 
 EXPECTED_FILES = [
     "all_prices_yahoo.parquet",
@@ -40,6 +44,9 @@ GDRIVE_FILE_IDS = {
     "all_income_statements.parquet": "18lv5CurVMkgFm0IA5RHCateKgYgcAe3c",
     "all_prices_yahoo.parquet": "1HUOqrumZUZ_NagYZEj4FloAJSdVzR012",
 }
+
+# Cached Google Drive file index for per-symbol parquets {SYMBOL: gdrive_file_id}
+_gdrive_eod_index = None
 
 
 def get_data_dir():
@@ -347,6 +354,160 @@ def _find_column(df, candidates):
         if candidate.lower() in cols_lower:
             return cols_lower[candidate.lower()]
     return None
+
+
+def _load_gdrive_eod_index(data_dir=None):
+    """Load the Google Drive file-ID index for per-symbol parquets.
+
+    Tries local cache first (gdrive_eod_index.json), then scrapes the
+    Google Drive embedded folder view to build the index.
+    """
+    global _gdrive_eod_index
+    if _gdrive_eod_index is not None:
+        return _gdrive_eod_index
+
+    data_dir = data_dir or get_data_dir()
+    index_path = os.path.join(data_dir, "gdrive_eod_index.json")
+
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            _gdrive_eod_index = json.load(f)
+        log(f"  Loaded GDrive EOD index: {len(_gdrive_eod_index)} tickers")
+        return _gdrive_eod_index
+
+    # Scrape the Google Drive embedded folder view
+    log(f"  Building GDrive EOD index from folder {EOD_FOLDER_ID}...")
+    try:
+        import requests
+        url = f"https://drive.google.com/embeddedfolderview?id={EOD_FOLDER_ID}"
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+        pattern = re.compile(
+            r'id="entry-([a-zA-Z0-9_\-]+)".*?flip-entry-title">([^<]+)</div>',
+            re.DOTALL,
+        )
+        _gdrive_eod_index = {}
+        for m in pattern.finditer(resp.text):
+            fid, fname = m.group(1), m.group(2).strip()
+            if fname.endswith(".parquet"):
+                _gdrive_eod_index[fname.replace(".parquet", "")] = fid
+        # Cache to disk
+        os.makedirs(data_dir, exist_ok=True)
+        with open(index_path, "w") as f:
+            json.dump(_gdrive_eod_index, f, indent=2)
+        log(f"  Scraped GDrive EOD index: {len(_gdrive_eod_index)} tickers")
+    except Exception as e:
+        log(f"  WARNING: Could not build GDrive EOD index: {e}")
+        _gdrive_eod_index = {}
+
+    return _gdrive_eod_index
+
+
+def _download_eod_symbol(symbol, data_dir=None):
+    """Download a single per-symbol parquet from Google Drive."""
+    data_dir = data_dir or get_data_dir()
+    eod_dir = os.path.join(data_dir, "eod_by_symbol")
+    os.makedirs(eod_dir, exist_ok=True)
+
+    dest = os.path.join(eod_dir, f"{symbol}.parquet")
+    if os.path.exists(dest) and os.path.getsize(dest) > 100:
+        return dest
+
+    idx = _load_gdrive_eod_index(data_dir)
+    if symbol not in idx:
+        return None
+
+    try:
+        import gdown
+        fid = idx[symbol]
+        old_stdout = sys.stdout
+        sys.stdout = sys.stderr
+        try:
+            gdown.download(f"https://drive.google.com/uc?id={fid}", dest, quiet=True)
+        finally:
+            sys.stdout = old_stdout
+        if os.path.exists(dest) and os.path.getsize(dest) > 100:
+            return dest
+    except Exception as e:
+        log(f"  WARNING: Failed to download {symbol}: {e}")
+    return None
+
+
+def ensure_eod_symbols(tickers, data_dir=None):
+    """Ensure per-symbol parquets exist locally for the given tickers.
+
+    Downloads missing files from Google Drive on demand.
+    Returns (found_paths, missing_symbols).
+    """
+    data_dir = data_dir or get_data_dir()
+    eod_dir = os.path.join(data_dir, "eod_by_symbol")
+    os.makedirs(eod_dir, exist_ok=True)
+
+    found = {}
+    missing = []
+
+    for sym in tickers:
+        sym_upper = sym.upper()
+        fpath = os.path.join(eod_dir, f"{sym_upper}.parquet")
+        if os.path.exists(fpath) and os.path.getsize(fpath) > 100:
+            found[sym_upper] = fpath
+        else:
+            result = _download_eod_symbol(sym_upper, data_dir)
+            if result:
+                found[sym_upper] = result
+            else:
+                missing.append(sym_upper)
+
+    log(f"  EOD symbols: {len(found)} found, {len(missing)} missing")
+    if missing:
+        log(f"  Missing: {missing[:20]}{'...' if len(missing) > 20 else ''}")
+
+    return found, missing
+
+
+def load_eod_by_symbol(data_dir=None, tickers=None):
+    """Load per-symbol parquet files into {ticker: DataFrame} dict.
+
+    This is the preferred loading path — reads small per-symbol files
+    instead of a 700MB monolithic parquet.
+    """
+    import pandas as pd
+
+    data_dir = data_dir or get_data_dir()
+    eod_dir = os.path.join(data_dir, "eod_by_symbol")
+
+    if tickers is None:
+        # Load all locally available symbols
+        if not os.path.isdir(eod_dir):
+            return {}
+        tickers = [f.replace(".parquet", "") for f in os.listdir(eod_dir)
+                    if f.endswith(".parquet")]
+
+    found_paths, missing = ensure_eod_symbols(tickers, data_dir)
+
+    result = {}
+    for sym, fpath in found_paths.items():
+        try:
+            df = pd.read_parquet(fpath)
+            df.columns = [c.lower().strip() for c in df.columns]
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values("date").reset_index(drop=True)
+            result[sym] = df
+        except Exception as e:
+            log(f"  WARNING: Failed to read {sym}: {e}")
+
+    log(f"  Loaded {len(result)} per-symbol DataFrames")
+    return result
+
+
+def list_available_eod_symbols(data_dir=None):
+    """List all locally-cached per-symbol parquet tickers."""
+    data_dir = data_dir or get_data_dir()
+    eod_dir = os.path.join(data_dir, "eod_by_symbol")
+    if not os.path.isdir(eod_dir):
+        return []
+    return sorted(f.replace(".parquet", "") for f in os.listdir(eod_dir)
+                   if f.endswith(".parquet"))
 
 
 def discover_universe(data_dir=None, min_rows=2000, min_volume_pct=0.80,
