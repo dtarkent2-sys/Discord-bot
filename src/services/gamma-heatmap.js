@@ -16,11 +16,13 @@
 
 const path = require('path');
 const gamma = require('./gamma');
-const databento = require('./databento');
+let databentoLive = null;
+try { databentoLive = require('./databento-live'); } catch { /* not available */ }
 const tradier = require('./tradier');
 const publicService = require('./public');
 const priceFetcher = require('../tools/price-fetcher');
 const alpaca = require('./alpaca');
+const { bsGamma: _bsGamma, estimateIV: _estimateIV } = require('../lib/black-scholes');
 
 // ── Canvas setup (mirrors gamma.js pattern) ──────────────────────────────
 
@@ -89,62 +91,9 @@ class GammaHeatmapService {
     const upper = ticker.toUpperCase();
     const strikeRange = opts.strikeRange || 20;
 
-    // ── Data source priority: Databento (OPRA) > Tradier (ORATS) > Public.com > Yahoo ──
-    let source = 'Yahoo';
-    let allExpDates = null;
-    let yahooExps = null;
-
-    // 1. Get available expirations — try sources in order
-    if (databento.enabled) {
-      try {
-        const dates = await databento.getOptionExpirations(upper);
-        if (dates.length > 0) { allExpDates = dates; source = 'Databento'; }
-      } catch (err) {
-        console.warn(`[GammaHeatmap] Databento expirations failed: ${err.message}`);
-      }
-    }
-    if (!allExpDates && tradier.enabled) {
-      try {
-        const dates = await tradier.getOptionExpirations(upper);
-        if (dates.length > 0) { allExpDates = dates; source = 'Tradier'; }
-      } catch (err) {
-        console.warn(`[GammaHeatmap] Tradier expirations failed: ${err.message}`);
-      }
-    }
-    if (!allExpDates && publicService.enabled) {
-      try {
-        const dates = await publicService.getOptionExpirations(upper);
-        if (dates && dates.length > 0) { allExpDates = dates; source = 'Public.com'; }
-      } catch (err) {
-        console.warn(`[GammaHeatmap] Public.com expirations failed: ${err.message}`);
-      }
-    }
-    if (!allExpDates) {
-      yahooExps = await gamma.fetchAvailableExpirations(upper);
-      if (yahooExps.length === 0) throw new Error(`No options expirations found for ${upper}`);
-      allExpDates = yahooExps.map(e => e.date);
-      source = 'Yahoo';
-    }
-
-    // Pick up to 6 nearest future expirations
-    const today = new Date().toISOString().slice(0, 10);
-    const futureExpDates = allExpDates.filter(d => d >= today).sort().slice(0, 6);
-
-    if (futureExpDates.length === 0) {
-      throw new Error(`No upcoming expirations for ${upper}`);
-    }
-
-    const targetExpDates = opts.expirations
-      ? allExpDates.filter(d => opts.expirations.includes(d))
-      : futureExpDates;
-
-    if (targetExpDates.length === 0) {
-      throw new Error('None of the specified expiration dates are available.');
-    }
-
-    // 2. Get spot price
+    // 1. Get spot price (source-independent — OPRA is options-only, always need equity quote)
     let spotPrice = null;
-    if (source === 'Tradier') {
+    if (tradier.enabled) {
       try {
         const q = await tradier.getQuote(upper);
         spotPrice = q.price;
@@ -162,46 +111,70 @@ class GammaHeatmapService {
     }
     if (!spotPrice) throw new Error(`Could not determine spot price for ${upper}`);
 
-    // 3. Fetch options chain for each expiration and compute per-strike GEX
-    const expirationData = [];
+    // 2. Build source priority list — try each in order with fallback
+    // If a source has expirations but produces no usable chain data (e.g. OI=0), fall back to next
+    const sourcesToTry = [];
+    if (databentoLive && databentoLive.hasDataFor(upper)) sourcesToTry.push('DatabentoLive');
+    if (tradier.enabled) sourcesToTry.push('Tradier');
+    if (publicService.enabled) sourcesToTry.push('Public.com');
+    sourcesToTry.push('Yahoo');
+    if (sourcesToTry.length === 1) {
+      console.warn('[GammaHeatmap] No premium sources configured — using Yahoo only. Set TRADIER_API_KEY for real greeks (free sandbox).');
+    }
+
+    let source = null;
+    let expirationData = [];
     let allStrikes = new Set();
+    let bestFallback = null; // Track best data if no source meets MIN_STRIKES
 
-    for (const expDate of targetExpDates) {
+    for (const trySource of sourcesToTry) {
+      // ── Get available expirations for this source ──
+      let allExpDates = null;
+      let yahooExps = null;
+
       try {
-        let strikeGEX;
-        let totalGEX;
-
-        if (source === 'Databento' || source === 'Tradier' || source === 'Public.com') {
-          // ── Real data path: Databento (OPRA+ORATS), Tradier (ORATS), or Public.com ──
-          let contracts;
-          if (source === 'Databento') {
-            // Databento OPRA quotes/OI merged with Tradier ORATS greeks
-            contracts = await databento.getOptionsWithGreeks(upper, expDate);
-          } else if (source === 'Tradier') {
-            contracts = await tradier.getOptionsWithGreeks(upper, expDate);
-          } else {
-            contracts = await publicService.getOptionsWithGreeks(upper, expDate);
-          }
-          if (!contracts || contracts.length === 0) continue;
-
-          strikeGEX = new Map();
-          totalGEX = 0;
-          for (const c of contracts) {
-            if (!c.strike || !c.openInterest || !c.gamma) continue;
-            const gex = c.openInterest * c.gamma * 100 * spotPrice;
-            const prev = strikeGEX.get(c.strike) || 0;
-            const contribution = c.type === 'call' ? gex : -gex;
-            strikeGEX.set(c.strike, prev + contribution);
-            allStrikes.add(c.strike);
-            totalGEX += contribution;
-          }
+        if (trySource === 'DatabentoLive') {
+          const dates = databentoLive.getExpirations(upper);
+          if (dates.length > 0) allExpDates = dates;
+        } else if (trySource === 'Tradier') {
+          const dates = await tradier.getOptionExpirations(upper);
+          if (dates.length > 0) allExpDates = dates;
+        } else if (trySource === 'Public.com') {
+          const dates = await publicService.getOptionExpirations(upper);
+          if (dates && dates.length > 0) allExpDates = dates;
         } else {
-          // ── Yahoo fallback: Black-Scholes estimated gamma ──
+          yahooExps = await gamma.fetchAvailableExpirations(upper);
+          if (yahooExps.length > 0) allExpDates = yahooExps.map(e => e.date);
+        }
+      } catch (err) {
+        console.warn(`[GammaHeatmap] ${trySource} expirations failed: ${err.message}`);
+        continue;
+      }
+
+      if (!allExpDates || allExpDates.length === 0) continue;
+
+      // Pick up to 6 nearest future expirations
+      const today = new Date().toISOString().slice(0, 10);
+      const futureExpDates = allExpDates.filter(d => d >= today).sort().slice(0, 6);
+      if (futureExpDates.length === 0) continue;
+
+      const targetExpDates = opts.expirations
+        ? allExpDates.filter(d => opts.expirations.includes(d))
+        : futureExpDates;
+      if (targetExpDates.length === 0) continue;
+
+      // ── Fetch options chain for each expiration and compute per-strike GEX ──
+      expirationData = [];
+      allStrikes = new Set();
+
+      if (trySource === 'Yahoo') {
+        // ── Yahoo: fetch all expirations in parallel for speed ──
+        const fetchResults = await Promise.allSettled(targetExpDates.map(async (expDate) => {
           const expObj = yahooExps?.find(e => e.date === expDate);
-          if (!expObj) continue;
+          if (!expObj) return null;
           const result = await gamma._yahooFetch(upper, expObj.epoch);
           const options = result.options?.[0];
-          if (!options) continue;
+          if (!options) return null;
 
           const chain = [];
           for (const c of (options.calls || [])) {
@@ -218,18 +191,95 @@ class GammaHeatmapService {
           }
 
           const detailed = gamma.calculateDetailedGEX(chain, spotPrice);
-          strikeGEX = new Map();
+          const strikeGEX = new Map();
+          const strikes = [];
           for (const s of detailed.strikes) {
             strikeGEX.set(s.strike, s['netGEX$']);
-            allStrikes.add(s.strike);
+            strikes.push(s.strike);
           }
-          totalGEX = detailed['totalNetGEX$'];
-        }
+          return { date: expDate, strikeGEX, totalGEX: detailed['totalNetGEX$'], strikes };
+        }));
 
-        expirationData.push({ date: expDate, strikeGEX, totalGEX });
-      } catch (err) {
-        console.warn(`[GammaHeatmap] Skipping ${expDate}: ${err.message}`);
+        for (const r of fetchResults) {
+          if (r.status === 'fulfilled' && r.value && r.value.strikeGEX.size > 0) {
+            expirationData.push({ date: r.value.date, strikeGEX: r.value.strikeGEX, totalGEX: r.value.totalGEX });
+            for (const s of r.value.strikes) allStrikes.add(s);
+          } else if (r.status === 'rejected') {
+            console.warn(`[GammaHeatmap] Yahoo exp failed: ${r.reason?.message}`);
+          }
+        }
+      } else {
+        // ── Non-Yahoo sources: sequential (DatabentoLive is in-memory = fast) ──
+        for (const expDate of targetExpDates) {
+          try {
+            let contracts;
+            if (trySource === 'DatabentoLive') {
+              contracts = databentoLive.getOptionsChain(upper, expDate);
+            } else if (trySource === 'Tradier') {
+              contracts = await tradier.getOptionsWithGreeks(upper, expDate);
+            } else {
+              contracts = await publicService.getOptionsWithGreeks(upper, expDate);
+            }
+            if (!contracts || contracts.length === 0) continue;
+
+            const T = Math.max((new Date(expDate).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+
+            const strikeGEX = new Map();
+            let totalGEX = 0;
+            for (const c of contracts) {
+              if (!c.strike || !c.openInterest) continue;
+
+              let contractGamma = c.gamma;
+              if (!contractGamma || contractGamma === 0) {
+                const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+                const iv = _estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+                contractGamma = _bsGamma(spotPrice, c.strike, iv, T);
+              }
+              if (!contractGamma) continue;
+
+              const gex = c.openInterest * contractGamma * 100 * spotPrice;
+              const prev = strikeGEX.get(c.strike) || 0;
+              const contribution = c.type === 'call' ? gex : -gex;
+              strikeGEX.set(c.strike, prev + contribution);
+              allStrikes.add(c.strike);
+              totalGEX += contribution;
+            }
+
+            if (strikeGEX.size > 0) {
+              expirationData.push({ date: expDate, strikeGEX, totalGEX });
+            }
+          } catch (err) {
+            console.warn(`[GammaHeatmap] Skipping ${expDate}: ${err.message}`);
+            if (err.name === 'TimeoutError' || err.message.includes('timeout')) break;
+          }
+        }
       }
+
+      // Require a minimum number of strikes to consider a source usable —
+      // DatabentoLive often has sparse OI early in the session which produces
+      // a nearly-empty heatmap. Fall back to a richer source instead.
+      const MIN_STRIKES = 10;
+      if (expirationData.length > 0 && allStrikes.size >= MIN_STRIKES) {
+        source = trySource;
+        console.log(`[GammaHeatmap] Using ${trySource} for ${upper} (${expirationData.length} expirations, ${allStrikes.size} strikes)`);
+        break; // Success — use this source
+      }
+
+      // Track best fallback in case no source meets MIN_STRIKES
+      if (expirationData.length > 0 && allStrikes.size > 0 &&
+          (!bestFallback || allStrikes.size > bestFallback.allStrikes.size)) {
+        bestFallback = { source: trySource, expirationData: [...expirationData], allStrikes: new Set(allStrikes) };
+      }
+
+      console.warn(`[GammaHeatmap] ${trySource} had expirations but insufficient data (${expirationData.length} exps, ${allStrikes.size} strikes), falling back...`);
+    }
+
+    // If no source met MIN_STRIKES but we have some data, use the best available
+    if (!source && bestFallback) {
+      source = bestFallback.source;
+      expirationData = bestFallback.expirationData;
+      allStrikes = bestFallback.allStrikes;
+      console.warn(`[GammaHeatmap] No source met MIN_STRIKES, using best fallback: ${source} (${expirationData.length} exps, ${allStrikes.size} strikes)`);
     }
 
     if (expirationData.length === 0) {
@@ -480,7 +530,7 @@ class GammaHeatmapService {
    * Format Discord text summary to accompany the heat map image.
    */
   formatForDiscord(ticker, spotPrice, expirations, source) {
-    const sourceLabel = source === 'Databento' ? 'Databento OPRA + ORATS greeks'
+    const sourceLabel = source === 'DatabentoLive' ? 'Databento Live OPRA (real-time)'
       : source === 'Tradier' ? 'Tradier (ORATS real greeks)'
       : source === 'Public.com' ? 'Public.com (real greeks)'
       : 'Yahoo Finance (Black-Scholes est.)';

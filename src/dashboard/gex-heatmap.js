@@ -12,14 +12,309 @@
  */
 
 const gamma = require('../services/gamma');
-const databento = require('../services/databento');
 const alpaca = require('../services/alpaca');
 const tradier = require('../services/tradier');
 const publicService = require('../services/public');
 const priceFetcher = require('../tools/price-fetcher');
+const { bsGamma: _bsGamma, estimateIV: _estimateIV } = require('../lib/black-scholes');
 
 // Active SSE connections per ticker for cleanup
 const _sseClients = new Map(); // ticker → Set<res>
+
+// ── Live GEX Cache ─────────────────────────────────────────────────────
+// When Databento Live is streaming, we maintain a shadow heatmap cache
+// that updates in real-time as OI/trades come in from the TCP stream.
+// The cached greeks from the last full fetch are used to recalculate GEX.
+
+const _liveGexCache = new Map(); // ticker → { data, contracts, spotPrice, lastFullFetch, lastLiveUpdate }
+let _liveWired = false;
+
+/**
+ * Wire the Databento Live stream into the GEX heatmap cache.
+ * Called once when the first SSE client connects.
+ */
+function _wireLiveStream() {
+  if (_liveWired) return;
+  let live;
+  try { live = require('../services/databento-live'); } catch { return; }
+  if (!live.client.enabled) return;
+
+  _liveWired = true;
+  console.log('[GEXHeatmap] Wiring live Databento stream for real-time GEX updates');
+
+  // On trade: update volume counters
+  live.client.on('trade', (trade) => {
+    if (!trade.underlying || !trade.strike || !trade.optionType || !trade.expirationDate) return;
+    const ticker = trade.underlying;
+    const cache = _liveGexCache.get(ticker);
+    if (!cache || !cache.contracts) return;
+
+    // Find matching contract and increment volume
+    const key = `${trade.strike}_${trade.optionType}_${trade.expirationDate}`;
+    const contract = cache.contracts.get(key);
+    if (contract) {
+      contract.volume = (contract.volume || 0) + (trade.size || 1);
+      cache.lastLiveUpdate = Date.now();
+    }
+  });
+
+  // On OI stat: update open interest and recalculate GEX
+  live.client.on('statistic', (stat) => {
+    if (stat.statType !== 9) return; // 9 = OPEN_INTEREST
+    if (!stat.underlying || !stat.strike || !stat.optionType) return;
+
+    const ticker = stat.underlying;
+    const cache = _liveGexCache.get(ticker);
+    if (!cache || !cache.contracts) return;
+
+    // stat.quantity is BigInt from DBN i64 field — convert to Number for OI
+    const oi = Number(stat.quantity);
+    if (oi <= 0) return;
+
+    const key = `${stat.strike}_${stat.optionType}_${stat.expirationDate}`;
+    const contract = cache.contracts.get(key);
+    if (contract) {
+      contract.openInterest = oi;
+      cache.dirty = true;
+      cache.lastLiveUpdate = Date.now();
+    }
+  });
+
+  // On quote: update spot price from underlying quotes (not option quotes)
+  live.client.on('quote', (quote) => {
+    if (!quote.underlying || !quote.level) return;
+    // Only update if this is actually the underlying equity quote
+    // (option quotes have strikes, equity quotes don't)
+    if (quote.strike) return;
+    const ticker = quote.underlying;
+    const cache = _liveGexCache.get(ticker);
+    if (cache && quote.level.bidPx && quote.level.askPx) {
+      const mid = (quote.level.bidPx + quote.level.askPx) / 2;
+      if (mid > 0) {
+        cache.spotPrice = mid;
+        cache.dirty = true;
+        cache.lastLiveUpdate = Date.now();
+      }
+    }
+  });
+
+  // Push live updates to SSE clients every 5 seconds
+  setInterval(() => {
+    for (const [ticker, cache] of _liveGexCache) {
+      if (!cache.dirty) continue;
+      cache.dirty = false;
+
+      const clients = _sseClients.get(ticker);
+      if (!clients || clients.size === 0) continue;
+
+      // Rebuild heatmap from cached contracts with updated OI
+      try {
+        const data = _rebuildHeatmapFromCache(cache);
+        if (!data) continue;
+        const payload = `data: ${JSON.stringify(data)}\n\n`;
+        for (const res of clients) {
+          try { res.write(payload); } catch { /* client gone */ }
+        }
+      } catch (err) {
+        console.warn(`[GEXHeatmap] Live rebuild failed for ${ticker}: ${err.message}`);
+      }
+    }
+  }, 5000);
+}
+
+/**
+ * Rebuild the heatmap data structure from cached contracts.
+ * Uses cached gamma values with updated OI to recalculate GEX.
+ */
+function _rebuildHeatmapFromCache(cache) {
+  if (!cache.data || !cache.contracts || !cache.spotPrice) return null;
+
+  const spotPrice = cache.spotPrice;
+  const oldData = cache.data;
+
+  // Recalculate GEX per strike per expiration
+  const expirationResults = [];
+  const allStrikes = new Set();
+
+  for (const exp of oldData.expirations) {
+    const strikeGEX = {};
+    let totalGEX = 0;
+
+    for (const [key, c] of cache.contracts) {
+      // Key format: strike_type_date (e.g. "605_call_2026-02-13")
+      if (c.expiration !== exp.date) continue;
+      if (!c.gamma || !c.openInterest) continue;
+
+      const gex = c.openInterest * c.gamma * 100 * spotPrice;
+      const strike = c.strike;
+      const entry = strikeGEX[strike] || { net: 0, call: 0, put: 0, callOI: 0, putOI: 0 };
+
+      if (c.type === 'call') {
+        entry.call += gex;
+        entry.callOI += c.openInterest;
+      } else {
+        entry.put -= gex;
+        entry.putOI += c.openInterest;
+      }
+      entry.net = entry.call + entry.put;
+      strikeGEX[strike] = entry;
+      allStrikes.add(strike);
+    }
+
+    totalGEX = Object.values(strikeGEX).reduce((s, e) => s + e.net, 0);
+    expirationResults.push({ date: exp.date, strikeGEX, totalGEX });
+  }
+
+  if (expirationResults.length === 0) return null;
+
+  // Reuse the same strike range from cached data
+  const selectedStrikes = [...oldData.strikes].reverse(); // un-reverse to ascending
+  const grid = [];
+  let maxAbsGEX = 0;
+
+  for (const strike of selectedStrikes) {
+    const row = { strike, values: [] };
+    for (const exp of expirationResults) {
+      const data = exp.strikeGEX[strike] || { net: 0, call: 0, put: 0, callOI: 0, putOI: 0 };
+      row.values.push(data);
+      if (Math.abs(data.net) > maxAbsGEX) maxAbsGEX = Math.abs(data.net);
+    }
+    grid.push(row);
+  }
+
+  const profile = selectedStrikes.map(strike => {
+    let totalNet = 0, totalCall = 0, totalPut = 0;
+    for (const exp of expirationResults) {
+      const d = exp.strikeGEX[strike];
+      if (d) { totalNet += d.net; totalCall += d.call; totalPut += d.put; }
+    }
+    return { strike, net: totalNet, call: totalCall, put: totalPut };
+  });
+
+  // Compute key levels
+  let callWall = null, putWall = null, gammaFlip = null;
+  const posStrikes = profile.filter(p => p.net > 0);
+  if (posStrikes.length > 0) callWall = posStrikes.reduce((best, p) => p.net > best.net ? p : best);
+  const negStrikes = profile.filter(p => p.net < 0);
+  if (negStrikes.length > 0) putWall = negStrikes.reduce((best, p) => p.net < best.net ? p : best);
+
+  let cumulative = 0;
+  for (let i = 0; i < profile.length; i++) {
+    const prev = cumulative;
+    cumulative += profile[i].net;
+    if (i > 0 && prev !== 0 && Math.sign(prev) !== Math.sign(cumulative)) {
+      const ratio = Math.abs(prev) / (Math.abs(prev) + Math.abs(profile[i].net));
+      gammaFlip = Math.round((profile[i - 1].strike + ratio * (profile[i].strike - profile[i - 1].strike)) * 100) / 100;
+      break;
+    }
+  }
+
+  // Reverse for display (highest strike on top)
+  selectedStrikes.reverse();
+  grid.reverse();
+  profile.reverse();
+
+  return {
+    ticker: oldData.ticker,
+    spotPrice,
+    source: oldData.source + ' (LIVE)',
+    timestamp: new Date().toISOString(),
+    expirations: expirationResults.map(e => ({ date: e.date, totalGEX: e.totalGEX })),
+    availableExpirations: oldData.availableExpirations,
+    strikes: selectedStrikes,
+    grid, profile, maxAbsGEX,
+    callWall: callWall ? { strike: callWall.strike, gex: callWall.net } : null,
+    putWall: putWall ? { strike: putWall.strike, gex: putWall.net } : null,
+    gammaFlip,
+  };
+}
+
+/**
+ * Populate the live GEX cache for a ticker after a full data fetch.
+ * Stores all contracts with their gamma values for incremental updates.
+ * When no real greeks are available, estimates gamma via Black-Scholes.
+ */
+function _populateLiveCache(ticker, data, source) {
+  let live;
+  try { live = require('../services/databento-live'); } catch { return; }
+  if (!live.client.connected) return;
+
+  // Build contract map — either from live stream or from the last full fetch
+  const contractMap = new Map();
+  const spotPrice = data.spotPrice;
+
+  const buildFromLive = () => {
+    for (const exp of data.expirations) {
+      const T = Math.max((new Date(exp.date).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+      const contracts = live.getOptionsChain(ticker, exp.date);
+      for (const c of contracts) {
+        if (!c.strike || !c.openInterest) continue;
+        let g = c.gamma;
+        if (!g || g === 0) {
+          const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+          const iv = _estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+          g = _bsGamma(spotPrice, c.strike, iv, T);
+        }
+        if (!g) continue;
+        const key = `${c.strike}_${c.type}_${exp.date}`;
+        contractMap.set(key, {
+          strike: c.strike, type: c.type, expiration: exp.date,
+          gamma: g, openInterest: c.openInterest, volume: c.volume || 0,
+        });
+      }
+    }
+  };
+
+  const buildFromApi = async () => {
+    try {
+      for (const exp of data.expirations) {
+        const T = Math.max((new Date(exp.date).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+        let contracts;
+        if (source === 'Tradier') {
+          contracts = await tradier.getOptionsWithGreeks(ticker, exp.date);
+        } else if (source === 'Public.com') {
+          contracts = await publicService.getOptionsWithGreeks(ticker, exp.date);
+        }
+        if (!contracts) continue;
+
+        for (const c of contracts) {
+          if (!c.strike || !c.openInterest) continue;
+          let g = c.gamma;
+          if (!g || g === 0) {
+            const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+            const iv = _estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+            g = _bsGamma(spotPrice, c.strike, iv, T);
+          }
+          if (!g) continue;
+          const key = `${c.strike}_${c.type}_${exp.date}`;
+          contractMap.set(key, {
+            strike: c.strike, type: c.type, expiration: exp.date,
+            gamma: g, openInterest: c.openInterest, volume: c.volume || 0,
+          });
+        }
+      }
+    } catch (err) {
+      console.warn(`[GEXHeatmap] Live cache populate failed: ${err.message}`);
+      return;
+    }
+  };
+
+  const finalize = () => {
+    if (contractMap.size === 0) return;
+    _liveGexCache.set(ticker, {
+      data, contracts: contractMap, spotPrice,
+      lastFullFetch: Date.now(), lastLiveUpdate: null, dirty: false,
+    });
+    console.log(`[GEXHeatmap] Live cache populated: ${ticker} (${contractMap.size} contracts, source=${source})`);
+  };
+
+  if (source === 'DatabentoLive') {
+    buildFromLive();
+    finalize();
+  } else if (source !== 'Yahoo') {
+    buildFromApi().then(finalize);
+  }
+}
 
 /**
  * Register all GEX heatmap routes on the Express app.
@@ -55,6 +350,9 @@ function registerGEXHeatmapRoutes(app) {
   });
 
   // ── SSE real-time stream ────────────────────────────────────────────
+  // When Databento Live is streaming, live OI/trade updates are pushed
+  // every 5s via the _wireLiveStream() interval. The full API re-fetch
+  // happens on a longer interval to refresh greeks/spot baseline.
 
   app.get('/api/gex/heatmap/:ticker/stream', (req, res) => {
     const ticker = req.params.ticker.toUpperCase().replace(/[^A-Z0-9.]/g, '');
@@ -69,17 +367,21 @@ function registerGEXHeatmapRoutes(app) {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no', // disable nginx buffering
+      'X-Accel-Buffering': 'no',
     });
 
     // Track this client
     if (!_sseClients.has(ticker)) _sseClients.set(ticker, new Set());
     _sseClients.get(ticker).add(res);
 
-    // Send initial data immediately
+    // Wire the live stream on first SSE connection
+    _wireLiveStream();
+
+    // Send initial data immediately (full fetch to populate greeks cache)
     _fetchAndPush(res, ticker, range, expirations);
 
-    // Set up interval for live updates
+    // Full API re-fetch on longer interval (refreshes greeks baseline)
+    // Live updates between full fetches are pushed by _wireLiveStream's 5s interval
     const timer = setInterval(() => {
       _fetchAndPush(res, ticker, range, expirations);
     }, intervalSec * 1000);
@@ -90,7 +392,10 @@ function registerGEXHeatmapRoutes(app) {
       const clients = _sseClients.get(ticker);
       if (clients) {
         clients.delete(res);
-        if (clients.size === 0) _sseClients.delete(ticker);
+        if (clients.size === 0) {
+          _sseClients.delete(ticker);
+          _liveGexCache.delete(ticker); // Free memory when no one's watching
+        }
       }
     });
   });
@@ -107,96 +412,12 @@ function registerGEXHeatmapRoutes(app) {
 // ── Data fetching ─────────────────────────────────────────────────────
 
 async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
-  // ── Data source priority: Databento (OPRA) > Tradier (ORATS) > Public.com > Yahoo ──
-  let source = 'Yahoo';
-
-  // 1. Get available expirations — try sources in order
-  let allExpDates = null;
-  let yahooExps = null;
-
-  // Try Databento first (institutional OPRA feed, all 17 exchanges)
-  if (databento.enabled) {
-    try {
-      allExpDates = await databento.getOptionExpirations(ticker);
-      if (allExpDates.length > 0) {
-        source = 'Databento';
-      } else {
-        allExpDates = null;
-      }
-    } catch (err) {
-      console.warn(`[GEXHeatmap] Databento expirations failed: ${err.message}`);
-      allExpDates = null;
-    }
-  }
-
-  // Try Tradier next (ORATS real greeks, clean API)
-  if (!allExpDates && tradier.enabled) {
-    try {
-      allExpDates = await tradier.getOptionExpirations(ticker);
-      if (allExpDates.length > 0) {
-        source = 'Tradier';
-      } else {
-        allExpDates = null;
-      }
-    } catch (err) {
-      console.warn(`[GEXHeatmap] Tradier expirations failed: ${err.message}`);
-      allExpDates = null;
-    }
-  }
-
-  // Try Public.com next (real broker greeks)
-  if (!allExpDates && publicService.enabled) {
-    try {
-      allExpDates = await publicService.getOptionExpirations(ticker);
-      if (allExpDates && allExpDates.length > 0) {
-        source = 'Public.com';
-      } else {
-        allExpDates = null;
-      }
-    } catch (err) {
-      console.warn(`[GEXHeatmap] Public.com expirations failed: ${err.message}`);
-      allExpDates = null;
-    }
-  }
-
-  // Yahoo fallback (always available, no auth)
-  if (!allExpDates) {
-    yahooExps = await gamma.fetchAvailableExpirations(ticker);
-    if (yahooExps.length === 0) throw new Error(`No expirations for ${ticker}`);
-    allExpDates = yahooExps.map(e => e.date);
-    source = 'Yahoo';
-  }
-
-  const today = new Date().toISOString().slice(0, 10);
-  const futureExpDates = allExpDates.filter(d => d >= today).sort();
-
-  // Pick target expirations
-  let targetExpDates;
-  if (requestedExps && requestedExps.length > 0) {
-    targetExpDates = allExpDates.filter(d => requestedExps.includes(d));
-  } else {
-    targetExpDates = futureExpDates.slice(0, 6);
-  }
-  if (targetExpDates.length === 0) throw new Error('No valid expirations found');
-
-  // 2. Get spot price — try sources in order
+  // 1. Get spot price (source-independent — OPRA is options-only, always need equity quote)
   let spotPrice = null;
-  if (source === 'Databento' || source === 'Tradier') {
+  if (tradier.enabled) {
     try {
-      // Databento OPRA is options-only — use Tradier for equity quotes
       const q = await tradier.getQuote(ticker);
       spotPrice = q.price;
-    } catch { /* fallback */ }
-  }
-  if (!spotPrice && publicService.enabled) {
-    try {
-      const accountId = require('../config').publicAccountId;
-      const quoteData = await publicService._post(
-        `/userapigateway/marketdata/${accountId}/quotes`,
-        { instruments: [{ symbol: ticker, type: 'EQUITY' }] }
-      );
-      const q = quoteData.quotes?.[0];
-      if (q) spotPrice = parseFloat(q.last) || 0;
     } catch { /* fallback */ }
   }
   if (!spotPrice && alpaca.enabled) {
@@ -211,60 +432,78 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
   }
   if (!spotPrice) throw new Error(`Cannot determine spot price for ${ticker}`);
 
-  // 3. Fetch chains and compute GEX per strike per expiration
-  const expirationResults = [];
-  const allStrikes = new Set();
+  // 2. Build source priority list — try each in order with fallback
+  // If a source has expirations but produces no usable chain data (e.g. OI=0), fall back to next
+  let live;
+  try { live = require('../services/databento-live'); } catch { live = null; }
 
-  for (const expDate of targetExpDates) {
+  const sourcesToTry = [];
+  if (live && live.hasDataFor(ticker)) sourcesToTry.push('DatabentoLive');
+  if (tradier.enabled) sourcesToTry.push('Tradier');
+  if (publicService.enabled) sourcesToTry.push('Public.com');
+  // Alpaca omitted: indicative feed has no open interest data (OI=0),
+  // and no expiration discovery API. Needs SIP feed ($99/mo) for OI.
+  // Free alternative: set TRADIER_API_KEY (sandbox is free, includes ORATS greeks + OI)
+  sourcesToTry.push('Yahoo');
+  if (sourcesToTry.length === 1) {
+    console.warn('[GEXHeatmap] No premium sources configured — using Yahoo only. Set TRADIER_API_KEY for real greeks (free sandbox).');
+  }
+
+  let source = null;
+  let expirationResults = [];
+  let allStrikes = new Set();
+  let futureExpDates = [];
+  let bestFallback = null; // Track best data if no source meets MIN_STRIKES
+
+  for (const trySource of sourcesToTry) {
+    // ── Get available expirations for this source ──
+    let allExpDates = null;
+    let yahooExps = null;
+
     try {
-      let strikeGEXMap;
-      let totalGEX;
-
-      if (source === 'Databento' || source === 'Tradier' || source === 'Public.com') {
-        // ── Real data path: Databento (OPRA+ORATS), Tradier (ORATS), or Public.com ──
-        let contracts;
-        if (source === 'Databento') {
-          contracts = await databento.getOptionsWithGreeks(ticker, expDate);
-        } else if (source === 'Tradier') {
-          contracts = await tradier.getOptionsWithGreeks(ticker, expDate);
-        } else {
-          contracts = await publicService.getOptionsWithGreeks(ticker, expDate);
-        }
-        if (!contracts || contracts.length === 0) continue;
-
-        // Compute GEX per strike using real gamma
-        // GEX = OI × Gamma × 100 × Spot (calls positive, puts negative for dealer)
-        const strikeMap = new Map();
-        for (const c of contracts) {
-          if (!c.strike || !c.openInterest || !c.gamma) continue;
-          const gex = c.openInterest * c.gamma * 100 * spotPrice;
-
-          const entry = strikeMap.get(c.strike) || { net: 0, call: 0, put: 0, callOI: 0, putOI: 0 };
-          if (c.type === 'call') {
-            entry.call += gex;
-            entry.callOI += c.openInterest;
-          } else {
-            entry.put -= gex; // negative for dealer short puts
-            entry.putOI += c.openInterest;
-          }
-          entry.net = entry.call + entry.put;
-          strikeMap.set(c.strike, entry);
-        }
-
-        strikeGEXMap = {};
-        totalGEX = 0;
-        for (const [strike, data] of strikeMap) {
-          strikeGEXMap[strike] = data;
-          allStrikes.add(strike);
-          totalGEX += data.net;
-        }
+      if (trySource === 'DatabentoLive') {
+        const dates = live.getExpirations(ticker);
+        if (dates.length > 0) allExpDates = dates;
+      } else if (trySource === 'Tradier') {
+        const dates = await tradier.getOptionExpirations(ticker);
+        if (dates.length > 0) allExpDates = dates;
+      } else if (trySource === 'Public.com') {
+        const dates = await publicService.getOptionExpirations(ticker);
+        if (dates && dates.length > 0) allExpDates = dates;
       } else {
-        // ── Yahoo fallback: Black-Scholes estimated gamma ──
+        yahooExps = await gamma.fetchAvailableExpirations(ticker);
+        if (yahooExps.length > 0) allExpDates = yahooExps.map(e => e.date);
+      }
+    } catch (err) {
+      console.warn(`[GEXHeatmap] ${trySource} expirations failed: ${err.message}`);
+      continue;
+    }
+
+    if (!allExpDates || allExpDates.length === 0) continue;
+
+    const today = new Date().toISOString().slice(0, 10);
+    futureExpDates = allExpDates.filter(d => d >= today).sort();
+
+    let targetExpDates;
+    if (requestedExps && requestedExps.length > 0) {
+      targetExpDates = allExpDates.filter(d => requestedExps.includes(d));
+    } else {
+      targetExpDates = futureExpDates.slice(0, 6);
+    }
+    if (targetExpDates.length === 0) continue;
+
+    // ── Fetch chains and compute GEX per strike per expiration ──
+    expirationResults = [];
+    allStrikes = new Set();
+
+    if (trySource === 'Yahoo') {
+      // ── Yahoo: fetch all expirations in parallel for speed ──
+      const fetchResults = await Promise.allSettled(targetExpDates.map(async (expDate) => {
         const expObj = yahooExps?.find(e => e.date === expDate);
-        if (!expObj) continue;
+        if (!expObj) return null;
         const result = await gamma._yahooFetch(ticker, expObj.epoch);
         const options = result.options?.[0];
-        if (!options) continue;
+        if (!options) return null;
 
         const chain = [];
         for (const c of (options.calls || [])) {
@@ -281,21 +520,111 @@ async function _fetchHeatmapData(ticker, strikeRange, requestedExps) {
         }
 
         const detailed = gamma.calculateDetailedGEX(chain, spotPrice);
-        strikeGEXMap = {};
+        const strikeGEXMap = {};
+        const strikes = [];
         for (const s of detailed.strikes) {
           strikeGEXMap[s.strike] = {
             net: s['netGEX$'], call: s['callGEX$'], put: s['putGEX$'],
             callOI: s.callOI, putOI: s.putOI,
           };
-          allStrikes.add(s.strike);
+          strikes.push(s.strike);
         }
-        totalGEX = detailed['totalNetGEX$'];
-      }
+        return { date: expDate, strikeGEX: strikeGEXMap, totalGEX: detailed['totalNetGEX$'], strikes };
+      }));
 
-      expirationResults.push({ date: expDate, strikeGEX: strikeGEXMap, totalGEX });
-    } catch (err) {
-      console.warn(`[GEXHeatmap API] Skipping ${expDate}: ${err.message}`);
+      for (const r of fetchResults) {
+        if (r.status === 'fulfilled' && r.value && Object.keys(r.value.strikeGEX).length > 0) {
+          expirationResults.push({ date: r.value.date, strikeGEX: r.value.strikeGEX, totalGEX: r.value.totalGEX });
+          for (const s of r.value.strikes) allStrikes.add(s);
+        } else if (r.status === 'rejected') {
+          console.warn(`[GEXHeatmap] Yahoo exp failed: ${r.reason?.message}`);
+        }
+      }
+    } else {
+      // ── Non-Yahoo sources: sequential (DatabentoLive is in-memory = fast) ──
+      for (const expDate of targetExpDates) {
+        try {
+          let contracts;
+          if (trySource === 'DatabentoLive') {
+            contracts = live.getOptionsChain(ticker, expDate);
+          } else if (trySource === 'Tradier') {
+            contracts = await tradier.getOptionsWithGreeks(ticker, expDate);
+          } else {
+            contracts = await publicService.getOptionsWithGreeks(ticker, expDate);
+          }
+          if (!contracts || contracts.length === 0) continue;
+
+          const T = Math.max((new Date(expDate).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+
+          const strikeMap = new Map();
+          for (const c of contracts) {
+            if (!c.strike || !c.openInterest) continue;
+
+            let contractGamma = c.gamma;
+            if (!contractGamma || contractGamma === 0) {
+              const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+              const iv = _estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+              contractGamma = _bsGamma(spotPrice, c.strike, iv, T);
+            }
+            if (!contractGamma) continue;
+
+            const gex = c.openInterest * contractGamma * 100 * spotPrice;
+            const entry = strikeMap.get(c.strike) || { net: 0, call: 0, put: 0, callOI: 0, putOI: 0 };
+            if (c.type === 'call') {
+              entry.call += gex;
+              entry.callOI += c.openInterest;
+            } else {
+              entry.put -= gex;
+              entry.putOI += c.openInterest;
+            }
+            entry.net = entry.call + entry.put;
+            strikeMap.set(c.strike, entry);
+          }
+
+          const strikeGEXMap = {};
+          let totalGEX = 0;
+          for (const [strike, data] of strikeMap) {
+            strikeGEXMap[strike] = data;
+            allStrikes.add(strike);
+            totalGEX += data.net;
+          }
+
+          if (Object.keys(strikeGEXMap).length > 0) {
+            expirationResults.push({ date: expDate, strikeGEX: strikeGEXMap, totalGEX });
+          }
+        } catch (err) {
+          console.warn(`[GEXHeatmap API] Skipping ${expDate}: ${err.message}`);
+          if (err.name === 'TimeoutError' || err.message.includes('timeout')) break;
+        }
+      }
     }
+
+    // Require a minimum number of strikes to consider a source usable —
+    // DatabentoLive often has sparse OI early in the session which produces
+    // a nearly-empty heatmap. Fall back to a richer source instead.
+    const MIN_STRIKES = 10;
+    if (expirationResults.length > 0 && allStrikes.size >= MIN_STRIKES) {
+      source = trySource;
+      console.log(`[GEXHeatmap] Using ${trySource} for ${ticker} (${expirationResults.length} expirations, ${allStrikes.size} strikes)`);
+      break; // Success — use this source
+    }
+
+    // Track best fallback in case no source meets MIN_STRIKES
+    if (expirationResults.length > 0 && allStrikes.size > 0 &&
+        (!bestFallback || allStrikes.size > bestFallback.allStrikes.size)) {
+      bestFallback = { source: trySource, expirationResults: [...expirationResults], allStrikes: new Set(allStrikes), futureExpDates: [...futureExpDates] };
+    }
+
+    console.warn(`[GEXHeatmap] ${trySource} had expirations but insufficient data (${expirationResults.length} exps, ${allStrikes.size} strikes), falling back...`);
+  }
+
+  // If no source met MIN_STRIKES but we have some data, use the best available
+  if (!source && bestFallback) {
+    source = bestFallback.source;
+    expirationResults = bestFallback.expirationResults;
+    allStrikes = bestFallback.allStrikes;
+    futureExpDates = bestFallback.futureExpDates;
+    console.warn(`[GEXHeatmap] No source met MIN_STRIKES, using best fallback: ${source} (${expirationResults.length} exps, ${allStrikes.size} strikes)`);
   }
 
   if (expirationResults.length === 0) throw new Error(`No options data for ${ticker}`);
@@ -387,6 +716,9 @@ async function _fetchAndPush(res, ticker, range, expirations) {
   try {
     const data = await _fetchHeatmapData(ticker, range, expirations);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+    // Populate live GEX cache so real-time updates can update OI incrementally
+    _populateLiveCache(ticker, data, data.source);
   } catch (err) {
     res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
   }
@@ -612,6 +944,13 @@ async function loadTicker() {
   input.value = ticker;
   state.ticker = ticker;
 
+  // If live is on, let SSE handle the initial fetch (avoids double-fetch)
+  if (state.live) {
+    showLoading('Connecting live stream...');
+    startSSE();
+    return;
+  }
+
   showLoading('Fetching gamma data...');
 
   try {
@@ -630,11 +969,8 @@ async function loadTicker() {
     updateSpotBadge();
     updateFooter();
 
-    // If live was on, reconnect SSE
-    if (state.live) startSSE();
-
     // Start auto-refresh
-    if (state.refreshInterval > 0 && !state.live) startAutoRefresh();
+    if (state.refreshInterval > 0) startAutoRefresh();
 
   } catch (err) {
     showError(err.message);
@@ -872,7 +1208,12 @@ function setInterval_(sec) {
   });
 
   clearAutoRefresh();
-  if (sec > 0 && !state.live) startAutoRefresh();
+  if (state.live) {
+    // Reconnect SSE with updated interval so the change takes effect immediately
+    startSSE();
+  } else if (sec > 0) {
+    startAutoRefresh();
+  }
 }
 
 function startAutoRefresh() {
@@ -923,11 +1264,13 @@ function toggleLive() {
     btn.classList.add('active');
     dot.classList.replace('off', 'live');
     clearAutoRefresh();
-    startSSE();
+    refreshData();  // Immediate update so heatmap refreshes NOW
+    startSSE();     // Then SSE takes over for subsequent live updates
   } else {
     btn.classList.remove('active');
     dot.classList.replace('live', 'off');
     stopSSE();
+    refreshData();  // Immediate update so user doesn't wait for next poll
     if (state.refreshInterval > 0) startAutoRefresh();
   }
 }
@@ -1025,7 +1368,7 @@ function updateFooter() {
   const src = state.data.source || 'Yahoo';
   document.getElementById('footerLeft').textContent =
     'GEX = OI \\u00d7 Gamma \\u00d7 100 \\u00d7 Spot | Data: ' + src
-    + (src === 'Databento' ? ' (OPRA + ORATS greeks)' : src === 'Tradier' ? ' (ORATS real greeks)' : src === 'Public.com' ? ' (real greeks)' : ' (Black-Scholes est.)');
+    + (src === 'Tradier' ? ' (ORATS real greeks)' : src === 'Public.com' ? ' (real greeks)' : src.includes('LIVE') ? ' (OPRA live)' : ' (Black-Scholes est.)');
   document.getElementById('footerRight').textContent =
     'Updated: ' + new Date(state.data.timestamp).toLocaleTimeString() + ' | '
     + state.data.expirations.length + ' expirations | '

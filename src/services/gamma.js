@@ -5,10 +5,11 @@
  * and generates bar-chart PNGs for Discord.
  *
  * Data source priority:
- *   1. Databento OPRA (institutional NBBO + OI) + Tradier ORATS greeks
- *   2. Tradier (ORATS real greeks, full chain)
- *   3. Alpaca (pre-calculated greeks, indicative feed)
- *   4. Yahoo Finance (free, Black-Scholes estimated gamma)
+ *   1. Databento Live TCP (real-time OPRA stream — zero API lag)
+ *   2. Databento Historical (institutional NBBO + OI) + Tradier ORATS greeks
+ *   3. Tradier (ORATS real greeks, full chain)
+ *   4. Alpaca (pre-calculated greeks + BS gamma fallback for indicative feed)
+ *   5. Yahoo Finance (free, Black-Scholes estimated gamma)
  * Spot price: Tradier → Alpaca → FMP → yahoo-finance2 fallback
  *
  * Key concepts:
@@ -44,7 +45,7 @@ const config = require('../config');
 const alpaca = require('./alpaca');
 const priceFetcher = require('../tools/price-fetcher');
 
-// Databento + Tradier — lazy-loaded to avoid circular deps and slow startup
+// Databento + Tradier + DatabentoLive — lazy-loaded to avoid circular deps and slow startup
 let _databento = null, _databentoLoaded = false;
 function getDatabento() {
   if (!_databentoLoaded) { _databentoLoaded = true; try { _databento = require('./databento'); } catch { _databento = null; } }
@@ -55,10 +56,15 @@ function getTradier() {
   if (!_tradierLoaded) { _tradierLoaded = true; try { _tradier = require('./tradier'); } catch { _tradier = null; } }
   return _tradier;
 }
+let _databentoLive = null, _databentoLiveLoaded = false;
+function getDatabentoLive() {
+  if (!_databentoLiveLoaded) { _databentoLiveLoaded = true; try { _databentoLive = require('./databento-live'); } catch { _databentoLive = null; } }
+  return _databentoLive;
+}
 
 const YAHOO_OPTIONS_BASE = 'https://query2.finance.yahoo.com/v7/finance/options';
 const FMP_BASE = 'https://financialmodelingprep.com/stable';
-const RISK_FREE_RATE = 0.045; // approximate 10Y yield
+const bs = require('../lib/black-scholes');
 
 const FONT_FAMILY = 'Inter';
 
@@ -368,29 +374,10 @@ class GammaService {
     }
   }
 
-  // ── Black-Scholes gamma ──────────────────────────────────────────────
+  // ── Black-Scholes gamma (delegates to shared lib/black-scholes.js) ──
 
-  _normalPDF(x) {
-    return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
-  }
-
-  _d1(S, K, r, sigma, T) {
-    return (Math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * Math.sqrt(T));
-  }
-
-  /**
-   * Black-Scholes gamma for a single option.
-   * @param {number} S - spot price
-   * @param {number} K - strike price
-   * @param {number} sigma - implied volatility (decimal, e.g. 0.30 = 30%)
-   * @param {number} T - time to expiry in years
-   * @returns {number} gamma value
-   */
-  _bsGamma(S, K, sigma, T) {
-    if (T <= 0 || sigma <= 0 || S <= 0 || K <= 0) return 0;
-    const d1 = this._d1(S, K, RISK_FREE_RATE, sigma, T);
-    return this._normalPDF(d1) / (S * sigma * Math.sqrt(T));
-  }
+  _bsGamma(S, K, sigma, T) { return bs.bsGamma(S, K, sigma, T); }
+  _estimateIV(midPrice, spotPrice, strike, T, isCall) { return bs.estimateIV(midPrice, spotPrice, strike, T, isCall); }
 
   // ── GEX calculation ──────────────────────────────────────────────────
 
@@ -988,9 +975,69 @@ class GammaService {
   async analyze(ticker, expirationPref = '0dte') {
     const upper = ticker.toUpperCase();
 
-    // ── Try Databento first (institutional OPRA data + ORATS greeks) ──
-    const databento = getDatabento();
+    // ── Try DatabentoLive TCP first (real-time OPRA — zero API lag) ──
+    const live = getDatabentoLive();
     const tradier = getTradier();
+    if (live && live.hasDataFor(upper)) {
+      try {
+        console.log(`[Gamma] Trying DatabentoLive TCP for ${upper} (pref: ${expirationPref})...`);
+        const targetExp = this._computeTargetDate(expirationPref);
+        const liveExps = live.getExpirations(upper);
+
+        let expDate = liveExps.find(d => d === targetExp);
+        if (!expDate) {
+          const today = this._todayString();
+          const future = liveExps.filter(d => d >= today);
+          expDate = future[0] || liveExps[0];
+        }
+
+        if (expDate) {
+          const contracts = live.getOptionsChain(upper, expDate);
+
+          // Get spot price (OPRA is options-only)
+          let spotPrice = null;
+          if (tradier && tradier.enabled) {
+            try { spotPrice = (await tradier.getQuote(upper)).price; } catch { /* fallback */ }
+          }
+          if (!spotPrice && alpaca.enabled) {
+            try { spotPrice = (await alpaca.getSnapshot(upper)).price; } catch { /* fallback */ }
+          }
+          if (!spotPrice) {
+            const pf = await priceFetcher.getCurrentPrice(upper);
+            if (!pf.error) spotPrice = pf.price;
+          }
+
+          if (contracts.length > 0 && spotPrice) {
+            // Estimate gamma via BS for contracts without greeks
+            const T = Math.max((new Date(expDate).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+            for (const c of contracts) {
+              if (!c.gamma || c.gamma === 0) {
+                const mid = c.lastPrice || (c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : 0);
+                if (mid > 0) {
+                  const iv = this._estimateIV(mid, spotPrice, c.strike, T, c.type === 'call');
+                  c.gamma = this._bsGamma(spotPrice, c.strike, iv, T);
+                  c.impliedVolatility = iv;
+                }
+              }
+            }
+
+            const gexData = this.calculateGEXFromAlpaca(contracts, spotPrice, expDate);
+            if (gexData.strikes.length > 0) {
+              const flip = this.findGammaFlip(gexData, spotPrice);
+              const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
+              console.log(`[Gamma] ${upper}: DatabentoLive TCP OK — ${contracts.length} contracts, exp ${expDate}`);
+              return { ticker: upper, spotPrice, expiration: expDate, gexData, flip, chartBuffer, source: 'DatabentoLive' };
+            }
+          }
+        }
+        console.log(`[Gamma] DatabentoLive returned insufficient data for ${upper}, falling back`);
+      } catch (err) {
+        console.warn(`[Gamma] DatabentoLive failed for ${upper}: ${err.message}, falling back`);
+      }
+    }
+
+    // ── Try Databento Historical (institutional OPRA data + ORATS greeks) ──
+    const databento = getDatabento();
     if (databento && databento.enabled) {
       try {
         console.log(`[Gamma] Trying Databento OPRA for ${upper} (pref: ${expirationPref})...`);
@@ -1095,19 +1142,45 @@ class GammaService {
 
         if (options.length > 0 && alpacaSpot) {
           const spotPrice = alpacaSpot;
-          // Use the actual expiration from returned data (may differ slightly)
           const expiration = this._pickAlpacaExpiration(options, expirationPref) || targetExp;
 
-          const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
-          if (gexData.strikes.length > 0) {
-            const flip = this.findGammaFlip(gexData, spotPrice);
-            const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
+          // Check if open interest is available — indicative feed returns OI=0 for all contracts,
+          // making GEX calculation impossible (GEX = OI × gamma × 100 × spot)
+          const hasOI = options.some(o => o.openInterest > 0 && o.expiration === expiration);
+          if (!hasOI) {
+            console.log(`[Gamma] Alpaca ${upper}: no open interest data (indicative feed) — cannot compute GEX, falling back`);
+          } else {
+            // If all gammas are 0 (indicative feed with no greeks), estimate via BS
+            const hasGreeks = options.some(o => o.gamma > 0 && o.expiration === expiration);
+            if (!hasGreeks) {
+              console.log(`[Gamma] Alpaca ${upper}: no greeks (indicative feed), estimating gamma via BS...`);
+              const T = Math.max((new Date(expiration).getTime() - Date.now()) / (365.25 * 86400000), 1 / 365);
+              for (const o of options) {
+                if (o.expiration !== expiration) continue;
+                if (!o.gamma || o.gamma === 0) {
+                  const mid = o.lastPrice || (o.bid > 0 && o.ask > 0 ? (o.bid + o.ask) / 2 : 0);
+                  if (mid > 0) {
+                    const iv = this._estimateIV(mid, spotPrice, o.strike, T, o.type === 'call');
+                    o.gamma = this._bsGamma(spotPrice, o.strike, iv, T);
+                    o.impliedVolatility = iv;
+                  }
+                }
+              }
+            }
 
-            console.log(`[Gamma] ${upper}: Alpaca OK — ${options.length} contracts, exp ${expiration}`);
-            return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Alpaca' };
+            const gexData = this.calculateGEXFromAlpaca(options, spotPrice, expiration);
+            if (gexData.strikes.length > 0) {
+              const flip = this.findGammaFlip(gexData, spotPrice);
+              const chartBuffer = await this.generateChart(gexData, spotPrice, upper, flip.flipStrike);
+
+              console.log(`[Gamma] ${upper}: Alpaca OK — ${options.length} contracts, exp ${expiration}`);
+              return { ticker: upper, spotPrice, expiration, gexData, flip, chartBuffer, source: 'Alpaca' };
+            }
+            console.log(`[Gamma] Alpaca returned insufficient data for ${upper}, falling back to Yahoo`);
           }
+        } else {
+          console.log(`[Gamma] Alpaca returned no contracts for ${upper}, falling back to Yahoo`);
         }
-        console.log(`[Gamma] Alpaca returned insufficient data for ${upper}, falling back to Yahoo`);
       } catch (err) {
         console.warn(`[Gamma] Alpaca failed for ${upper}: ${err.message}, falling back to Yahoo`);
       }
@@ -1164,7 +1237,7 @@ class GammaService {
       `🔴 **Put Wall (min GEX):** \`$${minGEX.strike}\` (${fmt(minGEX.value)})`,
       ``,
       `_Call wall = magnet/resistance | Put wall = support | Flip = regime boundary_`,
-      `_Data: ${result.source === 'Databento' ? 'Databento OPRA + ORATS greeks' : result.source === 'Tradier' ? 'Tradier (ORATS real greeks)' : result.source || 'Yahoo'}_`,
+      `_Data: ${result.source === 'DatabentoLive' ? 'Databento OPRA Live TCP + BS greeks' : result.source === 'Databento' ? 'Databento OPRA + ORATS greeks' : result.source === 'Tradier' ? 'Tradier (ORATS real greeks)' : result.source || 'Yahoo'}_`,
     ];
 
     return lines.join('\n');

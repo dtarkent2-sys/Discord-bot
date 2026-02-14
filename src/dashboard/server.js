@@ -162,11 +162,35 @@ function startDashboard() {
       } catch { /* live not available */ }
 
       // Fall back to historical API
-      const db = require('../services/databento');
-      if (!db.enabled) return res.json({ enabled: false, error: 'Databento not configured' });
+      let db = null;
+      try { db = require('../services/databento'); } catch { /* module removed */ }
+      if (!db || !db.enabled) return res.json({ enabled: false, error: 'Databento not configured' });
       const minutes = Math.min(Math.max(parseInt(req.query.minutes) || 15, 1), 60);
       const flow = await db.getOrderFlow(ticker, minutes);
       res.json(flow);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // HFT signals — book skew, VWAP, aggression, composite conviction
+  app.get('/api/signal/:ticker', (req, res) => {
+    try {
+      const live = require('../services/databento-live');
+      const ticker = req.params.ticker.toUpperCase().replace(/[^A-Z0-9.]/g, '');
+      const signal = live.getSignal(ticker);
+      res.json(signal || { error: 'No signal data yet (market may be closed)' });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Institutional sweep orders (intermarket sweeps detected from live OPRA stream)
+  app.get('/api/sweeps', (req, res) => {
+    try {
+      const live = require('../services/databento-live');
+      const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+      res.json({ sweeps: live.getSweeps(limit) });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }

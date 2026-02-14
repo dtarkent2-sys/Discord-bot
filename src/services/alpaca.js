@@ -138,7 +138,7 @@ class AlpacaService {
   async getOptionsSnapshots(ticker, expiration, type) {
     const upper = ticker.toUpperCase();
     const params = {
-      feed: 'indicative', // free tier — use 'opra' if you have paid
+      feed: config.alpacaFeed === 'sip' ? 'opra' : 'indicative', // 'opra' if SIP (paid), else 'indicative' (free)
       limit: 1000,
     };
     if (expiration) params.expiration_date = expiration;

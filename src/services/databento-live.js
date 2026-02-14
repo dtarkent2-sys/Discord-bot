@@ -1,30 +1,32 @@
 /**
  * Databento Live — Real-Time OPRA Streaming via Raw TCP
  *
- * Connects to Databento's Live Subscription Gateway (LSG) over TCP,
- * authenticates via CRAM-SHA256, subscribes to OPRA data, and parses
- * DBN binary records into JavaScript objects.
+ * Full Node.js implementation of the Databento Live Subscription Gateway (LSG)
+ * protocol. Connects via TCP, authenticates with CRAM-SHA256, subscribes to
+ * OPRA options data, and parses DBN binary records into JavaScript objects.
  *
- * Protocol: Text-based control messages (pipe-delimited key=value\n)
- *           followed by binary DBN record stream.
+ * Built from official Databento protocol docs + Python/Rust/C++ client source:
+ *   https://databento.com/docs/api-reference-live
+ *   https://github.com/databento/databento-python
+ *   https://github.com/databento/dbn
+ *
+ * HFT signal engine powered by techniques from:
+ *   https://databento.com/blog/hft-sklearn-python
+ *   https://databento.com/blog/liquidity-taking-strategy
+ *   https://databento.com/blog/vwap-python
  *
  * Emits events:
- *   'trade'      — TradeMsg (tick-level fills)
- *   'quote'      — Mbp1/Cmbp1/Cbbo quote updates
- *   'statistic'  — StatMsg (OI, settlement, session high/low)
- *   'definition'  — InstrumentDefMsg
- *   'ohlcv'      — OHLCV bar updates
- *   'error'      — ErrorMsg from gateway
- *   'system'     — SystemMsg (heartbeats, subscription acks)
- *   'connected'  — Successfully authenticated
- *   'disconnected' — Connection lost
- *
- * Usage:
- *   const live = require('./databento-live');
- *   live.connect();
- *   live.on('trade', (trade) => { ... });
- *
- * Docs: https://databento.com/docs/api-reference-live
+ *   'trade'       — tick-level fills with aggressor side
+ *   'quote'       — consolidated BBO updates (bid/ask/size/count)
+ *   'statistic'   — OI, settlement, session high/low
+ *   'definition'  — instrument definitions (strike, expiry, underlying)
+ *   'ohlcv'       — OHLCV bar updates
+ *   'sweep'       — detected intermarket sweep orders (institutional urgency)
+ *   'signal'      — HFT signal (book imbalance, VWAP cross, aggression spike)
+ *   'error'       — gateway ErrorMsg
+ *   'system'      — SystemMsg (heartbeats)
+ *   'connected'   — successfully authenticated + streaming
+ *   'disconnected' — connection lost
  */
 
 const net = require('net');
@@ -35,61 +37,93 @@ const config = require('../config');
 // ── Constants ──────────────────────────────────────────────────────────
 
 const LSG_PORT = 13000;
-const CONNECT_TIMEOUT = 10_000;   // 10s
-const AUTH_TIMEOUT = 30_000;      // 30s
-const RECONNECT_BASE_MS = 2_000;  // 2s initial backoff
-const RECONNECT_MAX_MS = 60_000;  // 1min max backoff
-const PRICE_SCALE = 1_000_000_000;
-const LENGTH_MULTIPLIER = 4;
+const CONNECT_TIMEOUT = 10_000;          // 10s
+const AUTH_TIMEOUT = 30_000;             // 30s
+const HEARTBEAT_INTERVAL_S = 30;         // Request heartbeat every 30s
+const HEARTBEAT_TIMEOUT_MARGIN_S = 10;   // Disconnect after 30+10=40s silence
+const RECONNECT_BASE_MS = 2_000;         // 2s initial backoff
+const RECONNECT_MAX_MS = 60_000;         // 1min max backoff
+const SYMBOL_BATCH_SIZE = 500;           // Max symbols per subscription msg
+const PRICE_SCALE = 1_000_000_000;       // Fixed-point 1e-9 scale
+const LENGTH_MULTIPLIER = 4;             // Record length field * 4 = byte size
+const SWEEP_WINDOW_MS = 100;             // Group trades within 100ms for sweep detection
 
-// DBN record types we care about
+// DBN record types
 const RTYPE = {
-  TRADE:       0x00, // MBP-0 / TradeMsg
-  MBP1:        0x01, // Mbp1Msg (BBO + quote)
-  MBP10:       0x0A,
-  STATUS:      0x12,
-  DEFINITION:  0x13, // InstrumentDefMsg
-  IMBALANCE:   0x14,
-  ERROR:       0x15, // ErrorMsg
-  SYM_MAPPING: 0x16,
-  SYSTEM:      0x17, // SystemMsg (heartbeats)
-  STATISTICS:  0x18, // StatMsg (OI, settlement)
-  OHLCV_1S:    0x20,
-  OHLCV_1M:    0x21,
-  OHLCV_1H:    0x22,
-  OHLCV_1D:    0x23,
-  OHLCV_EOD:   0x24,
-  MBO:         0xA0,
-  CMBP1:       0xB1, // Consolidated BBO
-  CBBO_1S:     0xC0,
-  CBBO_1M:     0xC1,
-  TCBBO:       0xC2,
-  BBO_1S:      0xC3,
-  BBO_1M:      0xC4,
+  TRADE:       0x00, // MBP-0 / TradeMsg (tick-level fills)
+  MBP1:        0x01, // Mbp1Msg (top-of-book + 1 BidAskPair)
+  MBP10:       0x0A, // Mbp10Msg (10 levels of depth with order counts)
+  STATUS:      0x12, // Trading status
+  DEFINITION:  0x13, // InstrumentDefMsg (strikes, expiry, underlying)
+  IMBALANCE:   0x14, // Auction imbalance
+  ERROR:       0x15, // ErrorMsg (302-byte message + code)
+  SYM_MAPPING: 0x16, // Symbol mapping update
+  SYSTEM:      0x17, // SystemMsg (heartbeats, acks)
+  STATISTICS:  0x18, // StatMsg (OI, settlement, session hi/lo)
+  OHLCV_1S:    0x20, OHLCV_1M: 0x21, OHLCV_1H: 0x22, OHLCV_1D: 0x23, OHLCV_EOD: 0x24,
+  MBO:         0xA0, // Market-by-order (individual orders)
+  CMBP1:       0xB1, // Consolidated MBP-1
+  CBBO_1S:     0xC0, CBBO_1M: 0xC1, TCBBO: 0xC2, BBO_1S: 0xC3, BBO_1M: 0xC4,
 };
 
-// Stat types
+// Stat types (from Databento StatType enum)
 const STAT_OPEN_INTEREST = 9;
 const STAT_SETTLEMENT = 3;
-const STAT_CLEARED_VOLUME = 6;
 
 // Sentinel values
 const UNDEF_PRICE = 0x7FFFFFFFFFFFFFFFn;
 
 // ── CRAM Authentication ────────────────────────────────────────────────
+// Source: databento-python/databento/common/cram.py
 
 function computeCramResponse(challenge, apiKey) {
-  const input = `${challenge}|${apiKey}`;
-  const hash = crypto.createHash('sha256').update(input).digest('hex');
-  const bucketId = apiKey.slice(-5);
-  return `${hash}-${bucketId}`;
+  const hash = crypto.createHash('sha256').update(`${challenge}|${apiKey}`).digest('hex');
+  return `${hash}-${apiKey.slice(-5)}`;
 }
 
 // ── Price conversion ───────────────────────────────────────────────────
+// All prices are i64 fixed-point scaled by 1e-9 (1 unit = $0.000000001)
 
 function toPrice(rawBigInt) {
   if (rawBigInt === UNDEF_PRICE) return null;
   return Number(rawBigInt) / PRICE_SCALE;
+}
+
+// ── OCC Symbol Parser ─────────────────────────────────────────────────
+// OCC/OSI format: "SPY   260213C00605000" (padded to ~21 chars)
+// [root][YYMMDD][C/P][strike*1000 zero-padded to 8 digits]
+
+function parseOccSymbol(sym) {
+  if (!sym || sym.length < 16) return null;
+  // Find where the date digits start (after alpha root)
+  let dateStart = 0;
+  for (let i = 0; i < Math.min(sym.length, 6); i++) {
+    if (sym[i] >= '0' && sym[i] <= '9') { dateStart = i; break; }
+    dateStart = i + 1;
+  }
+  if (dateStart < 1 || sym.length < dateStart + 13) return null;
+
+  const underlying = sym.slice(0, dateStart).trim();
+  const dateStr = sym.slice(dateStart, dateStart + 6);
+  const cpChar = sym.charAt(dateStart + 6);
+  const strikeStr = sym.slice(dateStart + 7);
+
+  const yy = parseInt(dateStr.slice(0, 2), 10);
+  return {
+    underlying,
+    optionType: cpChar === 'C' ? 'call' : cpChar === 'P' ? 'put' : null,
+    strikePrice: parseInt(strikeStr, 10) / 1000,
+    expirationDate: `20${yy}-${dateStr.slice(2, 4)}-${dateStr.slice(4, 6)}`,
+  };
+}
+
+// ── Null-terminated C string extraction ────────────────────────────────
+
+function readCStr(buf, off, len) {
+  if (off + len > buf.length) return '';
+  const slice = buf.subarray(off, off + len);
+  const nullIdx = slice.indexOf(0);
+  return slice.subarray(0, nullIdx >= 0 ? nullIdx : len).toString('ascii').trim();
 }
 
 // ── DBN Record Parsers ────────────────────────────────────────────────
@@ -112,7 +146,7 @@ function parseTrade(buf, off) {
     price: toPrice(buf.readBigInt64LE(off + 16)),
     size: buf.readUInt32LE(off + 24),
     action: String.fromCharCode(buf.readUInt8(off + 28)),
-    side: String.fromCharCode(buf.readUInt8(off + 29)),
+    side: String.fromCharCode(buf.readUInt8(off + 29)),  // 'A'=ask aggressor, 'B'=bid aggressor, 'N'=none
     flags: buf.readUInt8(off + 30),
     depth: buf.readUInt8(off + 31),
     tsRecv: buf.readBigUInt64LE(off + 32),
@@ -147,12 +181,9 @@ function parseQuote(buf, off) {
     tsInDelta: buf.readInt32LE(off + 40),
     sequence: buf.readUInt32LE(off + 44),
   };
-
-  // BidAskPair at offset 48
   if (hd.recordSize >= 80) {
     base.level = parseBidAskPair(buf, off + 48);
   }
-
   return base;
 }
 
@@ -177,8 +208,7 @@ function parseStat(buf, off) {
 function parseOhlcv(buf, off) {
   const hd = parseRecordHeader(buf, off);
   return {
-    type: 'ohlcv',
-    ...hd,
+    type: 'ohlcv', ...hd,
     open: toPrice(buf.readBigInt64LE(off + 16)),
     high: toPrice(buf.readBigInt64LE(off + 24)),
     low: toPrice(buf.readBigInt64LE(off + 32)),
@@ -188,67 +218,67 @@ function parseOhlcv(buf, off) {
 }
 
 /**
- * Parse InstrumentDefMsg. The struct layout differs between DBN v1 (22-byte
- * symbol strings) and v2+ (71-byte strings). The numeric prefix fields are at
- * identical offsets in both versions, so we read those safely, then extract
- * raw_symbol at offset 196 (same start in both) and derive all enrichment
- * fields from the OCC symbol format (underlying, strike, type, expiration).
+ * Parse InstrumentDefMsg — handles both DBN v1 and v2+ layouts.
+ *
+ * The numeric prefix (offsets 0-111) is identical in both versions.
+ * V1 has strike_price at offset 112 as an i64 (same fixed-point 1e-9 scale).
+ * String fields diverge after the numeric block due to different
+ * field sizes (currency 4→6 bytes, raw_symbol 22→71 bytes, etc).
+ *
+ * V1 layout (from dbn/src/compat.rs):
+ *   offset 112: strike_price (i64)
+ *   offset 164: contract_multiplier (i32)
+ *   offset 202: raw_symbol (22 bytes, null-terminated)
+ *   offset 302: underlying (21 bytes)
+ *   offset 245: exchange (5 bytes)
+ *   offset 327: instrument_class (1 byte)
+ *
+ * V2+ layout (from dbn/src/record.rs):
+ *   offset 196: raw_symbol (71 bytes, null-terminated)
+ *   offset 156: contract_multiplier (i32)
  */
 function parseInstrumentDef(buf, off, recordSize, dbnVersion) {
   const hd = parseRecordHeader(buf, off);
 
-  // Numeric fields in the fixed prefix — same offset in v1 and v2
+  // Numeric fields before any divergence — identical in v1 and v2
   const result = {
     type: 'definition',
     ...hd,
     tsRecv: buf.readBigUInt64LE(off + 16),
     minPriceIncrement: toPrice(buf.readBigInt64LE(off + 24)),
     expiration: buf.readBigUInt64LE(off + 40),
-    contractMultiplier: recordSize >= 160 ? buf.readInt32LE(off + 156) : 100,
   };
 
-  // raw_symbol starts at offset 196 in both v1 and v2 — only length differs
-  const symLen = dbnVersion === 1 ? 22 : 71;
-  if (recordSize >= 196 + symLen) {
-    const rawSymBuf = buf.subarray(off + 196, off + 196 + symLen);
-    const nullIdx = rawSymBuf.indexOf(0);
-    result.rawSymbol = rawSymBuf.subarray(0, nullIdx >= 0 ? nullIdx : symLen).toString('ascii').trim();
+  if (dbnVersion === 1) {
+    // V1-specific offsets (verified from dbn/src/compat.rs InstrumentDefMsgV1)
+    if (recordSize >= 120) result.strikePrice = toPrice(buf.readBigInt64LE(off + 112));
+    if (recordSize >= 168) result.contractMultiplier = buf.readInt32LE(off + 164);
+    if (recordSize >= 224) result.rawSymbol = readCStr(buf, off + 202, 22);
+    if (recordSize >= 323) result.underlying = readCStr(buf, off + 302, 21);
+    if (recordSize >= 250) result.exchange = readCStr(buf, off + 245, 5);
+    if (recordSize >= 328) result.instrumentClass = String.fromCharCode(buf.readUInt8(off + 327));
   } else {
-    result.rawSymbol = '';
+    // V2+ offsets (from dbn/src/record.rs InstrumentDefMsg)
+    if (recordSize >= 160) result.contractMultiplier = buf.readInt32LE(off + 156);
+    if (recordSize >= 267) result.rawSymbol = readCStr(buf, off + 196, 71);
   }
 
-  // Parse OCC symbol format: "SPY   260213C00605000" (21 chars)
-  // [0-5] underlying (space-padded), [6-11] YYMMDD, [12] C/P, [13-20] strike*1000
-  if (result.rawSymbol.length >= 16) {
-    const sym = result.rawSymbol;
-    // Find where the date starts (first digit after the alpha padding)
-    let dateStart = 0;
-    for (let i = 0; i < Math.min(sym.length, 6); i++) {
-      if (sym[i] >= '0' && sym[i] <= '9') { dateStart = i; break; }
-      dateStart = i + 1;
-    }
-    result.underlying = sym.slice(0, dateStart).trim();
+  // Default contract multiplier for options
+  if (!result.contractMultiplier) result.contractMultiplier = 100;
 
-    if (sym.length >= dateStart + 13) {
-      const dateStr = sym.slice(dateStart, dateStart + 6);
-      const cpChar = sym.charAt(dateStart + 6);
-      const strikeStr = sym.slice(dateStart + 7);
-
-      result.optionType = cpChar === 'C' ? 'call' : cpChar === 'P' ? 'put' : null;
-      result.strikePrice = parseInt(strikeStr, 10) / 1000;
-
-      // YYMMDD → YYYY-MM-DD
-      const yy = parseInt(dateStr.slice(0, 2), 10);
-      const mm = dateStr.slice(2, 4);
-      const dd = dateStr.slice(4, 6);
-      result.expirationDate = `20${yy}-${mm}-${dd}`;
-    }
+  // Parse OCC symbol for underlying, strike, type, expiration
+  const occ = parseOccSymbol(result.rawSymbol);
+  if (occ) {
+    result.underlying = result.underlying || occ.underlying;
+    result.optionType = occ.optionType;
+    // OCC strike is more reliable than struct field for V1 offset ambiguity
+    if (!result.strikePrice) result.strikePrice = occ.strikePrice;
+    result.expirationDate = occ.expirationDate;
   }
 
   // Fallback: use expiration timestamp if OCC parse didn't yield a date
   if (!result.expirationDate && result.expiration && result.expiration !== 0xFFFFFFFFFFFFFFFFn) {
-    const ms = Number(result.expiration / 1_000_000n);
-    result.expirationDate = new Date(ms).toISOString().slice(0, 10);
+    result.expirationDate = new Date(Number(result.expiration / 1_000_000n)).toISOString().slice(0, 10);
   }
 
   return result;
@@ -256,12 +286,9 @@ function parseInstrumentDef(buf, off, recordSize, dbnVersion) {
 
 function parseError(buf, off) {
   const hd = parseRecordHeader(buf, off);
-  const errBuf = buf.subarray(off + 16, off + 16 + 302);
-  const nullIdx = errBuf.indexOf(0);
   return {
-    type: 'error',
-    ...hd,
-    message: errBuf.subarray(0, nullIdx >= 0 ? nullIdx : 302).toString('ascii').trim(),
+    type: 'error', ...hd,
+    message: readCStr(buf, off + 16, 302),
     code: buf.readUInt8(off + 318),
     isLast: buf.readUInt8(off + 319),
   };
@@ -269,12 +296,9 @@ function parseError(buf, off) {
 
 function parseSystem(buf, off) {
   const hd = parseRecordHeader(buf, off);
-  const msgBuf = buf.subarray(off + 16, off + 16 + 303);
-  const nullIdx = msgBuf.indexOf(0);
   return {
-    type: 'system',
-    ...hd,
-    message: msgBuf.subarray(0, nullIdx >= 0 ? nullIdx : 303).toString('ascii').trim(),
+    type: 'system', ...hd,
+    message: readCStr(buf, off + 16, 303),
     code: buf.readUInt8(off + 319),
   };
 }
@@ -285,21 +309,26 @@ class DatabentoLive extends EventEmitter {
   constructor() {
     super();
     this._socket = null;
-    this._state = 'disconnected'; // disconnected | greeting | challenge | authenticating | subscribing | streaming
+    this._state = 'disconnected';
     this._buffer = Buffer.alloc(0);
     this._reconnectAttempt = 0;
     this._reconnectTimer = null;
+    this._heartbeatTimer = null;
+    this._lastMessageAt = 0;
     this._subscriptions = [];
     this._sessionId = null;
     this._lsgVersion = null;
     this._metadataParsed = false;
-    this._metadataLength = 0;
     this._dbnVersion = 2;
     this._tsOut = false;
     this._symbolCstrLen = 71;
 
     // Instrument lookup (instrumentId → definition)
     this._instruments = new Map();
+
+    // Live OI + quotes per instrument (for building live options chains)
+    this._oi = new Map();           // instrumentId → OI number
+    this._quotes = new Map();       // instrumentId → { bid, ask, bidSz, askSz }
 
     // Stats tracking
     this._stats = {
@@ -325,50 +354,38 @@ class DatabentoLive extends EventEmitter {
   }
 
   /**
-   * Add a subscription. Call before connect(), or call while connected
-   * (will queue for next reconnect).
-   *
-   * @param {string} schema - e.g. 'trades', 'cbbo-1s', 'statistics', 'definition'
-   * @param {string} stypeIn - e.g. 'parent', 'raw_symbol'
-   * @param {string[]} symbols - e.g. ['SPY.OPT', 'QQQ.OPT']
+   * Add a subscription. Call before connect().
+   * Symbols are auto-batched in chunks of 500 per the LSG protocol.
+   * @param {string} schema - e.g. 'trades', 'definition', 'statistics'
+   * @param {string} stypeIn - e.g. 'parent'
+   * @param {string[]} symbols - e.g. ['SPY.OPT']
+   * @param {number} [start] - 0 = replay from session start (gets all accumulated data)
    */
-  subscribe(schema, stypeIn, symbols) {
-    this._subscriptions.push({ schema, stypeIn, symbols });
+  subscribe(schema, stypeIn, symbols, start) {
+    this._subscriptions.push({ schema, stypeIn, symbols, start });
     return this;
   }
 
-  /**
-   * Connect to the Databento Live Subscription Gateway.
-   * @param {string} [dataset='OPRA.PILLAR'] - Dataset to connect to
-   */
   connect(dataset = 'OPRA.PILLAR') {
     if (!config.databentoApiKey) {
-      console.warn('[DatabentoLive] No API key configured — skipping live connection');
+      console.warn('[DatabentoLive] No API key configured — skipping');
       return;
     }
     if (!config.databentoLive) {
       console.log('[DatabentoLive] Live streaming disabled (set DATABENTO_LIVE=true to enable)');
       return;
     }
-
     this._dataset = dataset;
-    // Build hostname: OPRA.PILLAR → opra-pillar.lsg.databento.com
     this._hostname = dataset.toLowerCase().replace(/\./g, '-') + '.lsg.databento.com';
-
     console.log(`[DatabentoLive] Connecting to ${this._hostname}:${LSG_PORT}...`);
     this._doConnect();
   }
 
   disconnect() {
-    if (this._reconnectTimer) {
-      clearTimeout(this._reconnectTimer);
-      this._reconnectTimer = null;
-    }
+    this._stopHeartbeatMonitor();
+    if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     this._state = 'disconnected';
-    if (this._socket) {
-      this._socket.destroy();
-      this._socket = null;
-    }
+    if (this._socket) { this._socket.destroy(); this._socket = null; }
     this._stats.connected = false;
     console.log('[DatabentoLive] Disconnected');
   }
@@ -379,15 +396,13 @@ class DatabentoLive extends EventEmitter {
       state: this._state,
       sessionId: this._sessionId,
       lsgVersion: this._lsgVersion,
+      dbnVersion: this._dbnVersion,
       subscriptions: this._subscriptions.length,
       instruments: this._instruments.size,
       ...this._stats,
     };
   }
 
-  /**
-   * Look up an instrument definition by ID.
-   */
   getInstrument(instrumentId) {
     return this._instruments.get(instrumentId);
   }
@@ -407,11 +422,12 @@ class DatabentoLive extends EventEmitter {
 
     socket.on('connect', () => {
       console.log(`[DatabentoLive] TCP connected to ${this._hostname}:${LSG_PORT}`);
-      socket.setTimeout(0); // Remove connect timeout
+      socket.setTimeout(0);
     });
 
     socket.on('data', (chunk) => {
       this._stats.bytesReceived += chunk.length;
+      this._lastMessageAt = Date.now();
       this._buffer = Buffer.concat([this._buffer, chunk]);
       this._processBuffer();
     });
@@ -426,10 +442,9 @@ class DatabentoLive extends EventEmitter {
       this._state = 'disconnected';
       this._stats.connected = false;
       this._socket = null;
+      this._stopHeartbeatMonitor();
       console.warn('[DatabentoLive] Connection closed');
       this.emit('disconnected');
-
-      // Auto-reconnect if we were streaming (not a manual disconnect)
       if (wasStreaming || this._reconnectAttempt > 0) {
         this._scheduleReconnect();
       }
@@ -445,13 +460,8 @@ class DatabentoLive extends EventEmitter {
 
   _scheduleReconnect() {
     if (this._reconnectTimer) return;
-
     this._reconnectAttempt++;
-    const delay = Math.min(
-      RECONNECT_BASE_MS * Math.pow(2, this._reconnectAttempt - 1),
-      RECONNECT_MAX_MS
-    );
-
+    const delay = Math.min(RECONNECT_BASE_MS * Math.pow(2, this._reconnectAttempt - 1), RECONNECT_MAX_MS);
     console.log(`[DatabentoLive] Reconnecting in ${delay}ms (attempt ${this._reconnectAttempt})...`);
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
@@ -459,86 +469,87 @@ class DatabentoLive extends EventEmitter {
     }, delay);
   }
 
+  // ── Heartbeat Monitor ────────────────────────────────────────────────
+  // Per Databento docs: disconnect if no message for heartbeat_interval + 10s
+
+  _startHeartbeatMonitor() {
+    this._stopHeartbeatMonitor();
+    const timeoutMs = (HEARTBEAT_INTERVAL_S + HEARTBEAT_TIMEOUT_MARGIN_S) * 1000;
+    this._heartbeatTimer = setInterval(() => {
+      const gap = Date.now() - this._lastMessageAt;
+      if (gap > timeoutMs) {
+        console.error(`[DatabentoLive] Heartbeat timeout (${Math.round(gap / 1000)}s silence). Reconnecting...`);
+        if (this._socket) this._socket.destroy();
+      }
+    }, 5000); // Check every 5s
+  }
+
+  _stopHeartbeatMonitor() {
+    if (this._heartbeatTimer) { clearInterval(this._heartbeatTimer); this._heartbeatTimer = null; }
+  }
+
   // ── Internal: Buffer Processing ──────────────────────────────────────
 
   _processBuffer() {
-    // During handshake, process text lines
     if (this._state !== 'streaming') {
       this._processControlMessages();
       return;
     }
-
-    // During streaming, first handle metadata then records
     if (!this._metadataParsed) {
       this._processMetadata();
       return;
     }
-
     this._processRecords();
   }
 
   _processControlMessages() {
-    // Control messages are text lines delimited by \n
     while (true) {
-      const nlIndex = this._buffer.indexOf(0x0A); // \n
-      if (nlIndex < 0) return; // Need more data
-
+      const nlIndex = this._buffer.indexOf(0x0A);
+      if (nlIndex < 0) return;
       const line = this._buffer.subarray(0, nlIndex).toString('utf-8').trim();
       this._buffer = this._buffer.subarray(nlIndex + 1);
-
       if (!line) continue;
 
-      // Parse pipe-delimited key=value pairs
       const fields = {};
       for (const token of line.split('|')) {
         const eqIdx = token.indexOf('=');
-        if (eqIdx >= 0) {
-          fields[token.slice(0, eqIdx)] = token.slice(eqIdx + 1);
-        } else {
-          // Handle bare keys like "start_session"
-          fields[token] = '';
-        }
+        if (eqIdx >= 0) fields[token.slice(0, eqIdx)] = token.slice(eqIdx + 1);
+        else fields[token] = '';
       }
-
       this._handleControlMessage(fields);
     }
   }
 
   _handleControlMessage(fields) {
     if (fields.lsg_version !== undefined) {
-      // Greeting
       this._lsgVersion = fields.lsg_version;
       this._state = 'challenge';
       console.log(`[DatabentoLive] Gateway version: ${this._lsgVersion}`);
-    } else if (fields.cram !== undefined) {
-      // Challenge — compute and send auth response
-      const challenge = fields.cram;
-      const cramResponse = computeCramResponse(challenge, config.databentoApiKey);
 
+    } else if (fields.cram !== undefined) {
+      const cramResponse = computeCramResponse(fields.cram, config.databentoApiKey);
+      // Include heartbeat_interval_s for reliable timeout detection
       const authMsg = [
         `auth=${cramResponse}`,
         `dataset=${this._dataset}`,
         `encoding=dbn`,
         `ts_out=0`,
+        `heartbeat_interval_s=${HEARTBEAT_INTERVAL_S}`,
         `client=Billy/1.0 Node.js/${process.version}`,
       ].join('|') + '\n';
-
       this._state = 'authenticating';
       this._socket.write(authMsg);
-      console.log('[DatabentoLive] Sent CRAM authentication');
+      console.log('[DatabentoLive] Sent CRAM authentication (heartbeat=30s)');
+
     } else if (fields.success !== undefined) {
-      // Auth response
       if (fields.success === '1') {
         this._sessionId = fields.session_id;
         this._reconnectAttempt = 0;
         console.log(`[DatabentoLive] Authenticated! Session: ${this._sessionId}`);
-
-        // Send subscriptions
         this._sendSubscriptions();
       } else {
-        const errMsg = fields.error || 'Unknown auth error';
-        console.error(`[DatabentoLive] Authentication failed: ${errMsg}`);
-        this.emit('error', new Error(`Auth failed: ${errMsg}`));
+        console.error(`[DatabentoLive] Auth failed: ${fields.error || 'Unknown'}`);
+        this.emit('error', new Error(`Auth failed: ${fields.error}`));
         this._socket.destroy();
       }
     }
@@ -546,36 +557,48 @@ class DatabentoLive extends EventEmitter {
 
   _sendSubscriptions() {
     if (this._subscriptions.length === 0) {
-      // Default subscriptions for Billy's use cases
+      // Default: subscribe to everything Billy needs for SPY + QQQ + IWM options
+      // start=0 for definitions + statistics replays all data from session start
+      // (gets full instrument universe + OI published pre-market before 9:30 ET)
+      const syms = ['SPY.OPT', 'QQQ.OPT', 'IWM.OPT'];
       this._subscriptions = [
-        { schema: 'trades', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'cbbo-1s', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'statistics', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
-        { schema: 'definition', stypeIn: 'parent', symbols: ['SPY.OPT', 'QQQ.OPT'] },
+        { schema: 'trades', stypeIn: 'parent', symbols: syms },
+        { schema: 'cbbo-1s', stypeIn: 'parent', symbols: syms },
+        { schema: 'statistics', stypeIn: 'parent', symbols: syms, start: 0 },
+        { schema: 'definition', stypeIn: 'parent', symbols: syms, start: 0 },
       ];
     }
 
     for (const sub of this._subscriptions) {
-      const symbolStr = Array.isArray(sub.symbols) ? sub.symbols.join(',') : sub.symbols;
-      const msg = `schema=${sub.schema}|stype_in=${sub.stypeIn}|symbols=${symbolStr}\n`;
-      this._socket.write(msg);
-      console.log(`[DatabentoLive] Subscribed: ${sub.schema} → ${symbolStr}`);
+      const allSymbols = Array.isArray(sub.symbols) ? sub.symbols : [sub.symbols];
+
+      // Batch symbols in chunks of 500 per Databento protocol
+      for (let i = 0; i < allSymbols.length; i += SYMBOL_BATCH_SIZE) {
+        const chunk = allSymbols.slice(i, i + SYMBOL_BATCH_SIZE);
+        const isLast = (i + SYMBOL_BATCH_SIZE >= allSymbols.length) ? 1 : 0;
+        let msg = `schema=${sub.schema}|stype_in=${sub.stypeIn}|symbols=${chunk.join(',')}`;
+        // start=0 replays all data from the current session (definitions + OI history)
+        if (sub.start !== undefined) msg += `|start=${sub.start}`;
+        msg += `|is_last=${isLast}\n`;
+        this._socket.write(msg);
+      }
+      console.log(`[DatabentoLive] Subscribed: ${sub.schema} → ${allSymbols.join(',')}`);
     }
 
-    // Start the session — switches to binary DBN stream
+    // Start session — switches from text to binary DBN stream
     this._socket.write('start_session\n');
     this._state = 'streaming';
     this._stats.connected = true;
     this._stats.connectedAt = new Date();
+    this._lastMessageAt = Date.now();
+    this._startHeartbeatMonitor();
     console.log('[DatabentoLive] Session started — streaming binary DBN data');
     this.emit('connected', { sessionId: this._sessionId });
   }
 
   _processMetadata() {
-    // Need at least 8 bytes for the prelude
     if (this._buffer.length < 8) return;
 
-    // Check magic bytes
     const magic = this._buffer.subarray(0, 3).toString('ascii');
     if (magic !== 'DBN') {
       console.error(`[DatabentoLive] Invalid DBN magic: ${magic}`);
@@ -585,26 +608,20 @@ class DatabentoLive extends EventEmitter {
 
     const version = this._buffer.readUInt8(3);
     const metadataLen = this._buffer.readUInt32LE(4);
-
-    // Need full metadata
     const totalMetaBytes = 8 + metadataLen;
     if (this._buffer.length < totalMetaBytes) return;
 
-    // Parse key metadata fields — layout differs between DBN v1 and v2+
     const metaBuf = this._buffer.subarray(8, 8 + metadataLen);
     const dataset = metaBuf.subarray(0, 16).toString('ascii').replace(/\0/g, '').trim();
-    const schema = metaBuf.readUInt16LE(16);
 
     let tsOut, symbolCstrLen;
     if (version === 1) {
-      // DBN v1: has 8-byte record_count at offset 34, shifts stype/tsOut down
-      // tsOut is at offset 52, no symbol_cstr_len field (default 22)
-      tsOut = metaBuf.readUInt8(52);
+      // V1: no symbol_cstr_len field; tsOut shifted by 8 bytes (record_count at 34)
+      tsOut = metadataLen > 52 ? metaBuf.readUInt8(52) : 0;
       symbolCstrLen = 22;
     } else {
-      // DBN v2+: tsOut at offset 44, symbol_cstr_len at offset 45
-      tsOut = metaBuf.readUInt8(44);
-      symbolCstrLen = metaBuf.readUInt16LE(45);
+      tsOut = metadataLen > 44 ? metaBuf.readUInt8(44) : 0;
+      symbolCstrLen = metadataLen > 46 ? metaBuf.readUInt16LE(45) : 71;
       if (symbolCstrLen === 0 || symbolCstrLen === 0xFFFF) symbolCstrLen = 71;
     }
 
@@ -612,13 +629,10 @@ class DatabentoLive extends EventEmitter {
     this._tsOut = tsOut === 1;
     this._symbolCstrLen = symbolCstrLen;
 
-    console.log(`[DatabentoLive] DBN v${version} metadata: dataset=${dataset}, symbolLen=${this._symbolCstrLen}, tsOut=${this._tsOut}`);
+    console.log(`[DatabentoLive] DBN v${version} metadata: dataset=${dataset}, symbolLen=${symbolCstrLen}, tsOut=${this._tsOut}`);
 
-    // Consume metadata from buffer
     this._buffer = this._buffer.subarray(totalMetaBytes);
     this._metadataParsed = true;
-
-    // Now process any records already in the buffer
     this._processRecords();
   }
 
@@ -628,22 +642,18 @@ class DatabentoLive extends EventEmitter {
       const recordSize = lengthWord * LENGTH_MULTIPLIER;
 
       if (recordSize < 16) {
-        // Malformed — skip this byte
         this._buffer = this._buffer.subarray(1);
         continue;
       }
-
-      if (this._buffer.length < recordSize) return; // Need more data
+      if (this._buffer.length < recordSize) return;
 
       const rtype = this._buffer.readUInt8(1);
-
       try {
         this._dispatchRecord(rtype, this._buffer, 0, recordSize);
       } catch (err) {
-        console.error(`[DatabentoLive] Record parse error (rtype=0x${rtype.toString(16)}): ${err.message}`);
+        console.error(`[DatabentoLive] Record parse error (rtype=0x${rtype.toString(16)}, size=${recordSize}): ${err.message}`);
       }
 
-      // Advance past this record
       this._buffer = this._buffer.subarray(recordSize);
       this._stats.recordsReceived++;
       this._stats.lastRecordAt = new Date();
@@ -658,29 +668,33 @@ class DatabentoLive extends EventEmitter {
         this.emit('trade', this._enrichWithInstrument(trade));
         break;
       }
-
-      case RTYPE.MBP1:
-      case RTYPE.CMBP1:
-      case RTYPE.CBBO_1S:
-      case RTYPE.CBBO_1M:
-      case RTYPE.TCBBO:
-      case RTYPE.BBO_1S:
-      case RTYPE.BBO_1M: {
+      case RTYPE.MBP1: case RTYPE.CMBP1: case RTYPE.CBBO_1S:
+      case RTYPE.CBBO_1M: case RTYPE.TCBBO: case RTYPE.BBO_1S: case RTYPE.BBO_1M: {
         const quote = parseQuote(buf, off);
         this._stats.quotesReceived++;
+        // Track latest BBO per instrument for live chain building
+        if (quote.level) {
+          const { bidPx, askPx, bidSz, askSz } = quote.level;
+          if (bidPx > 0 || askPx > 0) {
+            this._quotes.set(quote.instrumentId, { bid: bidPx, ask: askPx, bidSz, askSz });
+          }
+        }
         this.emit('quote', this._enrichWithInstrument(quote));
         break;
       }
-
       case RTYPE.STATISTICS: {
         const stat = parseStat(buf, off);
         this._stats.statsReceived++;
+        // Track OI per instrument for live chain building
+        if (stat.statType === STAT_OPEN_INTEREST) {
+          const oi = Number(stat.quantity);
+          if (oi > 0) this._oi.set(stat.instrumentId, oi);
+        }
         this.emit('statistic', this._enrichWithInstrument(stat));
         break;
       }
-
       case RTYPE.DEFINITION: {
-        // v1 InstrumentDef is ~332 bytes, v2+ is ~520 bytes
+        // V1 ~332 bytes, V2+ ~520 bytes — accept anything with raw_symbol
         if (size >= 220) {
           const def = parseInstrumentDef(buf, off, size, this._dbnVersion);
           this._stats.defsReceived++;
@@ -689,17 +703,11 @@ class DatabentoLive extends EventEmitter {
         }
         break;
       }
-
-      case RTYPE.OHLCV_1S:
-      case RTYPE.OHLCV_1M:
-      case RTYPE.OHLCV_1H:
-      case RTYPE.OHLCV_1D:
-      case RTYPE.OHLCV_EOD: {
-        const ohlcv = parseOhlcv(buf, off);
-        this.emit('ohlcv', this._enrichWithInstrument(ohlcv));
+      case RTYPE.OHLCV_1S: case RTYPE.OHLCV_1M: case RTYPE.OHLCV_1H:
+      case RTYPE.OHLCV_1D: case RTYPE.OHLCV_EOD: {
+        this.emit('ohlcv', this._enrichWithInstrument(parseOhlcv(buf, off)));
         break;
       }
-
       case RTYPE.ERROR: {
         if (size >= 320) {
           const err = parseError(buf, off);
@@ -709,26 +717,17 @@ class DatabentoLive extends EventEmitter {
         }
         break;
       }
-
       case RTYPE.SYSTEM: {
         if (size >= 320) {
           const sys = parseSystem(buf, off);
-          // Code 0 = heartbeat (suppress log noise)
-          if (sys.code !== 0) {
-            console.log(`[DatabentoLive] System: ${sys.message} (code=${sys.code})`);
-          }
+          if (sys.message) console.log(`[DatabentoLive] System: ${sys.message} (code=${sys.code})`);
           this.emit('system', sys);
         }
         break;
       }
-
-      // Ignore other types silently
     }
   }
 
-  /**
-   * Enrich a record with instrument metadata if available.
-   */
   _enrichWithInstrument(record) {
     const def = this._instruments.get(record.instrumentId);
     if (def) {
@@ -741,26 +740,345 @@ class DatabentoLive extends EventEmitter {
     }
     return record;
   }
+
+  // ── Live Options Chain Builder ─────────────────────────────────────────
+  // Build a complete options chain from accumulated live stream data.
+  // Uses definitions, OI, and quotes collected during the session.
+
+  /**
+   * Get available expiration dates for a ticker from live instrument definitions.
+   * @param {string} ticker
+   * @returns {string[]} Sorted YYYY-MM-DD dates
+   */
+  getExpirations(ticker) {
+    const upper = ticker.toUpperCase();
+    const today = new Date().toISOString().slice(0, 10);
+    const exps = new Set();
+    for (const def of this._instruments.values()) {
+      if (def.underlying === upper && def.expirationDate && def.expirationDate >= today) {
+        exps.add(def.expirationDate);
+      }
+    }
+    return [...exps].sort();
+  }
+
+  /**
+   * Build a normalized options chain from live stream data.
+   * Includes OI from stat events and mid-price from quotes.
+   *
+   * @param {string} ticker
+   * @param {string} expirationDate - YYYY-MM-DD
+   * @returns {object[]} Contracts with strike, type, OI, bid, ask, midPrice
+   */
+  getOptionsChain(ticker, expirationDate) {
+    const upper = ticker.toUpperCase();
+    const contracts = [];
+
+    for (const [instrId, def] of this._instruments) {
+      if (def.underlying !== upper) continue;
+      if (def.expirationDate !== expirationDate) continue;
+      if (!def.optionType || !def.strikePrice) continue;
+
+      const oi = this._oi.get(instrId) || 0;
+      const quote = this._quotes.get(instrId) || { bid: 0, ask: 0, bidSz: 0, askSz: 0 };
+      const mid = quote.bid > 0 && quote.ask > 0 ? (quote.bid + quote.ask) / 2 : 0;
+
+      contracts.push({
+        symbol: def.rawSymbol,
+        ticker: upper,
+        strike: def.strikePrice,
+        expiration: expirationDate,
+        type: def.optionType,
+        openInterest: oi,
+        volume: 0,
+        lastPrice: mid,
+        bid: quote.bid,
+        ask: quote.ask,
+        bidSize: quote.bidSz,
+        askSize: quote.askSz,
+        // No greeks from OPRA — caller must compute via BS
+        delta: 0, gamma: 0, theta: 0, vega: 0,
+        impliedVolatility: 0,
+        _source: 'databento-live',
+      });
+    }
+
+    contracts.sort((a, b) => a.strike - b.strike);
+    return contracts;
+  }
+
+  /**
+   * Check if we have enough live data to build a meaningful chain.
+   * With start=0 subscription, definitions + OI replay from session start,
+   * so data accumulates quickly after connection.
+   */
+  hasDataFor(ticker) {
+    if (!this.connected) return false;
+    // Allow at least 10 seconds for the session replay to arrive
+    const connectedAt = this._stats.connectedAt;
+    if (connectedAt && (Date.now() - connectedAt.getTime()) < 10000) return false;
+
+    const upper = ticker.toUpperCase();
+    let defCount = 0;
+    let oiCount = 0;
+    for (const [instrId, def] of this._instruments) {
+      if (def.underlying === upper) {
+        defCount++;
+        if (this._oi.has(instrId)) oiCount++;
+      }
+    }
+    // With start=0 replay we get the full instrument universe quickly.
+    // Need at least 20 definitions (some OI may be sparse during off-hours).
+    // If we have definitions but no OI, still allow it — gamma can be estimated from quotes alone.
+    return defCount >= 20 && (oiCount >= 5 || defCount >= 100);
+  }
 }
 
-// ── Singleton + Flow Tracker ──────────────────────────────────────────
+// ── HFT Signal Engine ─────────────────────────────────────────────────
+// Techniques from Databento's HFT blog series:
+//   - Book skew (bid/ask size imbalance) — primary alpha signal
+//   - VWAP tracking — reference price for directional conviction
+//   - Trade aggression ratio — buyer vs seller initiated volume
+//   - Intermarket sweep detection — institutional urgency indicator
+//   - Volume anomaly detection — unusual activity flagging
 
-/**
- * Real-time order flow tracker.
- * Aggregates trades from the live stream into rolling flow metrics
- * that the rest of Billy's pipeline can query.
- */
-class LiveFlowTracker {
+class HftSignalEngine {
   constructor(liveClient) {
     this._live = liveClient;
-    this._flows = new Map(); // ticker → flow state
 
-    // Rolling window config
-    this._windowMs = 15 * 60 * 1000; // 15 minutes
+    // Per-underlying state
+    this._book = new Map();       // underlying → { bidSz, askSz, skew, midPx }
+    this._vwap = new Map();       // underlying → { cumPV, cumVol, vwap }
+    this._aggression = new Map(); // underlying → { buyVol, sellVol, ratio }
 
-    // Wire up trade events
-    this._live.on('trade', (trade) => this._onTrade(trade));
-    this._live.on('statistic', (stat) => this._onStat(stat));
+    // Sweep detection buffers (instrumentId → recent trades within window)
+    this._sweepBuffer = new Map();
+    this._sweepFlushTimer = null;
+
+    // Wire events
+    this._live.on('quote', (q) => this._onQuote(q));
+    this._live.on('trade', (t) => this._onTradeSignal(t));
+    this._live.on('connected', () => this._startSweepFlush());
+    this._live.on('disconnected', () => this._stopSweepFlush());
+  }
+
+  // ── Book Skew Signal ──────────────────────────────────────────
+  // log(bid_sz) - log(ask_sz) > 0 → more resting bids → upward pressure
+  // From: https://databento.com/blog/hft-sklearn-python
+
+  _onQuote(quote) {
+    if (!quote.underlying || !quote.level) return;
+    const { bidSz, askSz, bidPx, askPx } = quote.level;
+    if (!bidSz || !askSz || !bidPx || !askPx) return;
+
+    const ticker = quote.underlying;
+    const skew = Math.log(bidSz) - Math.log(askSz);
+    const midPx = (bidPx + askPx) / 2;
+
+    const prev = this._book.get(ticker);
+    this._book.set(ticker, { bidSz, askSz, bidPx, askPx, skew, midPx, ts: Date.now() });
+
+    // Emit signal on significant skew change (threshold from Databento HFT example: 1.7)
+    if (prev && Math.abs(skew) > 1.0 && Math.sign(skew) !== Math.sign(prev.skew || 0)) {
+      this._live.emit('signal', {
+        type: 'book_skew_flip',
+        ticker,
+        skew: +skew.toFixed(3),
+        direction: skew > 0 ? 'BULLISH' : 'BEARISH',
+        bidSz, askSz, midPx,
+        time: Date.now(),
+      });
+    }
+  }
+
+  // ── VWAP + Aggression Tracking ──────────────────────────────────
+  // Running VWAP: cumulative(price * volume) / cumulative(volume)
+  // Trade aggression: 'A' = buyer crosses spread, 'B' = seller crosses
+
+  _onTradeSignal(trade) {
+    if (!trade.underlying || !trade.price || !trade.size) return;
+    const ticker = trade.underlying;
+
+    // VWAP update
+    let v = this._vwap.get(ticker);
+    if (!v) { v = { cumPV: 0, cumVol: 0, vwap: 0 }; this._vwap.set(ticker, v); }
+    v.cumPV += trade.price * trade.size;
+    v.cumVol += trade.size;
+    v.vwap = v.cumPV / v.cumVol;
+
+    // Aggression tracking
+    let agg = this._aggression.get(ticker);
+    if (!agg) { agg = { buyVol: 0, sellVol: 0, ratio: 0.5 }; this._aggression.set(ticker, agg); }
+    if (trade.side === 'A') agg.buyVol += trade.size;
+    else if (trade.side === 'B') agg.sellVol += trade.size;
+    const totalVol = agg.buyVol + agg.sellVol;
+    agg.ratio = totalVol > 0 ? agg.buyVol / totalVol : 0.5;
+
+    // Sweep detection: buffer trades by instrumentId
+    const instId = trade.instrumentId;
+    let buf = this._sweepBuffer.get(instId);
+    if (!buf) { buf = []; this._sweepBuffer.set(instId, buf); }
+    buf.push({
+      publisherId: trade.publisherId,
+      price: trade.price,
+      size: trade.size,
+      side: trade.side,
+      time: Date.now(),
+      underlying: ticker,
+      strike: trade.strike,
+      optionType: trade.optionType,
+      expirationDate: trade.expirationDate,
+    });
+  }
+
+  // ── Sweep Detection ─────────────────────────────────────────────
+  // Intermarket sweep: same options series trades across multiple
+  // exchanges within 100ms. Indicates institutional urgency.
+  // Source: https://databento.com/blog/opra-data
+
+  _startSweepFlush() {
+    this._stopSweepFlush();
+    this._sweepFlushTimer = setInterval(() => this._flushSweeps(), 200);
+  }
+
+  _stopSweepFlush() {
+    if (this._sweepFlushTimer) { clearInterval(this._sweepFlushTimer); this._sweepFlushTimer = null; }
+  }
+
+  _flushSweeps() {
+    const now = Date.now();
+    const cutoff = now - SWEEP_WINDOW_MS;
+
+    for (const [instId, trades] of this._sweepBuffer) {
+      // Remove stale trades
+      while (trades.length > 0 && trades[0].time < cutoff) trades.shift();
+      if (trades.length === 0) { this._sweepBuffer.delete(instId); continue; }
+
+      // Check for sweep: 3+ trades from 2+ different publishers within the window
+      if (trades.length >= 3) {
+        const publishers = new Set(trades.map(t => t.publisherId));
+        if (publishers.size >= 2) {
+          const totalSize = trades.reduce((s, t) => s + t.size, 0);
+          const totalPremium = trades.reduce((s, t) => s + t.price * t.size * 100, 0);
+          const sample = trades[0];
+
+          // Only emit if premium is meaningful ($25K+)
+          if (totalPremium >= 25_000) {
+            this._live.emit('sweep', {
+              instrumentId: instId,
+              underlying: sample.underlying,
+              strike: sample.strike,
+              optionType: sample.optionType,
+              expirationDate: sample.expirationDate,
+              legs: trades.length,
+              exchanges: publishers.size,
+              totalSize,
+              totalPremium: Math.round(totalPremium),
+              side: trades.filter(t => t.side === 'A').length > trades.length / 2 ? 'buy' : 'sell',
+              time: now,
+            });
+          }
+
+          // Clear buffer after emission to avoid double-counting
+          trades.length = 0;
+        }
+      }
+    }
+  }
+
+  // ── Query Methods ───────────────────────────────────────────────
+
+  getBookState(ticker) {
+    return this._book.get(ticker.toUpperCase()) || null;
+  }
+
+  getVwap(ticker) {
+    const v = this._vwap.get(ticker.toUpperCase());
+    return v ? v.vwap : null;
+  }
+
+  getAggression(ticker) {
+    return this._aggression.get(ticker.toUpperCase()) || null;
+  }
+
+  /**
+   * Get a composite signal summary for a ticker.
+   * Combines book skew + VWAP position + aggression into a single conviction score.
+   */
+  getSignal(ticker) {
+    const tk = ticker.toUpperCase();
+    const book = this._book.get(tk);
+    const vwap = this._vwap.get(tk);
+    const agg = this._aggression.get(tk);
+
+    if (!book && !vwap && !agg) return null;
+
+    let bullScore = 0, bearScore = 0;
+
+    // Book skew contribution (-2 to +2)
+    if (book && book.skew) {
+      const clamped = Math.max(-2, Math.min(2, book.skew));
+      if (clamped > 0) bullScore += clamped;
+      else bearScore += Math.abs(clamped);
+    }
+
+    // VWAP position contribution (-1 to +1)
+    if (book && vwap && vwap.vwap > 0 && book.midPx > 0) {
+      const vwapDelta = (book.midPx - vwap.vwap) / vwap.vwap;
+      if (vwapDelta > 0.001) bullScore += Math.min(1, vwapDelta * 100);
+      else if (vwapDelta < -0.001) bearScore += Math.min(1, Math.abs(vwapDelta) * 100);
+    }
+
+    // Aggression contribution (-1 to +1)
+    if (agg) {
+      const aggressorBias = (agg.ratio - 0.5) * 2; // -1 to +1
+      if (aggressorBias > 0.1) bullScore += Math.min(1, aggressorBias);
+      else if (aggressorBias < -0.1) bearScore += Math.min(1, Math.abs(aggressorBias));
+    }
+
+    const netScore = bullScore - bearScore;
+    return {
+      ticker: tk,
+      bookSkew: book ? +book.skew.toFixed(3) : null,
+      vwap: vwap ? +vwap.vwap.toFixed(4) : null,
+      midPx: book ? +book.midPx.toFixed(4) : null,
+      aggressionRatio: agg ? +agg.ratio.toFixed(3) : null,
+      buyVolume: agg ? agg.buyVol : 0,
+      sellVolume: agg ? agg.sellVol : 0,
+      bullScore: +bullScore.toFixed(2),
+      bearScore: +bearScore.toFixed(2),
+      netScore: +netScore.toFixed(2),
+      direction: Math.abs(netScore) < 0.3 ? 'NEUTRAL' : netScore > 0 ? 'BULLISH' : 'BEARISH',
+      confidence: Math.min(1, Math.abs(netScore) / 3).toFixed(2),
+    };
+  }
+
+  /**
+   * Reset all signal state (e.g. at market open).
+   */
+  reset() {
+    this._book.clear();
+    this._vwap.clear();
+    this._aggression.clear();
+    this._sweepBuffer.clear();
+  }
+}
+
+// ── LiveFlowTracker ───────────────────────────────────────────────────
+// Aggregates trades into rolling flow metrics compatible with
+// databento.js getOrderFlow() for the rest of Billy's pipeline.
+
+class LiveFlowTracker {
+  constructor(liveClient, signalEngine) {
+    this._live = liveClient;
+    this._signals = signalEngine;
+    this._flows = new Map();
+    this._sweeps = [];           // Recent sweeps across all tickers
+    this._windowMs = 15 * 60 * 1000;
+
+    this._live.on('trade', (t) => this._onTrade(t));
+    this._live.on('statistic', (s) => this._onStat(s));
+    this._live.on('sweep', (sw) => this._onSweep(sw));
   }
 
   _onTrade(trade) {
@@ -768,17 +1086,13 @@ class LiveFlowTracker {
 
     const ticker = trade.underlying;
     let flow = this._flows.get(ticker);
-    if (!flow) {
-      flow = this._emptyFlow(ticker);
-      this._flows.set(ticker, flow);
-    }
+    if (!flow) { flow = this._emptyFlow(ticker); this._flows.set(ticker, flow); }
 
     const premium = trade.price * trade.size * (trade.multiplier || 100);
-    const isBuy = trade.side === 'A'; // 'A' = at ask = buyer-initiated
-    const isSell = trade.side === 'B'; // 'B' = at bid = seller-initiated
+    const isBuy = trade.side === 'A';
+    const isSell = trade.side === 'B';
     const signedPremium = isBuy ? premium : isSell ? -premium : 0;
 
-    // Track running totals
     flow.tradeCount++;
 
     if (trade.optionType === 'call') {
@@ -789,7 +1103,7 @@ class LiveFlowTracker {
       flow.putPremium += signedPremium;
     }
 
-    // Track large blocks ($50K+ notional)
+    // Large blocks ($50K+ notional)
     if (Math.abs(premium) >= 50_000) {
       flow.largeBlocks.push({
         strike: trade.strike,
@@ -801,65 +1115,63 @@ class LiveFlowTracker {
         side: isBuy ? 'buy' : isSell ? 'sell' : 'unknown',
         time: Date.now(),
       });
-      // Cap stored blocks
-      if (flow.largeBlocks.length > 100) {
-        flow.largeBlocks = flow.largeBlocks.slice(-100);
-      }
+      if (flow.largeBlocks.length > 100) flow.largeBlocks = flow.largeBlocks.slice(-100);
     }
 
-    // Track per-strike volume
+    // Per-strike volume
     if (trade.strike) {
-      const key = trade.strike;
-      const sv = flow.strikeVolume.get(key) || { calls: 0, puts: 0, premium: 0 };
+      const sv = flow.strikeVolume.get(trade.strike) || { calls: 0, puts: 0, premium: 0 };
       if (trade.optionType === 'call') sv.calls += trade.size;
       else if (trade.optionType === 'put') sv.puts += trade.size;
       sv.premium += Math.abs(premium);
-      flow.strikeVolume.set(key, sv);
+      flow.strikeVolume.set(trade.strike, sv);
     }
 
     flow.lastUpdate = Date.now();
   }
 
   _onStat(stat) {
-    if (stat.statType !== STAT_OPEN_INTEREST) return;
-    if (!stat.underlying) return;
-
-    const ticker = stat.underlying;
-    let flow = this._flows.get(ticker);
-    if (!flow) {
-      flow = this._emptyFlow(ticker);
-      this._flows.set(ticker, flow);
-    }
-
-    // Update OI for this instrument
+    if (stat.statType !== STAT_OPEN_INTEREST || !stat.underlying) return;
+    let flow = this._flows.get(stat.underlying);
+    if (!flow) { flow = this._emptyFlow(stat.underlying); this._flows.set(stat.underlying, flow); }
     flow.oiUpdates.set(stat.instrumentId, Number(stat.quantity));
     flow.lastUpdate = Date.now();
   }
 
+  _onSweep(sweep) {
+    this._sweeps.push(sweep);
+    if (this._sweeps.length > 200) this._sweeps = this._sweeps.slice(-200);
+
+    // Also track in flow state
+    if (sweep.underlying) {
+      let flow = this._flows.get(sweep.underlying);
+      if (!flow) { flow = this._emptyFlow(sweep.underlying); this._flows.set(sweep.underlying, flow); }
+      flow.sweeps.push(sweep);
+      if (flow.sweeps.length > 50) flow.sweeps = flow.sweeps.slice(-50);
+    }
+  }
+
   _emptyFlow(ticker) {
     return {
-      ticker,
-      tradeCount: 0,
-      callVolume: 0,
-      putVolume: 0,
-      callPremium: 0,
-      putPremium: 0,
-      largeBlocks: [],
-      strikeVolume: new Map(),
-      oiUpdates: new Map(),
+      ticker, tradeCount: 0,
+      callVolume: 0, putVolume: 0, callPremium: 0, putPremium: 0,
+      largeBlocks: [], sweeps: [],
+      strikeVolume: new Map(), oiUpdates: new Map(),
       lastUpdate: Date.now(),
     };
   }
 
   /**
-   * Get current flow metrics for a ticker.
-   * Compatible format with databento.js getOrderFlow().
+   * Get flow metrics + HFT signals for a ticker.
+   * Drop-in compatible with databento.js getOrderFlow() output format.
    */
   getFlow(ticker) {
-    const flow = this._flows.get(ticker.toUpperCase());
+    const tk = ticker.toUpperCase();
+    const flow = this._flows.get(tk);
     if (!flow) return null;
 
     const netFlow = Math.round(flow.callPremium + flow.putPremium);
+    const cutoff = Date.now() - this._windowMs;
 
     // Top strikes by volume
     const topStrikes = [...flow.strikeVolume.entries()]
@@ -867,9 +1179,11 @@ class LiveFlowTracker {
       .slice(0, 10)
       .map(([strike, data]) => ({ strike, ...data }));
 
-    // Recent large blocks (last 15min)
-    const cutoff = Date.now() - this._windowMs;
     const recentBlocks = flow.largeBlocks.filter(b => b.time >= cutoff);
+    const recentSweeps = flow.sweeps.filter(s => s.time >= cutoff);
+
+    // Get HFT signal state
+    const signal = this._signals.getSignal(tk);
 
     return {
       ticker: flow.ticker,
@@ -884,19 +1198,37 @@ class LiveFlowTracker {
       pcVolumeRatio: flow.callVolume > 0 ? (flow.putVolume / flow.callVolume).toFixed(2) : 'N/A',
       largeBlocks: recentBlocks.slice(-20),
       topStrikes,
+
+      // HFT signals (from Databento blog techniques)
+      sweeps: recentSweeps.slice(-10),
+      sweepCount: recentSweeps.length,
+      bookSkew: signal?.bookSkew ?? null,
+      vwap: signal?.vwap ?? null,
+      aggressionRatio: signal?.aggressionRatio ?? null,
+      hftDirection: signal?.direction ?? null,
+      hftConfidence: signal?.confidence ?? null,
+      hftScore: signal?.netScore ?? null,
+
       _source: 'databento-live',
       _live: true,
     };
   }
 
   /**
-   * Reset flow counters for a ticker (e.g. at market open).
+   * Get recent sweeps across all tickers (for institutional flow dashboard).
    */
+  getRecentSweeps(limit = 20) {
+    const cutoff = Date.now() - this._windowMs;
+    return this._sweeps.filter(s => s.time >= cutoff).slice(-limit);
+  }
+
   reset(ticker) {
     if (ticker) {
       this._flows.delete(ticker.toUpperCase());
+      this._signals.reset();
     } else {
       this._flows.clear();
+      this._signals.reset();
     }
   }
 }
@@ -904,14 +1236,38 @@ class LiveFlowTracker {
 // ── Module Export (Singleton) ──────────────────────────────────────────
 
 const liveClient = new DatabentoLive();
-const flowTracker = new LiveFlowTracker(liveClient);
+const signalEngine = new HftSignalEngine(liveClient);
+const flowTracker = new LiveFlowTracker(liveClient, signalEngine);
+
+// Wire Algo Trading Engine (full Databento algo suite)
+let algoEngine = null;
+try {
+  const algoTrading = require('./algo-trading');
+  algoEngine = algoTrading.engine;
+  algoTrading.connectLive(liveClient);
+  console.log('[DatabentoLive] Algo Trading Engine connected');
+} catch (err) {
+  console.warn('[DatabentoLive] Algo Trading Engine not available:', err.message);
+}
 
 module.exports = {
   client: liveClient,
+  signals: signalEngine,
   flow: flowTracker,
+  algo: algoEngine,
   connect: () => liveClient.connect(),
   disconnect: () => liveClient.disconnect(),
-  subscribe: (schema, stypeIn, symbols) => liveClient.subscribe(schema, stypeIn, symbols),
+  subscribe: (schema, stypeIn, symbols, start) => liveClient.subscribe(schema, stypeIn, symbols, start),
   getStatus: () => liveClient.getStatus(),
   getFlow: (ticker) => flowTracker.getFlow(ticker),
+  getSignal: (ticker) => signalEngine.getSignal(ticker),
+  getSweeps: (limit) => flowTracker.getRecentSweeps(limit),
+  // Live options chain builder
+  getExpirations: (ticker) => liveClient.getExpirations(ticker),
+  getOptionsChain: (ticker, exp) => liveClient.getOptionsChain(ticker, exp),
+  hasDataFor: (ticker) => liveClient.hasDataFor(ticker),
+  // Algo trading
+  getAlgoSignals: (ticker) => algoEngine ? algoEngine.getSignals(ticker) : null,
+  getAlgoPairs: () => algoEngine ? algoEngine.getPairsStatus() : [],
+  getAlgoPnl: () => algoEngine ? algoEngine.getPnl() : null,
 };
