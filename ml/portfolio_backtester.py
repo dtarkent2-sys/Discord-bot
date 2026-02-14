@@ -274,34 +274,78 @@ class DataProvider:
         if not price_dict:
             raise ValueError("No ticker data loaded successfully")
 
-        # Build intersection calendar
-        date_sets = [set(df["date"].dropna().values) for df in price_dict.values()]
-        common = date_sets[0]
-        for ds in date_sets[1:]:
-            common = common.intersection(ds)
-        common_dates = sorted(common)
-
-        # Drop tickers that lost >20% of dates after intersection
-        total_dates = len(common_dates)
+        # ── Robust majority-calendar alignment ──
+        # Step 1: Drop tickers with too few rows (can't build features)
+        MIN_ROWS = 252
         for tkr in list(price_dict.keys()):
-            ticker_dates = set(price_dict[tkr]["date"].values)
-            overlap = len(ticker_dates.intersection(common))
-            if total_dates > 0 and overlap / total_dates < 0.80:
-                missing_report[tkr] = f"insufficient_overlap ({overlap}/{total_dates})"
+            n = price_dict[tkr]["close"].notna().sum()
+            if n < MIN_ROWS:
+                missing_report[tkr] = f"too_few_rows ({n}<{MIN_ROWS})"
+                log(f"  Dropping {tkr}: only {n} valid close prices (<{MIN_ROWS})")
                 del price_dict[tkr]
 
-        # Recalculate intersection after drops
-        if price_dict:
-            date_sets = [set(df["date"].dropna().values) for df in price_dict.values()]
-            common = date_sets[0]
-            for ds in date_sets[1:]:
-                common = common.intersection(ds)
-            common_dates = sorted(common)
+        if not price_dict:
+            raise ValueError(
+                f"No tickers have at least {MIN_ROWS} trading days. "
+                f"Dropped: {list(missing_report.keys())}"
+            )
+
+        # Step 2: Find robust overlapping range (median start, median end)
+        # Using medians avoids one outlier ticker collapsing the range to zero.
+        ranges = {}
+        for tkr, df in price_dict.items():
+            valid = df.loc[df["close"].notna(), "date"]
+            ranges[tkr] = (valid.min(), valid.max())
+
+        starts = sorted(r[0] for r in ranges.values())
+        ends = sorted(r[1] for r in ranges.values())
+        range_start = starts[len(starts) // 2]   # median start
+        range_end = ends[len(ends) // 2]          # median end
+
+        # Extend end to latest if the median end is close (within 60 days)
+        if (max(ends) - range_end).days <= 60:
+            range_end = max(ends)
+
+        if range_start >= range_end:
+            raise ValueError(
+                f"No overlapping date range across {len(price_dict)} tickers. "
+                f"Median start={range_start.date()}, median end={range_end.date()}."
+            )
+
+        calendar = pd.bdate_range(range_start, range_end)
+        log(f"  Majority calendar: {range_start.date()} to {range_end.date()} ({len(calendar)} bdays)")
+
+        # Step 3: Drop tickers with >20% missing within the calendar
+        cal_set = set(calendar)
+        for tkr in list(price_dict.keys()):
+            ticker_dates = set(price_dict[tkr].loc[price_dict[tkr]["close"].notna(), "date"])
+            overlap = len(ticker_dates.intersection(cal_set))
+            coverage = overlap / len(calendar) if len(calendar) > 0 else 0
+            if coverage < 0.80:
+                missing_report[tkr] = f"insufficient_coverage ({coverage:.0%}, {overlap}/{len(calendar)})"
+                log(f"  Dropping {tkr}: only {coverage:.0%} coverage in calendar")
+                del price_dict[tkr]
+
+        if not price_dict:
+            raise ValueError(
+                f"All tickers dropped due to insufficient coverage. "
+                f"Report: {missing_report}"
+            )
+
+        # Step 4: Build common dates = calendar dates where >= 50% of surviving tickers have data
+        ticker_date_sets = {tkr: set(df.loc[df["close"].notna(), "date"])
+                           for tkr, df in price_dict.items()}
+        n_tickers = len(price_dict)
+        common_dates = sorted(
+            d for d in calendar
+            if sum(1 for s in ticker_date_sets.values() if d in s) >= max(1, n_tickers // 2)
+        )
 
         if len(common_dates) < 252:
             raise ValueError(
-                f"Only {len(common_dates)} common trading dates across {len(price_dict)} tickers. "
-                f"Need at least 252. Consider fewer tickers or wider date range."
+                f"Only {len(common_dates)} trading dates with >=50% ticker coverage "
+                f"across {n_tickers} tickers. Need at least 252. "
+                f"Loaded: {list(price_dict.keys())}. Dropped: {[k for k,v in missing_report.items()]}"
             )
 
         # Filter by date range from config
@@ -328,6 +372,8 @@ class DataProvider:
         self.common_dates = common_dates
         self.missing_report = missing_report
 
+        if missing_report:
+            log(f"  Dropped tickers: {missing_report}")
         log(f"Canonical panel: {len(price_dict)} tickers × {len(common_dates)} dates "
             f"({pd.Timestamp(common_dates[0]).date()} to {pd.Timestamp(common_dates[-1]).date()})")
 
