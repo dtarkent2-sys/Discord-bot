@@ -624,7 +624,11 @@ class SignalModel:
         cached_scaler = None
         last_train_month = None
 
-        for reb_date in rebalance_dates:
+        for i_reb, reb_date in enumerate(rebalance_dates):
+            # Progress heartbeat every 50 rebalances
+            if i_reb > 0 and i_reb % 50 == 0:
+                log(f"  Signal generation progress: {i_reb}/{len(rebalance_dates)} rebalances")
+
             # Advance the clock — this IS the point in simulated time
             self.clock.advance_to(reb_date)
 
@@ -660,16 +664,22 @@ class SignalModel:
                 scaler = StandardScaler()
                 X_train_scaled = scaler.fit_transform(X_train)
 
-                if cfg.model_type == "linear":
-                    model = Ridge(alpha=1.0, random_state=cfg.seed)
-                else:
-                    model = HistGradientBoostingRegressor(
-                        max_iter=150, max_depth=4, learning_rate=0.08,
-                        min_samples_leaf=20, random_state=cfg.seed,
-                        validation_fraction=0.1, n_iter_no_change=15,
-                    )
+                try:
+                    if cfg.model_type == "linear":
+                        model = Ridge(alpha=1.0, random_state=cfg.seed)
+                    else:
+                        model = HistGradientBoostingRegressor(
+                            max_iter=150, max_depth=4, learning_rate=0.08,
+                            min_samples_leaf=20, random_state=cfg.seed,
+                            validation_fraction=0.1, n_iter_no_change=15,
+                        )
 
-                model.fit(X_train_scaled, y_train)
+                    model.fit(X_train_scaled, y_train)
+                except Exception as e:
+                    log(f"  ERROR training model at {reb_date}: {e} "
+                        f"(X_train shape={X_train_scaled.shape})")
+                    raise
+
                 cached_model = model
                 cached_scaler = scaler
                 last_train_month = reb_month
@@ -1666,11 +1676,14 @@ def main():
             debug=bool(args.debug),
         )
         print(json.dumps(result))
+        sys.stdout.flush()
     except Exception as e:
         log(f"ERROR: {e}")
         import traceback
         traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
         print(json.dumps({"error": str(e)}))
+        sys.stdout.flush()
         sys.exit(1)
 
 
