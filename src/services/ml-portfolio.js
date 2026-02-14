@@ -42,7 +42,7 @@ function _extractJson(raw) {
  */
 function compileConfig(options = {}) {
   const cfg = {
-    tickers: options.tickers || 'mega',
+    tickers: options.tickers || 'auto',
     start_date: options.startDate || null,
     end_date: options.endDate || null,
     days: options.days || null,

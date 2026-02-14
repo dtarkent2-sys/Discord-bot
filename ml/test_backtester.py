@@ -19,7 +19,7 @@ import pandas as pd
 # Import functions under test
 from portfolio_backtester import (
     compute_metrics, compute_benchmarks, validate_returns,
-    ABSURD_DAILY_RETURN,
+    ABSURD_DAILY_RETURN, ABSURD_MAX_EVENTS,
 )
 
 PASS = 0
@@ -137,29 +137,44 @@ def test_random_differs_from_benchmark():
 
 
 def test_validate_returns_catches_absurd():
-    """validate_returns must flag tickers with daily returns > ±50%."""
+    """validate_returns must flag tickers with many absurd daily returns for DROP,
+    and keep tickers with few absurd days (<=ABSURD_MAX_EVENTS) with a warning."""
     print("\n=== test_validate_returns_catches_absurd ===")
 
+    np.random.seed(99)
     dates = pd.bdate_range("2020-01-01", periods=100)
     data = {
         "GOOD": np.random.normal(0.001, 0.02, 100),
-        "BAD": np.random.normal(0.001, 0.02, 100),
+        "FEW_BAD": np.random.normal(0.001, 0.02, 100),
+        "MANY_BAD": np.random.normal(0.001, 0.02, 100),
     }
-    # Inject absurd return on day 50
-    data["BAD"][50] = 0.80  # +80% in one day
+    # FEW_BAD: 1 absurd day (<=ABSURD_MAX_EVENTS) -> should be KEPT
+    data["FEW_BAD"][50] = 0.80
+    # MANY_BAD: 5 absurd days (>ABSURD_MAX_EVENTS=3) -> should be DROPPED
+    for i in [20, 30, 40, 50, 60]:
+        data["MANY_BAD"][i] = 0.75
     return_matrix = pd.DataFrame(data, index=dates)
 
     flagged, detail_log = validate_returns(return_matrix)
 
-    check("BAD ticker flagged", "BAD" in flagged,
+    check("MANY_BAD flagged for drop", "MANY_BAD" in flagged,
           f"flagged={list(flagged.keys())}")
-    check("GOOD ticker not flagged", "GOOD" not in flagged)
+    check("FEW_BAD NOT flagged (kept)", "FEW_BAD" not in flagged,
+          f"flagged={list(flagged.keys())}")
+    check("GOOD not flagged", "GOOD" not in flagged)
     check("detail log not empty", len(detail_log) > 0)
 
-    # Verify the return value in flagged is correct
-    if "BAD" in flagged:
-        check("flagged return value correct",
-              abs(flagged["BAD"][0]["return"] - 0.80) < 0.01)
+    # Verify flagged events
+    if "MANY_BAD" in flagged:
+        check("MANY_BAD has 5 events", len(flagged["MANY_BAD"]) == 5,
+              f"got {len(flagged['MANY_BAD'])} events")
+
+    # Test with close_matrix for forensic logging
+    close_data = {t: np.cumsum(data[t]) + 100 for t in data}
+    close_matrix = pd.DataFrame(close_data, index=dates)
+    flagged2, detail_log2 = validate_returns(return_matrix, close_matrix=close_matrix)
+    check("close prices in log", any("prev=" in line for line in detail_log2),
+          "expected prev_close in detail log")
 
 
 def test_no_clipping_in_compute_metrics():

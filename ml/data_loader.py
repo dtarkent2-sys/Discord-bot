@@ -347,3 +347,96 @@ def _find_column(df, candidates):
         if candidate.lower() in cols_lower:
             return cols_lower[candidate.lower()]
     return None
+
+
+def discover_universe(data_dir=None, min_rows=2000, min_volume_pct=0.80,
+                      max_price=100000, min_price=0.01, max_absurd_days=0,
+                      top_n=30):
+    """Auto-discover the best tickers in the dataset.
+
+    Scans the parquet file, filters by data quality, deduplicates tickers
+    that share identical price series, and returns the top_n tickers sorted
+    by average daily volume.
+
+    Returns:
+        list[str]: ticker symbols, sorted by volume descending
+        dict: diagnostics {total_tickers, passed_filters, unique_series, ...}
+    """
+    import pandas as pd
+    import numpy as np
+
+    data_dir = data_dir or get_data_dir()
+    fpath = os.path.join(data_dir, "all_prices_yahoo.parquet")
+    if not os.path.exists(fpath):
+        raise FileNotFoundError(f"Price data not found: {fpath}")
+
+    log(f"Discovering universe from {fpath}")
+    df = pd.read_parquet(fpath)
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    ticker_col = _find_column(df, ["symbol", "ticker", "sym", "stock"])
+    if not ticker_col:
+        raise ValueError(f"No ticker column found. Columns: {list(df.columns)}")
+
+    total_tickers = df[ticker_col].nunique()
+    log(f"  Total tickers in data: {total_tickers}")
+
+    # Pass 1: filter by row count, volume, price range, absurd returns
+    fingerprints = {}
+    good_tickers = {}
+
+    for sym, grp in df.groupby(ticker_col):
+        n = len(grp)
+        if n < min_rows:
+            continue
+        close = grp.sort_values("date")["close"].dropna()
+        if len(close) < min_rows:
+            continue
+        vol = grp["volume"].fillna(0)
+        vol_pct = (vol > 0).sum() / n
+        if vol_pct < min_volume_pct:
+            continue
+        cmin, cmax = close.min(), close.max()
+        if cmin < min_price or cmax > max_price:
+            continue
+        rets = close.pct_change().dropna()
+        absurd = int((rets.abs() > 0.5).sum())
+        if absurd > max_absurd_days:
+            continue
+
+        # Fingerprint for dedup: first 10 + last 10 close values
+        vals = close.values
+        fp = tuple(np.round(vals[:10], 2)) + tuple(np.round(vals[-10:], 2))
+        fp_key = hash(fp)
+        if fp_key not in fingerprints:
+            fingerprints[fp_key] = []
+        fingerprints[fp_key].append(sym)
+        good_tickers[sym] = {
+            "rows": n, "cmin": cmin, "cmax": cmax,
+            "mean_vol": vol.mean(), "absurd": absurd, "fp": fp_key,
+        }
+
+    # Pass 2: pick best representative from each deduplicated group
+    reps = []
+    for fp_key, syms in fingerprints.items():
+        best = min(syms, key=lambda s: (good_tickers[s]["absurd"],
+                                         -good_tickers[s]["mean_vol"]))
+        info = good_tickers[best]
+        reps.append((best, info))
+
+    reps.sort(key=lambda x: -x[1]["mean_vol"])
+    selected = [sym for sym, _ in reps[:top_n]]
+
+    diagnostics = {
+        "total_tickers": total_tickers,
+        "passed_filters": len(good_tickers),
+        "unique_series": len(fingerprints),
+        "selected": len(selected),
+    }
+    log(f"  Passed filters: {len(good_tickers)}, unique series: {len(fingerprints)}, selected top {len(selected)}")
+    for sym, info in reps[:top_n]:
+        log(f"    {sym:10s}: {info['rows']:5d} rows | "
+            f"${info['cmin']:.2f}-${info['cmax']:.2f} | "
+            f"vol/day={info['mean_vol']:.0f}")
+
+    return selected, diagnostics
