@@ -81,28 +81,73 @@ def ensure_data(data_dir=None):
 
 
 def _download_folder(folder_id, output_dir):
-    """Download an entire Google Drive folder using gdown."""
+    """Download only .parquet files from a Google Drive folder.
+
+    Uses the Drive web page to list files, then downloads each parquet
+    individually with gdown.download(). This avoids the 50-file limit
+    that gdown.download_folder hits when subfolders contain many CSVs.
+    """
     try:
         import gdown
     except ImportError:
         raise ImportError("gdown not installed. Run: pip install gdown")
 
-    url = f"https://drive.google.com/drive/folders/{folder_id}"
-    log(f"Downloading folder: {url}")
-    log(f"Target directory: {output_dir}")
+    import re
+    import requests
 
-    # gdown prints progress to stdout — redirect to stderr so it doesn't
-    # contaminate the JSON output that Node.js parses from stdout.
-    import contextlib
+    log(f"Listing files in Google Drive folder {folder_id}")
+
+    # Fetch the folder page and extract file entries
+    # gdown uses this same technique internally
+    url = f"https://drive.google.com/drive/folders/{folder_id}"
+    session = requests.Session()
+    res = session.get(url)
+    res.raise_for_status()
+
+    # Extract file IDs and names from the folder page HTML.
+    # Google Drive embeds file metadata in the page source.
+    # Pattern matches: ["file_id","file_name", ...]
+    file_entries = re.findall(
+        r'\["(1[A-Za-z0-9_-]{10,})","([^"]+\.parquet)"',
+        res.text,
+    )
+
+    if not file_entries:
+        # Fallback: try the JSON-ish format Google sometimes uses
+        file_entries = re.findall(
+            r'"(1[A-Za-z0-9_-]{10,})"[^"]*"([^"]+\.parquet)"',
+            res.text,
+        )
+
+    if not file_entries:
+        raise RuntimeError(
+            f"Could not find any .parquet files in Google Drive folder {folder_id}. "
+            f"Ensure the folder is public and contains parquet files."
+        )
+
+    # Deduplicate (same file can appear multiple times in the page)
+    seen = set()
+    unique = []
+    for file_id, file_name in file_entries:
+        if file_id not in seen:
+            seen.add(file_id)
+            unique.append((file_id, file_name))
+
+    log(f"Found {len(unique)} parquet file(s): {[n for _, n in unique]}")
+
+    # Download each parquet file individually — no 50-file limit
+    # Redirect stdout to stderr so gdown progress doesn't contaminate JSON output
     old_stdout = sys.stdout
     sys.stdout = sys.stderr
     try:
-        gdown.download_folder(
-            url=url,
-            output=output_dir,
-            quiet=False,
-            use_cookies=False,
-        )
+        for file_id, file_name in unique:
+            dest = os.path.join(output_dir, file_name)
+            if os.path.exists(dest):
+                log(f"  {file_name} already exists, skipping")
+                continue
+            file_url = f"https://drive.google.com/uc?id={file_id}"
+            log(f"  Downloading {file_name} ({file_id})")
+            gdown.download(file_url, dest, quiet=False)
     finally:
         sys.stdout = old_stdout
 

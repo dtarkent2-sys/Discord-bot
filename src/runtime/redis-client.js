@@ -2,6 +2,9 @@
  * Shared minimal Redis client using native TCP/TLS + RESP protocol.
  * No npm dependency — uses only Node.js built-in `net` and `tls` modules.
  * Supports both redis:// (plain TCP) and rediss:// (TLS) URLs.
+ *
+ * Includes automatic reconnection on disconnect and a `connected` flag
+ * so callers can skip commands instead of queuing on a dead socket.
  */
 
 const log = require('../logger')('RedisClient');
@@ -9,7 +12,7 @@ const log = require('../logger')('RedisClient');
 /**
  * Create a Redis client from a connection URL.
  * @param {string} redisUrl - e.g. redis://default:pass@host:6379 or rediss://...
- * @returns {Promise<{sendCommand: Function, quit: Function}>}
+ * @returns {Promise<{sendCommand: Function, quit: Function, connected: boolean}>}
  */
 function createRedisClient(redisUrl) {
   const url = new URL(redisUrl);
@@ -22,24 +25,74 @@ function createRedisClient(redisUrl) {
   log.info(`Connecting to ${host}:${port} (TLS: ${useTls})`);
 
   return new Promise((resolve, reject) => {
-    let socket;
-    if (useTls) {
-      const tls = require('tls');
-      socket = tls.connect({ host, port, rejectUnauthorized: false }, onConnect);
-    } else {
-      const net = require('net');
-      socket = net.createConnection({ host, port }, onConnect);
+    let settled = false; // guards the initial connection promise
+
+    const client = {
+      connected: false,
+      sendCommand: null,
+      quit: null,
+      _socket: null,
+      _pending: [],
+      _reconnectTimer: null,
+      _intentionalClose: false,
+    };
+
+    function connect() {
+      let socket;
+      if (useTls) {
+        const tls = require('tls');
+        socket = tls.connect({ host, port, rejectUnauthorized: false }, () => onConnect(socket));
+      } else {
+        const net = require('net');
+        socket = net.createConnection({ host, port }, () => onConnect(socket));
+      }
+
+      client._socket = socket;
+
+      // Connection-phase error: only reject the initial promise if not yet settled
+      socket.on('error', (err) => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Redis connection failed: ${err.message}`));
+        }
+      });
+
+      // Connection-phase timeout (only for initial connect)
+      if (!settled) {
+        const connTimeout = setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            socket.destroy();
+            reject(new Error('Redis connection timeout'));
+          }
+        }, 5000);
+        // Clear timeout once connected (inside onConnect)
+        socket._connTimeout = connTimeout;
+      }
     }
 
-    function onConnect() {
+    function onConnect(socket) {
+      // Clear the connection timeout
+      if (socket._connTimeout) {
+        clearTimeout(socket._connTimeout);
+        socket._connTimeout = null;
+      }
+
       let buffer = '';
-      const pending = [];
+      const pending = client._pending;
+
+      client.connected = true;
+      client._socket = socket;
 
       function rejectAll(err) {
+        client.connected = false;
         while (pending.length > 0) pending.shift().reject(err);
       }
 
       function sendCommand(...args) {
+        if (!client.connected) {
+          return Promise.reject(new Error('Redis not connected'));
+        }
         return new Promise((res, rej) => {
           const parts = [`*${args.length}`];
           for (const arg of args) {
@@ -51,15 +104,15 @@ function createRedisClient(redisUrl) {
           // the queue. Redis still sends its response, and the parser must consume
           // it in order. Splicing would offset every subsequent response by one,
           // permanently corrupting the connection.
-          let settled = false;
+          let cmdSettled = false;
           const entry = {
             dead: false,
-            resolve: (val) => { if (!settled) { settled = true; clearTimeout(timer); res(val); } },
-            reject: (err) => { if (!settled) { settled = true; clearTimeout(timer); rej(err); } },
+            resolve: (val) => { if (!cmdSettled) { cmdSettled = true; clearTimeout(timer); res(val); } },
+            reject: (err) => { if (!cmdSettled) { cmdSettled = true; clearTimeout(timer); rej(err); } },
           };
           const timer = setTimeout(() => {
             entry.dead = true;
-            if (!settled) { settled = true; rej(new Error('Redis command timeout (10s)')); }
+            if (!cmdSettled) { cmdSettled = true; rej(new Error('Redis command timeout (10s)')); }
           }, 10_000);
           pending.push(entry);
           socket.write(parts.join('\r\n') + '\r\n');
@@ -114,14 +167,31 @@ function createRedisClient(redisUrl) {
       }
 
       socket.on('data', (data) => parseResponse(data.toString()));
-      socket.on('error', (err) => rejectAll(err));
-      socket.on('close', () => rejectAll(new Error('Redis connection closed')));
 
-      const client = {
-        sendCommand,
-        quit() { try { socket.end(); } catch {} },
+      socket.on('error', (err) => {
+        log.error(`Redis socket error: ${err.message}`);
+        rejectAll(err);
+      });
+
+      socket.on('close', () => {
+        rejectAll(new Error('Redis connection closed'));
+        if (!client._intentionalClose) {
+          scheduleReconnect();
+        }
+      });
+
+      client.sendCommand = sendCommand;
+      client.quit = function quit() {
+        client._intentionalClose = true;
+        client.connected = false;
+        if (client._reconnectTimer) {
+          clearTimeout(client._reconnectTimer);
+          client._reconnectTimer = null;
+        }
+        try { socket.end(); } catch {}
       };
 
+      // Auth if needed, then resolve the initial promise
       if (password) {
         const authArgs = username && username !== 'default'
           ? ['AUTH', username, password]
@@ -129,16 +199,49 @@ function createRedisClient(redisUrl) {
         sendCommand(...authArgs)
           .then(() => {
             log.info('AUTH successful');
-            resolve(client);
+            if (!settled) { settled = true; resolve(client); }
           })
-          .catch(reject);
+          .catch((err) => {
+            if (!settled) { settled = true; reject(err); }
+          });
       } else {
-        resolve(client);
+        if (!settled) { settled = true; resolve(client); }
       }
     }
 
-    socket.on('error', reject);
-    setTimeout(() => reject(new Error('Redis connection timeout')), 5000);
+    function scheduleReconnect() {
+      if (client._intentionalClose) return;
+      const delay = 3000;
+      log.info(`Redis disconnected — reconnecting in ${delay / 1000}s...`);
+      client._reconnectTimer = setTimeout(() => {
+        client._reconnectTimer = null;
+        if (client._intentionalClose) return;
+        log.info('Attempting Redis reconnection...');
+
+        let socket;
+        if (useTls) {
+          const tls = require('tls');
+          socket = tls.connect({ host, port, rejectUnauthorized: false }, () => {
+            log.info('Redis reconnected');
+            onConnect(socket);
+          });
+        } else {
+          const net = require('net');
+          socket = net.createConnection({ host, port }, () => {
+            log.info('Redis reconnected');
+            onConnect(socket);
+          });
+        }
+
+        socket.on('error', (err) => {
+          log.error(`Redis reconnection failed: ${err.message}`);
+          client.connected = false;
+          scheduleReconnect();
+        });
+      }, delay);
+    }
+
+    connect();
   });
 }
 

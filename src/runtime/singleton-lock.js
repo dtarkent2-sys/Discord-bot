@@ -92,11 +92,19 @@ async function acquireLock() {
 
 async function _renewLock() {
   if (!_redis || !_lockValue) return;
+  // Verify we still own the lock, then renew atomically.
+  // GET + EXPIRE is a race: the lock could expire between the two commands
+  // and another instance could acquire it. Instead: verify ownership first,
+  // then use SET with XX (only if exists) + EX to atomically set-if-exists.
   const current = await _redis.sendCommand('GET', LOCK_KEY);
   if (current !== _lockValue) {
     throw new Error(`Lock value mismatch: expected ${_lockValue}, got ${current}`);
   }
-  await _redis.sendCommand('EXPIRE', LOCK_KEY, String(DEFAULT_TTL));
+  // SET ... XX EX — atomic: only sets if key exists, with new TTL
+  const result = await _redis.sendCommand('SET', LOCK_KEY, _lockValue, 'XX', 'EX', String(DEFAULT_TTL));
+  if (result !== 'OK') {
+    throw new Error('Lock expired between GET and SET XX — lost leadership');
+  }
   log.info(`Leader lock RENEWED (ttl=${DEFAULT_TTL}s)`);
 }
 

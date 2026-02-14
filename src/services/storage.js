@@ -10,9 +10,13 @@ if (!fs.existsSync(config.dataDir)) {
 }
 
 // ── Shared Redis connection for all Storage instances ──────────────────
-let _redis = null;
-let _redisReady = false;
+let _redis = null;    // the client object (has .connected, .sendCommand, .quit)
 const _instances = [];
+
+/** Check if the Redis client is connected and usable. */
+function _isRedisReady() {
+  return _redis !== null && _redis.connected === true;
+}
 
 /**
  * Initialize the shared Redis connection and hydrate all existing
@@ -27,7 +31,6 @@ async function initRedisStorage() {
 
   try {
     _redis = await createRedisClient(redisUrl);
-    _redisReady = true;
     log.info('Redis storage connection established');
 
     // Hydrate every Storage instance sequentially (not pipelined) so the
@@ -58,7 +61,7 @@ class Storage {
     _instances.push(this);
 
     // If Redis is already connected (unlikely on first boot, but handles late-created instances)
-    if (_redisReady) {
+    if (_isRedisReady()) {
       this._loadFromRedis().catch(() => {});
     }
   }
@@ -75,7 +78,7 @@ class Storage {
   }
 
   async _loadFromRedis() {
-    if (!_redisReady) return;
+    if (!_isRedisReady()) return;
     try {
       const raw = await _redis.sendCommand('GET', this.redisKey);
       if (raw) {
@@ -90,7 +93,7 @@ class Storage {
   }
 
   async _saveToRedis() {
-    if (!_redisReady) return;
+    if (!_isRedisReady()) return;
     try {
       await _redis.sendCommand('SET', this.redisKey, JSON.stringify(this.data));
     } catch (err) {
@@ -103,7 +106,7 @@ class Storage {
     try {
       fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2));
     } catch (err) {
-      if (!_redisReady) {
+      if (!_isRedisReady()) {
         log.error(`Failed to save ${this.filePath}: ${err.message}`);
       }
     }
