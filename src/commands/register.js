@@ -528,6 +528,103 @@ const commands = [
           { name: 'Gradient Boost — HistGradientBoosting only', value: 'gradient_boost' },
         )
     ),
+
+  // ── ML Portfolio Backtester ──────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName('mlportfolio')
+    .setDescription('ML portfolio walk-forward backtest — cross-sectional ranking + portfolio construction')
+    .addStringOption(opt =>
+      opt.setName('tickers')
+        .setDescription('Comma-separated tickers or preset: mega, sp500_25, tech, sector_etf')
+        .setRequired(false)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('days')
+        .setDescription('Trading days of history (default: 2520 ≈ 10 years)')
+        .setRequired(false)
+        .setMinValue(500)
+        .setMaxValue(10000)
+    )
+    .addStringOption(opt =>
+      opt.setName('start_date')
+        .setDescription('Backtest start date (YYYY-MM-DD)')
+        .setRequired(false)
+    )
+    .addStringOption(opt =>
+      opt.setName('end_date')
+        .setDescription('Backtest end date (YYYY-MM-DD)')
+        .setRequired(false)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('forward')
+        .setDescription('Forward return horizon in trading days (default: 20)')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(252)
+    )
+    .addStringOption(opt =>
+      opt.setName('rebalance')
+        .setDescription('Rebalance frequency: W-MON (weekly Mon), M (monthly), 2W (default: W-MON)')
+        .setRequired(false)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('top_k')
+        .setDescription('Number of long positions (default: 10)')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(50)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('bottom_k')
+        .setDescription('Number of short positions (default: 0)')
+        .setRequired(false)
+        .setMinValue(0)
+        .setMaxValue(50)
+    )
+    .addStringOption(opt =>
+      opt.setName('weighting')
+        .setDescription('Portfolio weighting scheme (default: equal)')
+        .setRequired(false)
+        .addChoices(
+          { name: 'Equal Weight — 1/N allocation', value: 'equal' },
+          { name: 'Vol Target — inverse-vol scaled to target', value: 'vol_target' },
+        )
+    )
+    .addNumberOption(opt =>
+      opt.setName('max_weight')
+        .setDescription('Max single position weight (default: 0.15 = 15%)')
+        .setRequired(false)
+        .setMinValue(0.01)
+        .setMaxValue(1.0)
+    )
+    .addNumberOption(opt =>
+      opt.setName('max_leverage')
+        .setDescription('Max gross leverage (default: 1.0)')
+        .setRequired(false)
+        .setMinValue(0.1)
+        .setMaxValue(3.0)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('cost_bps')
+        .setDescription('Transaction cost in basis points (default: 10)')
+        .setRequired(false)
+        .setMinValue(0)
+        .setMaxValue(100)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('slippage_bps')
+        .setDescription('Slippage in basis points (default: 0)')
+        .setRequired(false)
+        .setMinValue(0)
+        .setMaxValue(100)
+    )
+    .addIntegerOption(opt =>
+      opt.setName('seed')
+        .setDescription('Random seed for reproducibility (default: 42)')
+        .setRequired(false)
+        .setMinValue(0)
+        .setMaxValue(999999)
+    ),
 ];
 
 async function registerCommands() {

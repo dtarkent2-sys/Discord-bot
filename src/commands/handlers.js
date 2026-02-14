@@ -31,6 +31,7 @@ const channelHistory = require('../services/channel-history');
 let algoTrading = null;
 try { algoTrading = require('../services/algo-trading'); } catch { /* algo-trading not available */ }
 const mlPredictor = require('../services/ml-predictor');
+const mlPortfolio = require('../services/ml-portfolio');
 const { AttachmentBuilder, MessageFlags, PermissionsBitField, ChannelType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { getMarketContext, formatContextForAI } = require('../data/market');
 const config = require('../config');
@@ -119,6 +120,8 @@ async function handleCommand(interaction) {
       return handleAlgo(interaction);
     case 'mlpredict':
       return handleMLPredict(interaction);
+    case 'mlportfolio':
+      return handleMLPortfolio(interaction);
     default:
       await interaction.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
@@ -2270,6 +2273,77 @@ async function handleMLPredict(interaction) {
     console.error(`[ML-Predict] Error for ${ticker}:`, err);
     const msg = err.message.length > 500 ? err.message.slice(0, 500) + '...' : err.message;
     await interaction.editReply(`ML prediction failed for **${ticker}**: ${msg}`);
+  }
+}
+
+// ── ML Portfolio Backtester ────────────────────────────────────────────
+
+async function handleMLPortfolio(interaction) {
+  if (!mlPortfolio.enabled) {
+    return interaction.reply({ content: 'ML Portfolio requires Python dependencies (`pip install -r ml/requirements.txt`).', flags: MessageFlags.Ephemeral });
+  }
+
+  await interaction.deferReply();
+
+  const tickers = interaction.options.getString('tickers') || 'mega';
+  const forward = interaction.options.getInteger('forward') || 20;
+  const days = interaction.options.getInteger('days');
+  const startDate = interaction.options.getString('start_date');
+  const endDate = interaction.options.getString('end_date');
+  const rebalance = interaction.options.getString('rebalance') || 'W-MON';
+  const topK = interaction.options.getInteger('top_k') || 10;
+  const bottomK = interaction.options.getInteger('bottom_k') || 0;
+  const weighting = interaction.options.getString('weighting') || 'equal';
+  const maxWeight = interaction.options.getNumber('max_weight') || 0.15;
+  const maxLeverage = interaction.options.getNumber('max_leverage') || 1.0;
+  const costBps = interaction.options.getInteger('cost_bps');
+  const slippageBps = interaction.options.getInteger('slippage_bps');
+  const seed = interaction.options.getInteger('seed') || 42;
+
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+
+  try {
+    const options = {
+      tickers, forward, rebalance, topK, bottomK,
+      weighting, maxWeight, maxLeverage,
+      costBps: costBps != null ? costBps : 10,
+      slippageBps: slippageBps != null ? slippageBps : 0,
+      seed,
+    };
+
+    if (startDate) {
+      if (!datePattern.test(startDate)) return interaction.editReply('Invalid start_date format. Use YYYY-MM-DD.');
+      options.startDate = startDate;
+    }
+    if (endDate) {
+      if (!datePattern.test(endDate)) return interaction.editReply('Invalid end_date format. Use YYYY-MM-DD.');
+      options.endDate = endDate;
+    }
+    if (startDate && endDate && startDate > endDate) {
+      return interaction.editReply(`start_date (${startDate}) must be before end_date (${endDate}).`);
+    }
+    if (days) {
+      options.days = days;
+    }
+
+    const result = await mlPortfolio.runBacktest(options);
+    const summary = mlPortfolio.formatResults(result);
+
+    const replyPayload = { content: summary };
+    try {
+      const chartBuffer = await mlPortfolio.getChartBuffer(result);
+      const attachment = new AttachmentBuilder(chartBuffer, { name: `ml-portfolio-${seed}.png` });
+      replyPayload.files = [attachment];
+    } catch (chartErr) {
+      console.warn('[ML-Portfolio] Chart not available:', chartErr.message);
+      replyPayload.content += '\n\n*(Chart rendering unavailable)*';
+    }
+
+    await interaction.editReply(replyPayload);
+  } catch (err) {
+    console.error(`[ML-Portfolio] Error:`, err);
+    const msg = err.message.length > 500 ? err.message.slice(0, 500) + '...' : err.message;
+    await interaction.editReply(`ML portfolio backtest failed: ${msg}`);
   }
 }
 
