@@ -46,25 +46,25 @@ def log(msg):
 
 # ── Preset Universes ─────────────────────────────────────────────────────
 
+# Static universes: curated from actual data inspection.
+# "auto" / "auto_50" are dynamic — discovered at runtime from the parquet.
 UNIVERSES = {
-    "mega": [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B",
-        "JPM", "V", "UNH", "JNJ", "XOM", "WMT", "MA", "PG", "HD", "CVX",
-        "MRK", "ABBV", "LLY", "COST", "PEP", "KO", "AVGO",
+    "auto": None,      # Placeholder: auto-discover top 30 at runtime
+    "auto_50": None,   # Placeholder: auto-discover top 50 at runtime
+    "liquid_30": [
+        "SCLXW", "AIXN", "FORW", "WSC", "CORR", "VLRS", "FLNCF", "BOAS",
+        "ORN", "ADXSD", "ENERW", "APLS", "GAFL", "CMXHF", "VULMF", "SPXSY",
+        "NYMXF", "BRAG", "TLGPY", "FUAPF", "DBTX", "ICLK", "ALAB", "BCAB",
+        "VRMEW", "PIONF", "RAAQU", "IROQ", "AIRI", "ACBA",
     ],
-    "sp500_25": [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM",
-        "V", "UNH", "JNJ", "XOM", "WMT", "PG", "HD", "CVX", "MRK",
-        "ABBV", "LLY", "COST", "PEP", "KO", "AVGO", "BAC", "ADBE",
-    ],
-    "tech": [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO",
-        "ADBE", "CRM", "ORCL", "AMD", "INTC", "QCOM", "TXN", "NOW",
-        "AMAT", "MU", "LRCX", "SNPS",
-    ],
-    "sector_etf": [
-        "XLK", "XLF", "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLB",
-        "XLRE", "XLC",
+    "liquid_50": [
+        "SCLXW", "AIXN", "FORW", "WSC", "CORR", "VLRS", "FLNCF", "BOAS",
+        "ORN", "ADXSD", "ENERW", "APLS", "GAFL", "CMXHF", "VULMF", "SPXSY",
+        "NYMXF", "BRAG", "TLGPY", "FUAPF", "DBTX", "ICLK", "ALAB", "BCAB",
+        "VRMEW", "PIONF", "RAAQU", "IROQ", "AIRI", "ACBA", "GWLLF", "INSW",
+        "STJPF", "CPK", "EWCZ", "FCOB", "NCBDF", "FICVW", "SBBTF", "YNNHF",
+        "ALBY", "NZERF", "SJR", "INDHF", "OPAL", "BGRDF", "MXCHF", "KLYG",
+        "SGAMY", "VLTMF",
     ],
 }
 
@@ -87,7 +87,7 @@ class BacktestConfig:
     )
 
     def __init__(self, **kw):
-        self.tickers = kw.get("tickers", "mega")
+        self.tickers = kw.get("tickers", "auto")
         self.start_date = kw.get("start_date")
         self.end_date = kw.get("end_date")
         self.days = kw.get("days")
@@ -128,12 +128,27 @@ class BacktestConfig:
         )
 
     def resolve_tickers(self):
+        """Resolve ticker spec to a list of ticker symbols.
+        Supports: preset name (liquid_30, auto, auto_50), comma-sep list, or list."""
         tickers = self.tickers
         if isinstance(tickers, str):
-            if tickers.lower() in UNIVERSES:
-                return list(UNIVERSES[tickers.lower()])
+            key = tickers.lower()
+            if key in UNIVERSES:
+                preset = UNIVERSES[key]
+                if preset is not None:
+                    return list(preset)
+                # Dynamic discovery (auto / auto_50)
+                return self._discover_auto(key)
             return [t.strip().upper() for t in tickers.split(",") if t.strip()]
         return [t.upper() for t in tickers]
+
+    def _discover_auto(self, key):
+        """Run auto-discovery from the data file."""
+        from data_loader import discover_universe
+        top_n = 50 if "50" in key else 30
+        tickers, diag = discover_universe(data_dir=self.data_dir, top_n=top_n)
+        log(f"Auto-discovered {len(tickers)} tickers (preset={key})")
+        return tickers
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -247,7 +262,8 @@ class DataProvider:
 
         if not ticker_list:
             raise ValueError("No tickers provided")
-        log(f"Universe: {len(ticker_list)} tickers: {ticker_list[:10]}{'...' if len(ticker_list) > 10 else ''}")
+        log(f"Universe: requested {len(ticker_list)} tickers: "
+            f"{ticker_list[:15]}{'...' if len(ticker_list) > 15 else ''}")
 
         # Bulk-load all tickers in ONE parquet read (~700MB read once, not N times)
         raw_dict = load_prices_bulk(data_dir, tickers=ticker_list)
@@ -282,6 +298,14 @@ class DataProvider:
 
         if not price_dict:
             raise ValueError("No ticker data loaded successfully")
+
+        found_tickers = sorted(price_dict.keys())
+        not_found = sorted(set(ticker_list) - set(found_tickers) - set(missing_report.keys()))
+        log(f"  Data found for {len(found_tickers)}/{len(ticker_list)} tickers: {found_tickers[:15]}")
+        if not_found:
+            log(f"  Not in data source: {not_found}")
+            for t in not_found:
+                missing_report[t] = "not_in_data_source"
 
         # ── Robust majority-calendar alignment ──
         # Step 1: Drop tickers with too few rows (can't build features)
@@ -1038,13 +1062,23 @@ def compute_benchmarks(return_matrix, common_dates, all_tickers,
 
 
 ABSURD_DAILY_RETURN = 0.50  # ±50% — flag as data error, do NOT clip
+# If a ticker has more than this many absurd days, drop it entirely
+ABSURD_MAX_EVENTS = 3
 
 
-def validate_returns(return_matrix, daily_dates=None, label="Strategy"):
+def validate_returns(return_matrix, close_matrix=None, daily_dates=None, label="Strategy"):
     """Scan return matrix for absurd daily returns (>±50%).
+
+    When close_matrix is provided, logs prev_close and curr_close alongside
+    the return for forensic debugging.
+
+    Tickers with <= ABSURD_MAX_EVENTS are kept (events logged as warnings).
+    Tickers with > ABSURD_MAX_EVENTS are flagged for dropping.
+
     Returns (flagged_tickers, detail_log) — tickers that should be dropped."""
     _ensure_imports()
-    flagged = {}  # ticker -> list of (date, prev_price, curr_price, ret)
+    flagged = {}  # ticker -> list of events
+    warned = {}   # ticker -> list of events (kept, just warned)
     if return_matrix is None or return_matrix.empty:
         return flagged, []
 
@@ -1052,17 +1086,45 @@ def validate_returns(return_matrix, daily_dates=None, label="Strategy"):
     for ticker in return_matrix.columns:
         col = return_matrix[ticker].dropna()
         absurd_mask = col.abs() > ABSURD_DAILY_RETURN
-        if absurd_mask.any():
-            events = []
-            for dt in col[absurd_mask].index:
-                ret_val = float(col.loc[dt])
-                events.append({"date": str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10],
-                                "return": ret_val})
-                detail_log.append(
-                    f"  ABSURD {ticker} @ {dt.date() if hasattr(dt, 'date') else str(dt)[:10]}: "
-                    f"return={ret_val:+.4f} ({ret_val*100:+.1f}%)"
-                )
+        if not absurd_mask.any():
+            continue
+
+        events = []
+        for dt in col[absurd_mask].index:
+            ret_val = float(col.loc[dt])
+            event = {
+                "date": str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10],
+                "return": ret_val,
+            }
+
+            # Add close prices if available
+            if close_matrix is not None and ticker in close_matrix.columns:
+                idx = close_matrix.index.get_loc(dt)
+                curr_close = float(close_matrix.iloc[idx][ticker]) if not np.isnan(close_matrix.iloc[idx][ticker]) else None
+                prev_close = float(close_matrix.iloc[idx - 1][ticker]) if idx > 0 and not np.isnan(close_matrix.iloc[idx - 1][ticker]) else None
+                event["prev_close"] = prev_close
+                event["curr_close"] = curr_close
+                close_str = f" prev={prev_close} curr={curr_close}" if prev_close is not None else ""
+            else:
+                close_str = ""
+
+            events.append(event)
+            detail_log.append(
+                f"  ABSURD {ticker} @ {event['date']}: "
+                f"return={ret_val:+.4f} ({ret_val*100:+.1f}%){close_str}"
+            )
+
+        n_events = len(events)
+        if n_events > ABSURD_MAX_EVENTS:
             flagged[ticker] = events
+            detail_log.append(
+                f"  -> DROP {ticker}: {n_events} absurd days (>{ABSURD_MAX_EVENTS})"
+            )
+        else:
+            warned[ticker] = events
+            detail_log.append(
+                f"  -> KEEP {ticker}: only {n_events} absurd day(s) (<={ABSURD_MAX_EVENTS})"
+            )
 
     return flagged, detail_log
 
@@ -1267,7 +1329,9 @@ def run_full_backtest(**kwargs):
     log(f"Universe: requested={len(requested_tickers)}, loaded(close)={len(active_tickers)}")
 
     # 1b. Validate returns — detect and DROP tickers with absurd daily returns
-    flagged_tickers, absurd_log = validate_returns(data.return_matrix)
+    flagged_tickers, absurd_log = validate_returns(
+        data.return_matrix, close_matrix=data.close_matrix
+    )
     dropped_absurd = []
     if flagged_tickers:
         for line in absurd_log:
@@ -1294,6 +1358,16 @@ def run_full_backtest(**kwargs):
     if not active_tickers:
         raise ValueError("All tickers dropped due to absurd daily returns.")
 
+    MIN_ACTIVE_TICKERS = 10
+    if len(active_tickers) < MIN_ACTIVE_TICKERS:
+        raise ValueError(
+            f"Insufficient universe: only {len(active_tickers)} active tickers "
+            f"(need >={MIN_ACTIVE_TICKERS}). Loaded: {active_tickers}. "
+            f"Dropped: {list(data.missing_report.keys())}. "
+            f"Try a larger or different ticker set, or use tickers='auto' "
+            f"for auto-discovery."
+        )
+
     # 2. Initialize clock with all dates
     clock.initialize(data.common_dates)
 
@@ -1312,13 +1386,15 @@ def run_full_backtest(**kwargs):
     # Investable tickers = those with feature data (the strategy can trade these)
     investable_tickers = sorted(data.feature_df["ticker"].unique())
 
-    # 3b. Auto-set top_k = min(top_k, active) if fewer tickers than requested
+    # 3b. Validate top_k vs active tickers
     original_top_k = cfg.top_k
-    if len(investable_tickers) < cfg.top_k:
-        log(f"  WARNING: only {len(investable_tickers)} active tickers but top_k={cfg.top_k}. "
-            f"Auto-setting top_k={len(investable_tickers)}")
-        # Mutate config (single-use object) to match reality
-        object.__setattr__(cfg, 'top_k', len(investable_tickers))
+    if len(investable_tickers) <= cfg.top_k:
+        # If top_k >= active, strategy holds everything => degenerate.
+        # Cap at active - 1 (minimum 1) so there's actual selection.
+        new_top_k = max(1, len(investable_tickers) - 1)
+        log(f"  WARNING: top_k={cfg.top_k} >= active tickers ({len(investable_tickers)}). "
+            f"Auto-setting top_k={new_top_k} to enable selection.")
+        object.__setattr__(cfg, 'top_k', new_top_k)
 
     log(f"Universe: active(features)={len(investable_tickers)}: {investable_tickers}")
     log(f"Rebalance schedule: {len(rebalance_dates)} dates, freq={cfg.rebalance}")
