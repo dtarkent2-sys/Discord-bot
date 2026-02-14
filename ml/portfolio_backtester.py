@@ -83,6 +83,7 @@ class BacktestConfig:
         "weighting", "max_weight", "max_leverage",
         "cost_bps", "slippage_bps", "vol_window",
         "target_vol_annual", "model_type", "seed", "data_dir",
+        "debug",
     )
 
     def __init__(self, **kw):
@@ -104,6 +105,7 @@ class BacktestConfig:
         self.model_type = kw.get("model_type", "gradient_boost")
         self.seed = kw.get("seed", 42)
         self.data_dir = kw.get("data_dir")
+        self.debug = kw.get("debug", False)
 
     def to_dict(self):
         return {s: getattr(self, s) for s in self.__slots__}
@@ -113,6 +115,7 @@ class BacktestConfig:
         data_dir is excluded (local path artefact, doesn't affect results)."""
         d = self.to_dict()
         d.pop("data_dir", None)
+        d.pop("debug", None)
         canonical = json.dumps(d, sort_keys=True, default=str)
         return hashlib.sha256(canonical.encode()).hexdigest()[:12]
 
@@ -898,14 +901,18 @@ class ExecutionSimulator:
 # ══════════════════════════════════════════════════════════════════════════
 
 def compute_benchmarks(return_matrix, common_dates, all_tickers,
-                       investable_tickers, top_k,
+                       investable_tickers, top_k, rebalance_freq,
                        cost_bps, slippage_bps, seed):
     """Compute benchmark return series.
+
+    Benchmarks use the SAME rebalance frequency as the strategy (rebalance_freq)
+    so comparisons are apples-to-apples.
 
     Args:
         all_tickers: tickers in the close/return matrix (for equal-weight benchmark)
         investable_tickers: tickers with feature data (for random baseline — same
                             universe as the strategy)
+        rebalance_freq: same freq as the strategy (e.g. 'W-MON')
     """
     _ensure_imports()
     rng = np.random.RandomState(seed + 1)
@@ -913,24 +920,34 @@ def compute_benchmarks(return_matrix, common_dates, all_tickers,
     dates = pd.DatetimeIndex(common_dates)
     benchmarks = {}
 
-    # ── Equal-weight benchmark (monthly rebalanced) ──────────────────────
+    # Build a rebalance schedule matching the strategy frequency
+    reb_schedule = set()
+    if len(dates) > 1:
+        freq_map = {
+            "W-MON": "W-MON", "W": "W-MON",
+            "M": "MS", "MS": "MS", "ME": "ME",
+            "2W": "2W-MON", "BM": "BMS",
+        }
+        freq = freq_map.get(rebalance_freq, rebalance_freq)
+        sched = pd.date_range(start=dates[0], end=dates[-1], freq=freq)
+        for s_date in sched:
+            candidates = dates[dates >= s_date]
+            if len(candidates) > 0:
+                reb_schedule.add(candidates[0])
+
+    # ── Equal-weight benchmark (same rebalance freq as strategy) ─────────
     ew_tickers = [t for t in all_tickers if t in return_matrix.columns]
     if ew_tickers:
         n = len(ew_tickers)
-        # Track actual portfolio weights that drift between rebalances
         weights = {t: 1.0 / n for t in ew_tickers}
         ew_returns = []
-        prev_month = None
         for i, date in enumerate(dates):
             if i == 0:
                 ew_returns.append(0.0)
-                prev_month = (date.year, date.month)
                 continue
-            # Monthly rebalance: reset to 1/n at month boundary
-            month_key = (date.year, date.month)
-            if month_key != prev_month:
+            # Rebalance on schedule dates: reset to 1/n
+            if date in reb_schedule:
                 weights = {t: 1.0 / n for t in ew_tickers}
-                prev_month = month_key
             # Daily return = sum(w_i * r_i)
             day_ret = 0.0
             if date in return_matrix.index:
@@ -950,7 +967,7 @@ def compute_benchmarks(return_matrix, common_dates, all_tickers,
                 weights = {t: w / gross_val for t, w in weights.items()}
 
         benchmarks["equal_weight_bh"] = {
-            "name": f"Equal-Weight {n}-stock (monthly reb.)",
+            "name": f"Equal-Weight {n}-stock ({rebalance_freq} reb.)",
             "daily_returns": ew_returns,
         }
 
@@ -965,31 +982,29 @@ def compute_benchmarks(return_matrix, common_dates, all_tickers,
                 spy_returns.append(0.0)
         benchmarks["spy_bh"] = {"name": "SPY Buy & Hold", "daily_returns": spy_returns}
 
-    # ── Random baseline (monthly re-draw from INVESTABLE tickers only) ───
+    # ── Random baseline (same rebalance cadence, from INVESTABLE tickers) ─
     rand_pool = [t for t in investable_tickers if t in return_matrix.columns]
     rand_k = min(top_k, max(1, len(rand_pool) - 1))  # at least 1 fewer than pool
     if len(rand_pool) >= 2 and rand_k >= 1:
         rand_returns = []
         current_picks = []
-        prev_month = None
         rand_log = []  # log first 5 selections
         for i, date in enumerate(dates):
-            month_key = (date.year, date.month)
-            if month_key != prev_month:
+            # Rebalance on the same schedule as strategy
+            if date in reb_schedule or i == 0:
                 old_picks = set(current_picks)
                 current_picks = list(rng.choice(rand_pool,
                                                 size=rand_k, replace=False))
                 new_picks = set(current_picks)
                 if len(rand_log) < 5:
                     rand_log.append(f"  {date.date()}: random={sorted(current_picks)}")
-                if prev_month is not None:
+                if old_picks:
                     all_t = old_picks.union(new_picks)
                     w_per = 1.0 / len(current_picks) if current_picks else 0
                     turnover = sum(abs((w_per if t in new_picks else 0) -
                                        (w_per if t in old_picks else 0)) for t in all_t)
                 else:
                     turnover = 0
-                prev_month = month_key
             else:
                 turnover = 0
 
@@ -1015,14 +1030,41 @@ def compute_benchmarks(return_matrix, common_dates, all_tickers,
                 log(line)
 
         benchmarks["random_baseline"] = {
-            "name": f"Random {rand_k}-pick (monthly, net)",
+            "name": f"Random {rand_k}-pick ({rebalance_freq}, net)",
             "daily_returns": rand_returns,
         }
 
     return benchmarks
 
 
-MAX_DAILY_RETURN = 0.50  # ±50% daily cap — anything beyond is data error
+ABSURD_DAILY_RETURN = 0.50  # ±50% — flag as data error, do NOT clip
+
+
+def validate_returns(return_matrix, daily_dates=None, label="Strategy"):
+    """Scan return matrix for absurd daily returns (>±50%).
+    Returns (flagged_tickers, detail_log) — tickers that should be dropped."""
+    _ensure_imports()
+    flagged = {}  # ticker -> list of (date, prev_price, curr_price, ret)
+    if return_matrix is None or return_matrix.empty:
+        return flagged, []
+
+    detail_log = []
+    for ticker in return_matrix.columns:
+        col = return_matrix[ticker].dropna()
+        absurd_mask = col.abs() > ABSURD_DAILY_RETURN
+        if absurd_mask.any():
+            events = []
+            for dt in col[absurd_mask].index:
+                ret_val = float(col.loc[dt])
+                events.append({"date": str(dt.date()) if hasattr(dt, 'date') else str(dt)[:10],
+                                "return": ret_val})
+                detail_log.append(
+                    f"  ABSURD {ticker} @ {dt.date() if hasattr(dt, 'date') else str(dt)[:10]}: "
+                    f"return={ret_val:+.4f} ({ret_val*100:+.1f}%)"
+                )
+            flagged[ticker] = events
+
+    return flagged, detail_log
 
 
 def compute_metrics(daily_returns, daily_dates=None, label="Strategy"):
@@ -1031,28 +1073,28 @@ def compute_metrics(daily_returns, daily_dates=None, label="Strategy"):
     rets = np.nan_to_num(rets, nan=0.0)
     n_days = len(rets)
     if n_days < 2:
-        return {"label": label, "total_return": 0.0, "cagr": 0.0, "vol": 0.0,
+        return {"label": label, "total_return_pct": 0.0, "equity_start": 1.0,
+                "equity_end": 1.0, "cagr": 0.0, "vol": 0.0,
                 "sharpe": 0.0, "sortino": 0.0, "max_dd": 0.0, "calmar": 0.0,
-                "n_days": 0, "equity_curve": [], "clipped_days": 0}
+                "n_days": 0, "equity_curve": []}
 
-    # Clip absurd daily returns (data errors)
-    n_clipped = int(np.sum(np.abs(rets) > MAX_DAILY_RETURN))
-    rets = np.clip(rets, -MAX_DAILY_RETURN, MAX_DAILY_RETURN)
-    if n_clipped > 0:
-        log(f"  [{label}] Clipped {n_clipped} daily returns exceeding ±{MAX_DAILY_RETURN:.0%}")
+    # NO clipping — absurd returns are caught upstream by validate_returns()
+    # and the offending ticker is dropped from the universe entirely.
 
     # Build equity curve: E_t = E_{t-1} * (1 + r_t)
     equity = np.cumprod(1.0 + rets)
 
-    # Assert equity never goes negative (impossible with clipped returns, but verify)
     assert np.all(equity > 0), (
         f"Negative equity detected in {label}: min={equity.min():.6f}")
 
-    total_return = float(equity[-1] - 1.0)  # growth of $1 -> E_end - 1
+    equity_start = 1.0
+    equity_end = float(equity[-1])
+    total_return_pct = (equity_end - 1.0) * 100.0  # percent, not fraction
 
     n_years = n_days / 252.0
-    cagr = (equity[-1] ** (1.0 / n_years) - 1.0
-            if n_years > 0 and equity[-1] > 0 else 0.0)
+    # CAGR = equity_end ^ (252 / n_days) - 1
+    cagr = (equity_end ** (252.0 / n_days) - 1.0
+            if n_days > 0 and equity_end > 0 else 0.0)
 
     vol = np.std(rets, ddof=1) * np.sqrt(252) if n_days > 1 else 0.0
     excess_mean = np.mean(rets) * 252
@@ -1069,7 +1111,9 @@ def compute_metrics(daily_returns, daily_dates=None, label="Strategy"):
 
     return {
         "label": label,
-        "total_return": round(float(total_return), 6),
+        "equity_start": round(float(equity_start), 6),
+        "equity_end": round(float(equity_end), 6),
+        "total_return_pct": round(float(total_return_pct), 4),
         "cagr": round(float(cagr), 6),
         "vol": round(float(vol), 6),
         "sharpe": round(float(sharpe), 4),
@@ -1078,7 +1122,6 @@ def compute_metrics(daily_returns, daily_dates=None, label="Strategy"):
         "calmar": round(float(calmar), 4),
         "n_days": n_days,
         "equity_curve": [round(float(x), 6) for x in equity],
-        "clipped_days": n_clipped,
     }
 
 
@@ -1223,6 +1266,34 @@ def run_full_backtest(**kwargs):
     # Universe reporting
     log(f"Universe: requested={len(requested_tickers)}, loaded(close)={len(active_tickers)}")
 
+    # 1b. Validate returns — detect and DROP tickers with absurd daily returns
+    flagged_tickers, absurd_log = validate_returns(data.return_matrix)
+    dropped_absurd = []
+    if flagged_tickers:
+        for line in absurd_log:
+            log(line)
+        for bad_ticker in flagged_tickers:
+            if bad_ticker in data.price_dict:
+                log(f"  DROPPING {bad_ticker}: {len(flagged_tickers[bad_ticker])} absurd daily returns")
+                del data.price_dict[bad_ticker]
+                data.missing_report[bad_ticker] = (
+                    f"absurd_returns ({len(flagged_tickers[bad_ticker])} days >±{ABSURD_DAILY_RETURN:.0%})"
+                )
+                dropped_absurd.append(bad_ticker)
+        if dropped_absurd:
+            # Rebuild matrices without the bad tickers
+            if data.return_matrix is not None:
+                keep_cols = [c for c in data.return_matrix.columns if c not in dropped_absurd]
+                data.close_matrix = data.close_matrix[keep_cols]
+                data.return_matrix = data.return_matrix[keep_cols]
+            if data.feature_df is not None:
+                data.feature_df = data.feature_df[~data.feature_df["ticker"].isin(dropped_absurd)]
+            active_tickers = sorted(data.price_dict.keys())
+            log(f"  After absurd-return cleanup: {len(active_tickers)} tickers remain")
+
+    if not active_tickers:
+        raise ValueError("All tickers dropped due to absurd daily returns.")
+
     # 2. Initialize clock with all dates
     clock.initialize(data.common_dates)
 
@@ -1240,6 +1311,15 @@ def run_full_backtest(**kwargs):
 
     # Investable tickers = those with feature data (the strategy can trade these)
     investable_tickers = sorted(data.feature_df["ticker"].unique())
+
+    # 3b. Auto-set top_k = min(top_k, active) if fewer tickers than requested
+    original_top_k = cfg.top_k
+    if len(investable_tickers) < cfg.top_k:
+        log(f"  WARNING: only {len(investable_tickers)} active tickers but top_k={cfg.top_k}. "
+            f"Auto-setting top_k={len(investable_tickers)}")
+        # Mutate config (single-use object) to match reality
+        object.__setattr__(cfg, 'top_k', len(investable_tickers))
+
     log(f"Universe: active(features)={len(investable_tickers)}: {investable_tickers}")
     log(f"Rebalance schedule: {len(rebalance_dates)} dates, freq={cfg.rebalance}")
 
@@ -1269,18 +1349,24 @@ def run_full_backtest(**kwargs):
 
     backtest_result = execution_sim.run(signals_df, cfg, oos_dates)
 
+    # 5b. Forensic sanity dump (--debug=1)
+    debug_dump = None
+    if cfg.debug:
+        debug_dump = _forensic_dump(signals_df, backtest_result, data, cfg)
+
     # 6. Metrics
     strategy_gross = compute_metrics(backtest_result["daily_returns_gross"],
                                      backtest_result["daily_dates"], "Strategy (gross)")
     strategy_net = compute_metrics(backtest_result["daily_returns_net"],
                                    backtest_result["daily_dates"], "Strategy (net)")
 
-    # 7. Benchmarks — pass both all_tickers and investable_tickers
+    # 7. Benchmarks — pass rebalance_freq so benchmarks match strategy cadence
     benchmarks_raw = compute_benchmarks(
         data.return_matrix, oos_dates,
         all_tickers=active_tickers,
         investable_tickers=investable_tickers,
         top_k=cfg.top_k,
+        rebalance_freq=cfg.rebalance,
         cost_bps=cfg.cost_bps, slippage_bps=cfg.slippage_bps, seed=cfg.seed,
     )
     benchmark_metrics = {}
@@ -1317,16 +1403,15 @@ def run_full_backtest(**kwargs):
         miss_pct = len(data.missing_report) / len(requested_tickers) * 100
         if miss_pct > 20:
             warnings_list.append(f"Missing data: {miss_pct:.0f}% of requested tickers")
-    if avg_holdings < cfg.top_k:
+    if original_top_k != cfg.top_k:
         warnings_list.append(
-            f"Avg holdings ({avg_holdings:.1f}) < top_k ({cfg.top_k}): "
-            f"only {len(investable_tickers)} tickers have feature data"
+            f"top_k auto-reduced from {original_top_k} to {cfg.top_k} "
+            f"(only {len(investable_tickers)} active tickers)"
         )
-    clipped = strategy_gross.get("clipped_days", 0)
-    if clipped > 0:
+    if dropped_absurd:
         warnings_list.append(
-            f"Clipped {clipped} days with daily return > ±{MAX_DAILY_RETURN:.0%} "
-            f"(likely data quality issues)"
+            f"Dropped {len(dropped_absurd)} tickers with absurd daily returns "
+            f"(>±{ABSURD_DAILY_RETURN:.0%}): {dropped_absurd}"
         )
     if clock.violations:
         warnings_list.append(f"LOOKAHEAD VIOLATIONS: {len(clock.violations)}")
@@ -1357,8 +1442,10 @@ def run_full_backtest(**kwargs):
     config_dict["tickers_missing"] = data.missing_report
     config_dict["start_date"] = eff_start
     config_dict["end_date"] = eff_end
+    if original_top_k != cfg.top_k:
+        config_dict["top_k_original"] = original_top_k
 
-    return {
+    result = {
         "config": config_dict,
         "strategy": {
             "gross": {k: v for k, v in strategy_gross.items() if k != "equity_curve"},
@@ -1380,6 +1467,71 @@ def run_full_backtest(**kwargs):
         "warnings": warnings_list,
         "chart_path": chart_path,
     }
+
+    if debug_dump:
+        result["debug"] = debug_dump
+
+    return result
+
+
+def _forensic_dump(signals_df, backtest_result, data, cfg):
+    """Build forensic sanity dump: first 3 rebalance dates with tickers+weights,
+    first 5 daily steps with per-ticker returns, portfolio return, equity."""
+    _ensure_imports()
+    dump = {"rebalances": [], "daily_steps": []}
+
+    # First 3 rebalance dates with selected tickers + weights
+    reb_dates = sorted(signals_df["date"].unique())[:3]
+    for rd in reb_dates:
+        picks = signals_df[signals_df["date"] == rd].sort_values(
+            "predicted_return", ascending=False
+        )
+        top_picks = picks.head(cfg.top_k)
+        n_selected = min(cfg.top_k, len(picks))
+        w = 1.0 / n_selected if n_selected > 0 else 0
+        entry = {
+            "date": str(rd.date()) if hasattr(rd, 'date') else str(rd)[:10],
+            "tickers": list(top_picks["ticker"].values),
+            "predicted_returns": [round(float(x), 6) for x in top_picks["predicted_return"].values],
+            "weight_each": round(w, 4),
+        }
+        dump["rebalances"].append(entry)
+        log(f"  [DEBUG] Rebalance {entry['date']}: "
+            f"tickers={entry['tickers']} weights={entry['weight_each']}")
+
+    # First 5 daily steps with per-ticker returns
+    daily_dates = backtest_result["daily_dates"]
+    daily_rets_net = backtest_result["daily_returns_net"]
+    daily_rets_gross = backtest_result["daily_returns_gross"]
+    return_matrix = data.return_matrix
+
+    equity = 1.0
+    for i in range(min(5, len(daily_dates))):
+        dt_str = daily_dates[i]
+        dt = pd.Timestamp(dt_str)
+        per_ticker = {}
+        if dt in return_matrix.index:
+            for tkr in return_matrix.columns:
+                r = return_matrix.loc[dt, tkr]
+                if not np.isnan(r):
+                    per_ticker[tkr] = round(float(r), 6)
+
+        equity_before = equity
+        equity *= (1.0 + daily_rets_net[i])
+        step = {
+            "date": dt_str,
+            "portfolio_return_gross": round(daily_rets_gross[i], 6),
+            "portfolio_return_net": round(daily_rets_net[i], 6),
+            "equity_before": round(equity_before, 6),
+            "equity_after": round(equity, 6),
+            "per_ticker_returns": per_ticker,
+            "holdings": backtest_result["holdings_count"][i] if i < len(backtest_result["holdings_count"]) else 0,
+        }
+        dump["daily_steps"].append(step)
+        log(f"  [DEBUG] Day {dt_str}: gross={daily_rets_gross[i]:+.6f} "
+            f"net={daily_rets_net[i]:+.6f} equity={equity:.6f}")
+
+    return dump
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -1404,6 +1556,8 @@ def main():
     parser.add_argument("--model", choices=["linear", "gradient_boost"], default="gradient_boost")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-dir")
+    parser.add_argument("--debug", type=int, default=0,
+                        help="1=forensic sanity dump (first 3 rebalances, first 5 daily steps)")
 
     args = parser.parse_args()
 
@@ -1436,6 +1590,7 @@ def main():
             model_type=args.model,
             seed=args.seed,
             data_dir=args.data_dir,
+            debug=bool(args.debug),
         )
         print(json.dumps(result))
     except Exception as e:

@@ -59,10 +59,14 @@ function compileConfig(options = {}) {
     target_vol_annual: options.targetVolAnnual || 0.15,
     model_type: options.model || 'gradient_boost',
     seed: options.seed || 42,
+    debug: options.debug || false,
   };
 
   // Deterministic hash (matches Python BacktestConfig.config_hash)
-  const canonical = JSON.stringify(cfg, Object.keys(cfg).sort());
+  // Exclude debug and data_dir — they don't affect results
+  const hashObj = { ...cfg };
+  delete hashObj.debug;
+  const canonical = JSON.stringify(hashObj, Object.keys(hashObj).sort());
   cfg._hash = crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 12);
 
   return cfg;
@@ -190,6 +194,7 @@ class MLPortfolio {
       if (cfg.start_date) args.push('--start-date', cfg.start_date);
       if (cfg.end_date) args.push('--end-date', cfg.end_date);
       if (cfg.days) args.push('--days', String(cfg.days));
+      if (cfg.debug) args.push('--debug', '1');
       if (process.env.ML_DATA_DIR) args.push('--data-dir', process.env.ML_DATA_DIR);
 
       console.log(`[ML-Portfolio] Spawning: cfg=${cfg._hash} tickers=${cfg.tickers} fwd=${cfg.forward}d`);
@@ -307,13 +312,16 @@ class MLPortfolio {
     lines.push('');
     lines.push('**Trading Stats:**');
     lines.push('```');
+    lines.push(`Equity Start:         ${n2(gross.equity_start || 1.0)}`);
+    lines.push(`Equity End (gross):   ${n2(gross.equity_end || 1.0)}`);
+    lines.push(`Equity End (net):     ${n2(net.equity_end || 1.0)}`);
+    lines.push(`Gross Return:         ${pctDirect(gross.total_return_pct)}`);
+    lines.push(`Net Return:           ${pctDirect(net.total_return_pct)}`);
     lines.push(`Hit Rate (rebalance): ${pct1(strat.hit_rate)}`);
     lines.push(`Avg Holdings:         ${n1(strat.avg_holdings)}`);
     lines.push(`Turnover/yr:          ${n2(strat.turnover_annual)}`);
     lines.push(`Total Costs:          ${pctSigned(strat.total_cost)}`);
     lines.push(`Rebalances:           ${strat.num_rebalances || 0}`);
-    lines.push(`Gross Return:         ${pctSigned(gross.total_return)}`);
-    lines.push(`Net Return:           ${pctSigned(net.total_return)}`);
     lines.push('```');
 
     // Annual breakdown
@@ -369,6 +377,11 @@ function pct1(v) { return (Number(v || 0) * 100).toFixed(1) + '%'; }
 function pctSigned(v) {
   const x = Number(v || 0) * 100;
   return (x >= 0 ? '+' : '') + x.toFixed(1) + '%';
+}
+/** total_return_pct is already in % units (e.g. 12.3 means +12.3%) */
+function pctDirect(v) {
+  const x = Number(v || 0);
+  return (x >= 0 ? '+' : '') + x.toFixed(2) + '%';
 }
 
 module.exports = new MLPortfolio();
