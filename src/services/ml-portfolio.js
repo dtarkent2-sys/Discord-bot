@@ -1,20 +1,29 @@
 /**
- * ML Portfolio Backtester — Node.js Bridge
+ * ML Portfolio Backtester — Node.js Bridge (v2)
  *
- * Spawns ml/portfolio_backtester.py as a subprocess, captures JSON output,
- * and formats results for Discord display.
+ * Patterns:
+ *  - Config-driven: compile slash args -> config object -> SHA-256 hash
+ *  - Redis distributed lock: SET NX PX prevents concurrent backtests
+ *  - Atomic state: lock logs, fallback to in-process mutex
+ *  - Spawns ml/portfolio_backtester.py, captures JSON, formats for Discord
  */
 
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 const ML_SCRIPT = path.join(__dirname, '..', '..', 'ml', 'portfolio_backtester.py');
 
 const _resultCache = new Map();
-const RESULT_CACHE_TTL = 10 * 60 * 1000; // 10 min cache for portfolio (heavier compute)
+const RESULT_CACHE_TTL = 10 * 60 * 1000;
 
-/** Extract the last JSON object from stdout (handles stray print output) */
+// In-process mutex fallback (when Redis unavailable)
+let _inProcessLock = false;
+const LOCK_KEY = 'mlportfolio:run';
+const LOCK_TTL_MS = 600_000; // 10 min max run
+
+/** Extract last JSON object from stdout */
 function _extractJson(raw) {
   const trimmed = raw.trim();
   if (trimmed.startsWith('{')) return trimmed;
@@ -27,93 +36,175 @@ function _extractJson(raw) {
   return trimmed;
 }
 
-class MLPortfolio {
-  get enabled() {
-    return true; // No API key needed — uses local parquet data
+/**
+ * Compile slash command options into a canonical config object.
+ * This mirrors BacktestConfig in Python — same fields, same hash.
+ */
+function compileConfig(options = {}) {
+  const cfg = {
+    tickers: options.tickers || 'mega',
+    start_date: options.startDate || null,
+    end_date: options.endDate || null,
+    days: options.days || null,
+    forward: options.forward || 20,
+    rebalance: options.rebalance || 'W-MON',
+    top_k: options.topK || 10,
+    bottom_k: options.bottomK || 0,
+    weighting: options.weighting || 'equal',
+    max_weight: options.maxWeight || 0.15,
+    max_leverage: options.maxLeverage || 1.0,
+    cost_bps: options.costBps != null ? options.costBps : 10,
+    slippage_bps: options.slippageBps != null ? options.slippageBps : 0,
+    vol_window: options.volWindow || 20,
+    target_vol_annual: options.targetVolAnnual || 0.15,
+    model_type: options.model || 'gradient_boost',
+    seed: options.seed || 42,
+  };
+
+  // Deterministic hash (matches Python BacktestConfig.config_hash)
+  const canonical = JSON.stringify(cfg, Object.keys(cfg).sort());
+  cfg._hash = crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 12);
+
+  return cfg;
+}
+
+
+// ── Redis Distributed Lock ──────────────────────────────────────────────
+
+let _redisClient = null;
+
+async function _getRedis() {
+  if (_redisClient) return _redisClient;
+
+  const redisUrl = process.env.REDIS_URL;
+  if (!redisUrl) return null;
+
+  try {
+    const { createRedisClient } = require('../runtime/redis-client');
+    _redisClient = await createRedisClient(redisUrl);
+    return _redisClient;
+  } catch (err) {
+    console.log(`[ML-Portfolio] Redis unavailable: ${err.message} — using in-process lock`);
+    return null;
+  }
+}
+
+async function acquireRunLock(configHash) {
+  const lockKey = `${LOCK_KEY}:${configHash}`;
+  const lockValue = `${process.pid}-${Date.now()}`;
+
+  // Try Redis lock first
+  const redis = await _getRedis();
+  if (redis && redis.connected) {
+    try {
+      const result = await redis.sendCommand('SET', lockKey, lockValue, 'NX', 'PX', String(LOCK_TTL_MS));
+      if (result === 'OK') {
+        console.log(`[ML-Portfolio] Redis lock ACQUIRED: ${lockKey} (ttl=${LOCK_TTL_MS / 1000}s)`);
+        return { type: 'redis', key: lockKey, value: lockValue };
+      }
+      // Lock held by another run
+      const ttl = await redis.sendCommand('PTTL', lockKey);
+      console.log(`[ML-Portfolio] Redis lock BUSY: ${lockKey} (remaining=${ttl}ms)`);
+      return null; // Caller should tell user to wait
+    } catch (err) {
+      console.log(`[ML-Portfolio] Redis lock error: ${err.message} — fallback to in-process`);
+    }
   }
 
-  /**
-   * @param {object} options
-   * @param {string} options.tickers        - Comma-separated or preset name
-   * @param {string} [options.startDate]
-   * @param {string} [options.endDate]
-   * @param {number} [options.days]
-   * @param {number} [options.forward=20]
-   * @param {string} [options.rebalance='W-MON']
-   * @param {number} [options.topK=10]
-   * @param {number} [options.bottomK=0]
-   * @param {string} [options.weighting='equal']
-   * @param {number} [options.maxWeight=0.15]
-   * @param {number} [options.maxLeverage=1.0]
-   * @param {number} [options.costBps=10]
-   * @param {number} [options.slippageBps=0]
-   * @param {number} [options.volWindow=20]
-   * @param {number} [options.targetVolAnnual=0.15]
-   * @param {string} [options.model='gradient_boost']
-   * @param {number} [options.seed=42]
-   */
+  // Fallback: in-process mutex
+  if (_inProcessLock) {
+    console.log('[ML-Portfolio] In-process lock BUSY');
+    return null;
+  }
+  _inProcessLock = true;
+  console.log('[ML-Portfolio] In-process lock ACQUIRED');
+  return { type: 'memory' };
+}
+
+async function releaseRunLock(lock) {
+  if (!lock) return;
+
+  if (lock.type === 'redis') {
+    try {
+      const redis = await _getRedis();
+      if (redis && redis.connected) {
+        // Only release if we still own it (compare-and-delete)
+        const current = await redis.sendCommand('GET', lock.key);
+        if (current === lock.value) {
+          await redis.sendCommand('DEL', lock.key);
+          console.log(`[ML-Portfolio] Redis lock RELEASED: ${lock.key}`);
+        }
+      }
+    } catch (err) {
+      console.log(`[ML-Portfolio] Redis lock release error: ${err.message}`);
+    }
+  } else {
+    _inProcessLock = false;
+    console.log('[ML-Portfolio] In-process lock RELEASED');
+  }
+}
+
+
+// ── Main Service ────────────────────────────────────────────────────────
+
+class MLPortfolio {
+  get enabled() {
+    return true;
+  }
+
   async runBacktest(options = {}) {
-    const tickers = options.tickers || 'mega';
-    const forward = options.forward || 20;
-    const rebalance = options.rebalance || 'W-MON';
-    const topK = options.topK || 10;
-    const bottomK = options.bottomK || 0;
-    const weighting = options.weighting || 'equal';
-    const maxWeight = options.maxWeight || 0.15;
-    const maxLeverage = options.maxLeverage || 1.0;
-    const costBps = options.costBps != null ? options.costBps : 10;
-    const slippageBps = options.slippageBps != null ? options.slippageBps : 0;
-    const volWindow = options.volWindow || 20;
-    const targetVolAnnual = options.targetVolAnnual || 0.15;
-    const model = options.model || 'gradient_boost';
-    const seed = options.seed || 42;
+    const cfg = compileConfig(options);
 
-    const cacheKey = [
-      tickers, options.startDate, options.endDate, options.days,
-      forward, rebalance, topK, bottomK, weighting,
-      maxWeight, maxLeverage, costBps, slippageBps,
-      volWindow, targetVolAnnual, model, seed,
-    ].join('|');
-
-    const cached = _resultCache.get(cacheKey);
+    // Check cache (keyed by config hash)
+    const cached = _resultCache.get(cfg._hash);
     if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL) {
-      console.log(`[ML-Portfolio] Cache hit`);
+      console.log(`[ML-Portfolio] Cache hit: cfg=${cfg._hash}`);
       return cached.data;
     }
 
-    const args = [
-      ML_SCRIPT,
-      '--tickers', tickers,
-      '--forward', String(forward),
-      '--rebalance', rebalance,
-      '--top-k', String(topK),
-      '--bottom-k', String(bottomK),
-      '--weighting', weighting,
-      '--max-weight', String(maxWeight),
-      '--max-leverage', String(maxLeverage),
-      '--cost-bps', String(costBps),
-      '--slippage-bps', String(slippageBps),
-      '--vol-window', String(volWindow),
-      '--target-vol-annual', String(targetVolAnnual),
-      '--model', model,
-      '--seed', String(seed),
-    ];
+    // Acquire distributed lock
+    const lock = await acquireRunLock(cfg._hash);
+    if (!lock) {
+      throw new Error('Another portfolio backtest is running. Please wait and retry.');
+    }
 
-    if (options.startDate) args.push('--start-date', options.startDate);
-    if (options.endDate) args.push('--end-date', options.endDate);
-    if (options.days) args.push('--days', String(options.days));
-    if (process.env.ML_DATA_DIR) args.push('--data-dir', process.env.ML_DATA_DIR);
+    try {
+      const args = [
+        ML_SCRIPT,
+        '--tickers', cfg.tickers,
+        '--forward', String(cfg.forward),
+        '--rebalance', cfg.rebalance,
+        '--top-k', String(cfg.top_k),
+        '--bottom-k', String(cfg.bottom_k),
+        '--weighting', cfg.weighting,
+        '--max-weight', String(cfg.max_weight),
+        '--max-leverage', String(cfg.max_leverage),
+        '--cost-bps', String(cfg.cost_bps),
+        '--slippage-bps', String(cfg.slippage_bps),
+        '--vol-window', String(cfg.vol_window),
+        '--target-vol-annual', String(cfg.target_vol_annual),
+        '--model', cfg.model_type,
+        '--seed', String(cfg.seed),
+      ];
 
-    console.log(`[ML-Portfolio] Spawning: tickers=${tickers} fwd=${forward}d reb=${rebalance} top_k=${topK} wt=${weighting}`);
-    const t0 = Date.now();
+      if (cfg.start_date) args.push('--start-date', cfg.start_date);
+      if (cfg.end_date) args.push('--end-date', cfg.end_date);
+      if (cfg.days) args.push('--days', String(cfg.days));
+      if (process.env.ML_DATA_DIR) args.push('--data-dir', process.env.ML_DATA_DIR);
 
-    const result = await this._spawnPython(args);
-    console.log(`[ML-Portfolio] Completed in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      console.log(`[ML-Portfolio] Spawning: cfg=${cfg._hash} tickers=${cfg.tickers} fwd=${cfg.forward}d`);
+      const t0 = Date.now();
 
-    if (result.error) throw new Error(result.error);
+      const result = await this._spawnPython(args);
+      console.log(`[ML-Portfolio] Completed in ${((Date.now() - t0) / 1000).toFixed(1)}s cfg=${cfg._hash}`);
 
-    _resultCache.set(cacheKey, { data: result, ts: Date.now() });
-    return result;
+      if (result.error) throw new Error(result.error);
+
+      _resultCache.set(cfg._hash, { data: result, ts: Date.now() });
+      return result;
+    } finally {
+      await releaseRunLock(lock);
+    }
   }
 
   _spawnPython(args) {
@@ -175,13 +266,15 @@ class MLPortfolio {
     const net = strat.net || {};
     const benchmarks = result.benchmarks || {};
     const warns = result.warnings || [];
+    const panel = result.panel_stats || {};
 
     const lines = [
-      `**ML Portfolio Backtester**`,
+      `**ML Portfolio Backtester** \`cfg=${cfg.config_hash || '?'}\``,
       '',
       `**Config:** ${cfg.tickers_loaded || '?'} tickers | fwd=${cfg.forward || 20}d | reb=${cfg.rebalance || 'W-MON'} | top_k=${cfg.top_k || 10}`,
       `**Weighting:** ${cfg.weighting || 'equal'} | max_wt=${pct1(cfg.max_weight)} | lev_cap=${n2(cfg.max_leverage)} | cost=${cfg.cost_bps || 10}bp + slip=${cfg.slippage_bps || 0}bp`,
       `**Period:** ${cfg.start_date || '?'} to ${cfg.end_date || '?'} | seed=${cfg.seed || 42}`,
+      `**Panel:** ${panel.tickers || '?'}×${panel.dates || '?'} | fill=${pct1(panel.fill_rate)} | missing=${panel.missing_tickers || 0}`,
       '',
     ];
 
@@ -223,7 +316,7 @@ class MLPortfolio {
     lines.push(`Net Return:           ${pctSigned(net.total_return)}`);
     lines.push('```');
 
-    // Subperiod breakdown
+    // Annual breakdown
     const subperiod = result.subperiod || {};
     const years = Object.keys(subperiod);
     if (years.length > 0) {
@@ -264,7 +357,7 @@ class MLPortfolio {
   getStatus() {
     return {
       enabled: this.enabled,
-      engine: 'python (local parquets + scikit-learn + portfolio engine)',
+      engine: 'python v2 (SimClock + DataProvider + SignalModel + PortfolioEngine + ExecSim)',
       cacheSize: _resultCache.size,
     };
   }
