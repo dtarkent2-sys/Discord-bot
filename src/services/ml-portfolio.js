@@ -271,10 +271,10 @@ class MLPortfolio {
     const lines = [
       `**ML Portfolio Backtester** \`cfg=${cfg.config_hash || '?'}\``,
       '',
-      `**Config:** ${cfg.tickers_loaded || '?'} tickers | fwd=${cfg.forward || 20}d | reb=${cfg.rebalance || 'W-MON'} | top_k=${cfg.top_k || 10}`,
+      `**Config:** ${cfg.tickers_active || cfg.tickers_loaded || '?'} active tickers | fwd=${cfg.forward || 20}d | reb=${cfg.rebalance || 'W-MON'} | top_k=${cfg.top_k || 10}`,
       `**Weighting:** ${cfg.weighting || 'equal'} | max_wt=${pct1(cfg.max_weight)} | lev_cap=${n2(cfg.max_leverage)} | cost=${cfg.cost_bps || 10}bp + slip=${cfg.slippage_bps || 0}bp`,
       `**Period:** ${cfg.start_date || '?'} to ${cfg.end_date || '?'} | seed=${cfg.seed || 42}`,
-      `**Panel:** ${panel.tickers || '?'}×${panel.dates || '?'} | fill=${pct1(panel.fill_rate)} | missing=${panel.missing_tickers || 0}`,
+      `**Panel:** ${panel.tickers_loaded || '?'} loaded / ${panel.tickers_active || '?'} active × ${panel.dates || '?'} dates | fill=${pct1(panel.fill_rate)} | dropped=${panel.dropped_tickers || 0}`,
       '',
     ];
 

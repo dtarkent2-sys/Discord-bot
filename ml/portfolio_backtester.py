@@ -520,18 +520,20 @@ class DataProvider:
     @property
     def panel_stats(self):
         """Summary stats for the canonical panel."""
-        n_tickers = len(self.price_dict)
+        n_tickers_loaded = len(self.price_dict)
+        n_tickers_active = self.feature_df["ticker"].nunique() if self.feature_df is not None else 0
         n_dates = len(self.common_dates)
-        total_cells = n_tickers * n_dates
+        total_cells = n_tickers_loaded * n_dates
         non_null = sum(
             self.close_matrix[t].notna().sum() for t in self.close_matrix.columns
         ) if self.close_matrix is not None else 0
         fill_rate = non_null / total_cells if total_cells > 0 else 0
         return {
-            "tickers": n_tickers,
+            "tickers_loaded": n_tickers_loaded,
+            "tickers_active": n_tickers_active,
             "dates": n_dates,
             "fill_rate": round(fill_rate, 4),
-            "missing_tickers": len(self.missing_report),
+            "dropped_tickers": len(self.missing_report),
         }
 
 
@@ -658,15 +660,20 @@ class PortfolioEngine:
         self.data = data
 
     def construct(self, signals_at_date, cfg: BacktestConfig, current_date):
-        """Rank by predicted return, select top_k/bottom_k, weight, cap."""
+        """Rank by predicted return, select top_k/bottom_k, weight, cap.
+        If fewer tickers have signals than top_k, uses all available."""
         if len(signals_at_date) == 0:
             return {}
 
         ranked = signals_at_date.sort_values("predicted_return", ascending=False)
 
-        long_tickers = list(ranked.head(cfg.top_k)["ticker"].values)
-        short_tickers = (list(ranked.tail(cfg.bottom_k)["ticker"].values)
-                         if cfg.bottom_k > 0 else [])
+        avail = len(ranked)
+        eff_top_k = min(cfg.top_k, avail)
+        eff_bottom_k = min(cfg.bottom_k, max(0, avail - eff_top_k))
+
+        long_tickers = list(ranked.head(eff_top_k)["ticker"].values)
+        short_tickers = (list(ranked.tail(eff_bottom_k)["ticker"].values)
+                         if eff_bottom_k > 0 else [])
         short_tickers = [t for t in short_tickers if t not in long_tickers]
 
         selected = long_tickers + short_tickers
@@ -854,35 +861,64 @@ class ExecutionSimulator:
 #  Benchmarks & Metrics  (stateless utilities, unchanged)
 # ══════════════════════════════════════════════════════════════════════════
 
-def compute_benchmarks(return_matrix, common_dates, tickers, top_k,
+def compute_benchmarks(return_matrix, common_dates, all_tickers,
+                       investable_tickers, top_k,
                        cost_bps, slippage_bps, seed):
+    """Compute benchmark return series.
+
+    Args:
+        all_tickers: tickers in the close/return matrix (for equal-weight benchmark)
+        investable_tickers: tickers with feature data (for random baseline — same
+                            universe as the strategy)
+    """
     _ensure_imports()
     rng = np.random.RandomState(seed + 1)
     cost_rate = (cost_bps + slippage_bps) / 10000.0
     dates = pd.DatetimeIndex(common_dates)
     benchmarks = {}
 
-    ew_tickers = [t for t in tickers if t in return_matrix.columns]
+    # ── Equal-weight benchmark (monthly rebalanced) ──────────────────────
+    ew_tickers = [t for t in all_tickers if t in return_matrix.columns]
     if ew_tickers:
         n = len(ew_tickers)
-        w = 1.0 / n
+        # Track actual portfolio weights that drift between rebalances
+        weights = {t: 1.0 / n for t in ew_tickers}
         ew_returns = []
+        prev_month = None
         for i, date in enumerate(dates):
             if i == 0:
                 ew_returns.append(0.0)
+                prev_month = (date.year, date.month)
                 continue
+            # Monthly rebalance: reset to 1/n at month boundary
+            month_key = (date.year, date.month)
+            if month_key != prev_month:
+                weights = {t: 1.0 / n for t in ew_tickers}
+                prev_month = month_key
+            # Daily return = sum(w_i * r_i)
+            day_ret = 0.0
             if date in return_matrix.index:
-                day_ret = sum(w * return_matrix.loc[date, t]
-                              for t in ew_tickers
-                              if t in return_matrix.columns and not np.isnan(return_matrix.loc[date, t]))
-            else:
-                day_ret = 0.0
+                for t in ew_tickers:
+                    r = return_matrix.loc[date, t]
+                    if not np.isnan(r):
+                        day_ret += weights[t] * r
             ew_returns.append(day_ret)
+            # Drift weights by today's returns
+            gross_val = 0.0
+            for t in ew_tickers:
+                r = return_matrix.loc[date, t] if date in return_matrix.index else 0.0
+                r = r if not np.isnan(r) else 0.0
+                weights[t] *= (1.0 + r)
+                gross_val += abs(weights[t])
+            if gross_val > 0:
+                weights = {t: w / gross_val for t, w in weights.items()}
+
         benchmarks["equal_weight_bh"] = {
-            "name": "Equal-Weight B&H (monthly reb.)",
+            "name": f"Equal-Weight {n}-stock (monthly reb.)",
             "daily_returns": ew_returns,
         }
 
+    # ── SPY Buy & Hold ───────────────────────────────────────────────────
     if "SPY" in return_matrix.columns:
         spy_returns = []
         for date in dates:
@@ -893,17 +929,23 @@ def compute_benchmarks(return_matrix, common_dates, tickers, top_k,
                 spy_returns.append(0.0)
         benchmarks["spy_bh"] = {"name": "SPY Buy & Hold", "daily_returns": spy_returns}
 
-    if ew_tickers and top_k <= len(ew_tickers):
+    # ── Random baseline (monthly re-draw from INVESTABLE tickers only) ───
+    rand_pool = [t for t in investable_tickers if t in return_matrix.columns]
+    rand_k = min(top_k, max(1, len(rand_pool) - 1))  # at least 1 fewer than pool
+    if len(rand_pool) >= 2 and rand_k >= 1:
         rand_returns = []
         current_picks = []
         prev_month = None
+        rand_log = []  # log first 5 selections
         for i, date in enumerate(dates):
             month_key = (date.year, date.month)
             if month_key != prev_month:
                 old_picks = set(current_picks)
-                current_picks = list(rng.choice(ew_tickers,
-                                                size=min(top_k, len(ew_tickers)), replace=False))
+                current_picks = list(rng.choice(rand_pool,
+                                                size=rand_k, replace=False))
                 new_picks = set(current_picks)
+                if len(rand_log) < 5:
+                    rand_log.append(f"  {date.date()}: random={sorted(current_picks)}")
                 if prev_month is not None:
                     all_t = old_picks.union(new_picks)
                     w_per = 1.0 / len(current_picks) if current_picks else 0
@@ -920,23 +962,31 @@ def compute_benchmarks(return_matrix, common_dates, tickers, top_k,
                 continue
 
             w_per = 1.0 / len(current_picks)
+            day_ret = 0.0
             if date in return_matrix.index:
-                day_ret = sum(w_per * return_matrix.loc[date, t]
-                              for t in current_picks
-                              if t in return_matrix.columns
-                              and not np.isnan(return_matrix.loc[date, t]))
-            else:
-                day_ret = 0.0
+                for t in current_picks:
+                    if t in return_matrix.columns:
+                        r = return_matrix.loc[date, t]
+                        if not np.isnan(r):
+                            day_ret += w_per * r
 
             cost_today = turnover * cost_rate if turnover > 0 else 0
             rand_returns.append(day_ret - cost_today)
 
+        if rand_log:
+            log("Random baseline picks (first 5):")
+            for line in rand_log:
+                log(line)
+
         benchmarks["random_baseline"] = {
-            "name": f"Random {top_k}-pick (monthly, net)",
+            "name": f"Random {rand_k}-pick (monthly, net)",
             "daily_returns": rand_returns,
         }
 
     return benchmarks
+
+
+MAX_DAILY_RETURN = 0.50  # ±50% daily cap — anything beyond is data error
 
 
 def compute_metrics(daily_returns, daily_dates=None, label="Strategy"):
@@ -947,14 +997,26 @@ def compute_metrics(daily_returns, daily_dates=None, label="Strategy"):
     if n_days < 2:
         return {"label": label, "total_return": 0.0, "cagr": 0.0, "vol": 0.0,
                 "sharpe": 0.0, "sortino": 0.0, "max_dd": 0.0, "calmar": 0.0,
-                "n_days": 0, "equity_curve": []}
+                "n_days": 0, "equity_curve": [], "clipped_days": 0}
 
+    # Clip absurd daily returns (data errors)
+    n_clipped = int(np.sum(np.abs(rets) > MAX_DAILY_RETURN))
+    rets = np.clip(rets, -MAX_DAILY_RETURN, MAX_DAILY_RETURN)
+    if n_clipped > 0:
+        log(f"  [{label}] Clipped {n_clipped} daily returns exceeding ±{MAX_DAILY_RETURN:.0%}")
+
+    # Build equity curve: E_t = E_{t-1} * (1 + r_t)
     equity = np.cumprod(1.0 + rets)
-    total_return = equity[-1] / equity[0] - 1.0 if equity[0] != 0 else 0.0
+
+    # Assert equity never goes negative (impossible with clipped returns, but verify)
+    assert np.all(equity > 0), (
+        f"Negative equity detected in {label}: min={equity.min():.6f}")
+
+    total_return = float(equity[-1] - 1.0)  # growth of $1 -> E_end - 1
 
     n_years = n_days / 252.0
-    cagr = ((equity[-1] / equity[0]) ** (1.0 / n_years) - 1.0
-            if n_years > 0 and equity[-1] > 0 and equity[0] > 0 else 0.0)
+    cagr = (equity[-1] ** (1.0 / n_years) - 1.0
+            if n_years > 0 and equity[-1] > 0 else 0.0)
 
     vol = np.std(rets, ddof=1) * np.sqrt(252) if n_days > 1 else 0.0
     excess_mean = np.mean(rets) * 252
@@ -980,6 +1042,7 @@ def compute_metrics(daily_returns, daily_dates=None, label="Strategy"):
         "calmar": round(float(calmar), 4),
         "n_days": n_days,
         "equity_curve": [round(float(x), 6) for x in equity],
+        "clipped_days": n_clipped,
     }
 
 
@@ -1119,10 +1182,10 @@ def run_full_backtest(**kwargs):
     # 1. Load data
     data.load(cfg)
     active_tickers = sorted(data.price_dict.keys())
+    requested_tickers = cfg.resolve_tickers()
 
-    if len(active_tickers) < cfg.top_k:
-        log(f"WARNING: Only {len(active_tickers)} tickers loaded, reducing top_k")
-        cfg.top_k = len(active_tickers)
+    # Universe reporting
+    log(f"Universe: requested={len(requested_tickers)}, loaded(close)={len(active_tickers)}")
 
     # 2. Initialize clock with all dates
     clock.initialize(data.common_dates)
@@ -1139,10 +1202,24 @@ def run_full_backtest(**kwargs):
     if len(rebalance_dates) < 5:
         raise ValueError(f"Only {len(rebalance_dates)} rebalance dates with feature data.")
 
+    # Investable tickers = those with feature data (the strategy can trade these)
+    investable_tickers = sorted(data.feature_df["ticker"].unique())
+    log(f"Universe: active(features)={len(investable_tickers)}: {investable_tickers}")
     log(f"Rebalance schedule: {len(rebalance_dates)} dates, freq={cfg.rebalance}")
 
     # 4. Generate ML signals (clock advances through rebalance dates)
     signals_df, train_info = signal_model.generate_signals(rebalance_dates, cfg)
+
+    # Log first 5 strategy selections
+    if len(signals_df) > 0:
+        strat_log_dates = sorted(signals_df["date"].unique())[:5]
+        for sd in strat_log_dates:
+            picks = signals_df[signals_df["date"] == sd].sort_values(
+                "predicted_return", ascending=False
+            )
+            top = list(picks.head(cfg.top_k)["ticker"].values)
+            log(f"  {sd.date() if hasattr(sd, 'date') else str(sd)[:10]}: "
+                f"strategy top-{cfg.top_k}={top}")
 
     # 5. Reset clock for execution phase (start fresh from OOS period)
     oos_start = rebalance_dates[0]
@@ -1162,10 +1239,13 @@ def run_full_backtest(**kwargs):
     strategy_net = compute_metrics(backtest_result["daily_returns_net"],
                                    backtest_result["daily_dates"], "Strategy (net)")
 
-    # 7. Benchmarks
+    # 7. Benchmarks — pass both all_tickers and investable_tickers
     benchmarks_raw = compute_benchmarks(
-        data.return_matrix, oos_dates, active_tickers,
-        cfg.top_k, cfg.cost_bps, cfg.slippage_bps, cfg.seed,
+        data.return_matrix, oos_dates,
+        all_tickers=active_tickers,
+        investable_tickers=investable_tickers,
+        top_k=cfg.top_k,
+        cost_bps=cfg.cost_bps, slippage_bps=cfg.slippage_bps, seed=cfg.seed,
     )
     benchmark_metrics = {}
     for bkey, bdata in benchmarks_raw.items():
@@ -1198,14 +1278,25 @@ def run_full_backtest(**kwargs):
     if cfg.top_k <= 3:
         warnings_list.append(f"top_k={cfg.top_k} is very concentrated")
     if data.missing_report:
-        miss_pct = len(data.missing_report) / len(cfg.resolve_tickers()) * 100
+        miss_pct = len(data.missing_report) / len(requested_tickers) * 100
         if miss_pct > 20:
             warnings_list.append(f"Missing data: {miss_pct:.0f}% of requested tickers")
+    if avg_holdings < cfg.top_k:
+        warnings_list.append(
+            f"Avg holdings ({avg_holdings:.1f}) < top_k ({cfg.top_k}): "
+            f"only {len(investable_tickers)} tickers have feature data"
+        )
+    clipped = strategy_gross.get("clipped_days", 0)
+    if clipped > 0:
+        warnings_list.append(
+            f"Clipped {clipped} days with daily return > ±{MAX_DAILY_RETURN:.0%} "
+            f"(likely data quality issues)"
+        )
     if clock.violations:
         warnings_list.append(f"LOOKAHEAD VIOLATIONS: {len(clock.violations)}")
 
     # 10. Chart
-    config_line = cfg.summary_line(len(active_tickers))
+    config_line = cfg.summary_line(len(investable_tickers))
     chart_path = os.path.join(tempfile.gettempdir(), f"ml-portfolio-{cfg.config_hash()}.png")
     try:
         render_portfolio_chart(
@@ -1217,15 +1308,16 @@ def run_full_backtest(**kwargs):
         log(f"Chart rendering failed: {e}")
         chart_path = None
 
-    # 11. Assemble output
+    # 11. Assemble output — clear universe reporting
     eff_start = backtest_result["daily_dates"][0] if backtest_result["daily_dates"] else "?"
     eff_end = backtest_result["daily_dates"][-1] if backtest_result["daily_dates"] else "?"
 
     config_dict = cfg.to_dict()
     config_dict["config_hash"] = cfg.config_hash()
-    config_dict["tickers"] = active_tickers
-    config_dict["tickers_requested"] = len(cfg.resolve_tickers())
+    config_dict["tickers"] = investable_tickers
+    config_dict["tickers_requested"] = len(requested_tickers)
     config_dict["tickers_loaded"] = len(active_tickers)
+    config_dict["tickers_active"] = len(investable_tickers)
     config_dict["tickers_missing"] = data.missing_report
     config_dict["start_date"] = eff_start
     config_dict["end_date"] = eff_end
