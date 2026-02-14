@@ -237,7 +237,7 @@ class DataProvider:
 
     def load(self, cfg: BacktestConfig):
         """Load all data for the given config."""
-        from data_loader import ensure_data, load_prices
+        from data_loader import ensure_data, load_prices_bulk
 
         data_dir = ensure_data(cfg.data_dir)
         ticker_list = cfg.resolve_tickers()
@@ -246,13 +246,19 @@ class DataProvider:
             raise ValueError("No tickers provided")
         log(f"Universe: {len(ticker_list)} tickers: {ticker_list[:10]}{'...' if len(ticker_list) > 10 else ''}")
 
-        # Load per-ticker prices
+        # Bulk-load all tickers in ONE parquet read (~700MB read once, not N times)
+        raw_dict = load_prices_bulk(data_dir, tickers=ticker_list)
+
         price_dict = {}
         missing_report = {}
 
         for tkr in ticker_list:
+            if tkr not in raw_dict:
+                missing_report[tkr] = "no_data"
+                continue
+
             try:
-                df = load_prices(data_dir, ticker=tkr)
+                df = raw_dict[tkr]
                 if len(df) == 0:
                     missing_report[tkr] = "no_data"
                     continue
@@ -550,10 +556,18 @@ class SignalModel:
         self.clock = clock
         self.data = data
 
+    # Maximum training rows to keep training fast (subsample oldest data)
+    MAX_TRAIN_ROWS = 20_000
+
     def generate_signals(self, rebalance_dates, cfg: BacktestConfig):
         """Produce signals_df: [date, ticker, predicted_return, actual_return].
         Uses pooled model with ticker one-hot encoding.
-        Clock advances to each rebalance date; hard-errors on lookahead."""
+        Clock advances to each rebalance date; hard-errors on lookahead.
+
+        Performance: model is retrained only when a new calendar month starts
+        (or on the first rebalance). Between retrains the cached model is reused
+        for prediction.  Training set is capped at MAX_TRAIN_ROWS to keep late
+        windows fast."""
         from sklearn.linear_model import Ridge
         from sklearn.ensemble import HistGradientBoostingRegressor
         from sklearn.preprocessing import StandardScaler
@@ -576,8 +590,14 @@ class SignalModel:
         X_all = np.hstack([feature_values, ticker_onehot])
 
         signals = []
-        train_info = {"rebalance_count": 0, "avg_train_size": 0, "model_type": cfg.model_type}
+        train_info = {"rebalance_count": 0, "avg_train_size": 0, "model_type": cfg.model_type,
+                      "retrain_count": 0}
         total_train_size = 0
+
+        # Cache model + scaler; retrain only on new month boundary
+        cached_model = None
+        cached_scaler = None
+        last_train_month = None
 
         for reb_date in rebalance_dates:
             # Advance the clock — this IS the point in simulated time
@@ -598,26 +618,42 @@ class SignalModel:
             self.clock.guard_training_data(max_train_date, reb_date,
                                            context="SignalModel.generate_signals")
 
-            X_train = X_all[train_mask]
-            y_train = target_values[train_mask]
+            # Decide whether to retrain (new month or first time)
+            reb_ts = pd.Timestamp(reb_date)
+            reb_month = (reb_ts.year, reb_ts.month)
+            need_retrain = (cached_model is None or reb_month != last_train_month)
+
+            if need_retrain:
+                X_train = X_all[train_mask]
+                y_train = target_values[train_mask]
+
+                # Cap training size (keep most recent rows)
+                if len(X_train) > self.MAX_TRAIN_ROWS:
+                    X_train = X_train[-self.MAX_TRAIN_ROWS:]
+                    y_train = y_train[-self.MAX_TRAIN_ROWS:]
+
+                scaler = StandardScaler()
+                X_train_scaled = scaler.fit_transform(X_train)
+
+                if cfg.model_type == "linear":
+                    model = Ridge(alpha=1.0, random_state=cfg.seed)
+                else:
+                    model = HistGradientBoostingRegressor(
+                        max_iter=150, max_depth=4, learning_rate=0.08,
+                        min_samples_leaf=20, random_state=cfg.seed,
+                        validation_fraction=0.1, n_iter_no_change=15,
+                    )
+
+                model.fit(X_train_scaled, y_train)
+                cached_model = model
+                cached_scaler = scaler
+                last_train_month = reb_month
+                train_info["retrain_count"] += 1
+                total_train_size += len(X_train)
+
             X_test = X_all[test_mask]
-
-            # Scale (fit on train only)
-            scaler = StandardScaler()
-            X_train_scaled = scaler.fit_transform(X_train)
-            X_test_scaled = scaler.transform(X_test)
-
-            if cfg.model_type == "linear":
-                model = Ridge(alpha=1.0, random_state=cfg.seed)
-            else:
-                model = HistGradientBoostingRegressor(
-                    max_iter=200, max_depth=4, learning_rate=0.05,
-                    min_samples_leaf=20, random_state=cfg.seed,
-                    validation_fraction=0.1, n_iter_no_change=20,
-                )
-
-            model.fit(X_train_scaled, y_train)
-            preds = model.predict(X_test_scaled)
+            X_test_scaled = cached_scaler.transform(X_test)
+            preds = cached_model.predict(X_test_scaled)
 
             test_tickers = ticker_ids[test_mask]
             test_actual = target_values[test_mask]
@@ -631,17 +667,17 @@ class SignalModel:
                 })
 
             train_info["rebalance_count"] += 1
-            total_train_size += n_train
 
-        if train_info["rebalance_count"] > 0:
-            train_info["avg_train_size"] = total_train_size / train_info["rebalance_count"]
+        if train_info["retrain_count"] > 0:
+            train_info["avg_train_size"] = total_train_size / train_info["retrain_count"]
 
         signals_df = pd.DataFrame(signals)
         if len(signals_df) == 0:
             raise ValueError("No signals generated. Check data alignment and date range.")
         signals_df["date"] = pd.to_datetime(signals_df["date"])
 
-        log(f"Generated signals at {train_info['rebalance_count']} rebalance dates, "
+        log(f"Generated signals at {train_info['rebalance_count']} rebalance dates "
+            f"({train_info['retrain_count']} retrains), "
             f"avg train size={train_info['avg_train_size']:.0f}")
 
         return signals_df, train_info

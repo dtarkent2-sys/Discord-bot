@@ -196,6 +196,59 @@ def load_prices(data_dir=None, ticker=None):
     return df
 
 
+def load_prices_bulk(data_dir=None, tickers=None):
+    """
+    Load EOD pricing for multiple tickers in a SINGLE parquet read.
+    Returns dict {ticker: DataFrame} — much faster than calling
+    load_prices() in a loop (reads ~700MB file once instead of N times).
+    """
+    import pandas as pd
+
+    data_dir = data_dir or get_data_dir()
+    fpath = os.path.join(data_dir, "all_prices_yahoo.parquet")
+
+    if not os.path.exists(fpath):
+        raise FileNotFoundError(f"Price data not found: {fpath}. Run ensure_data() first.")
+
+    log(f"Bulk loading prices from {fpath}")
+    df = pd.read_parquet(fpath)
+    log(f"  Loaded {len(df):,} rows, columns: {list(df.columns)}")
+
+    df.columns = [c.lower().strip() for c in df.columns]
+
+    ticker_col = _find_column(df, ["symbol", "ticker", "sym", "stock"])
+    if not ticker_col:
+        raise ValueError(f"No ticker column found in {fpath}. Columns: {list(df.columns)}")
+
+    date_col = _find_column(df, ["date", "datetime", "timestamp", "time"])
+    if date_col and date_col != "date":
+        df = df.rename(columns={date_col: "date"})
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+
+    # Uppercase the ticker column for matching
+    df[ticker_col] = df[ticker_col].str.upper()
+
+    if tickers:
+        wanted = set(t.upper() for t in tickers)
+        df = df[df[ticker_col].isin(wanted)]
+        log(f"  Filtered to {len(wanted)} requested tickers: {len(df):,} rows")
+
+    # Split into per-ticker DataFrames
+    result = {}
+    for tkr, group in df.groupby(ticker_col):
+        result[tkr] = group.sort_values("date").reset_index(drop=True)
+
+    found = set(result.keys())
+    if tickers:
+        missing = wanted - found
+        if missing:
+            log(f"  Tickers not found in data: {sorted(missing)}")
+
+    log(f"  Returned {len(result)} tickers")
+    return result
+
+
 def load_fundamentals(data_dir=None, ticker=None):
     """
     Load and merge all fundamental data (balance sheets, income statements, cash flow).
